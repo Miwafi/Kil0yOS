@@ -52,6 +52,8 @@ fs_entry_t* fs_resolve_path(const char* path) {
     if (*path == '\0') return root;
     
     char* path_copy = (char*)kmalloc(strlen(path) + 1);
+    if (path_copy == NULL) return NULL;
+    
     strcpy(path_copy, path);
     
     char* token = strtok(path_copy, "/");

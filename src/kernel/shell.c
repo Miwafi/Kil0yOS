@@ -363,7 +363,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v1.0.0\n");
+    vga_puts("Kil0yOS v1.0.1\n");
     vga_puts("A simple 32-bit x86 operating system\n");
     return 0;
 }
@@ -423,10 +423,10 @@ void shell_run() {
                     vga_putchar('\b');
                 }
             } else if (c == '\t') {
-                vga_putchar(' ');
-                vga_putchar(' ');
-                vga_putchar(' ');
-                vga_putchar(' ');
+                for (int i = 0; i < 4 && cmd_len < MAX_COMMAND_LENGTH - 1; i++) {
+                    command[cmd_len++] = ' ';
+                    vga_putchar(' ');
+                }
             } else {
                 command[cmd_len++] = c;
                 vga_putchar(c);

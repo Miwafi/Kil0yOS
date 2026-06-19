@@ -72,6 +72,7 @@ void keyboard_handler(interrupt_frame_t* frame) {
     
     if (scancode == 0xE0) {
         extended = 1;
+        pic_send_eoi(KEYBOARD_IRQ);
         return;
     }
     
@@ -81,6 +82,7 @@ void keyboard_handler(interrupt_frame_t* frame) {
             shift_pressed = 0;
         }
         extended = 0;
+        pic_send_eoi(KEYBOARD_IRQ);
         return;
     }
     
@@ -93,10 +95,12 @@ void keyboard_handler(interrupt_frame_t* frame) {
             }
         }
         extended = 0;
+        pic_send_eoi(KEYBOARD_IRQ);
         return;
     }
     
     process_scancode(scancode);
+    pic_send_eoi(KEYBOARD_IRQ);
 }
 
 static void keyboard_controller_reset() {

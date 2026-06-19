@@ -24,6 +24,8 @@
 void interrupts_init();
 void pic_init();
 void pic_enable_irq(uint8_t irq);
+void pic_disable_irq(uint8_t irq);
+void pic_send_eoi(uint8_t irq);
 void enable_interrupts();
 void disable_interrupts();
 
