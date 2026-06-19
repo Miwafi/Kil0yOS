@@ -1,10 +1,10 @@
 #include "vga.h"
 #include "io.h"
 
-static uint16_t* vga_buffer;
+uint16_t* vga_buffer;
 static int vga_x = 0;
 static int vga_y = 0;
-static uint8_t vga_color = 0x07;
+uint8_t vga_color = 0x07;
 
 void vga_init() {
     vga_buffer = (uint16_t*)VGA_ADDR;

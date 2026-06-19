@@ -40,5 +40,6 @@ void fs_delete_entry_recursive(fs_entry_t* entry);
 int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size);
 int fs_read_file(fs_entry_t* file, uint8_t* buffer, size_t size);
 int fs_get_last_error();
+void fs_save();
 
 #endif
