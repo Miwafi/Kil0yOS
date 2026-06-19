@@ -8,6 +8,9 @@
 
 #define VGA_ADDR   0xB8000
 
+extern uint16_t* vga_buffer;
+extern uint8_t vga_color;
+
 typedef enum {
     COLOR_BLACK         = 0,
     COLOR_BLUE          = 1,

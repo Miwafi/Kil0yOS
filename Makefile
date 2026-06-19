@@ -22,7 +22,9 @@ KERNEL_SRCS = $(SRCDIR)/kernel/main.c \
               $(SRCDIR)/kernel/string.c \
               $(SRCDIR)/kernel/stdlib.c \
               $(SRCDIR)/kernel/fs.c \
-              $(SRCDIR)/kernel/shell.c
+              $(SRCDIR)/kernel/shell.c \
+              $(SRCDIR)/kernel/edit.c \
+              $(SRCDIR)/kernel/disk.c
 
 KERNEL_OBJS = $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(KERNEL_SRCS))
 KERNEL_ASM_OBJS = $(BUILDDIR)/kernel/isr_asm.o
@@ -56,7 +58,10 @@ $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 iso: $(BUILDDIR)/kil0yos.iso
 
 run: $(BUILDDIR)/kil0yos.iso
-	$(QEMU) -cdrom $(BUILDDIR)/kil0yos.iso -m 512M
+	$(QEMU) -cdrom $(BUILDDIR)/kil0yos.iso -drive file=disk.img,format=raw -m 512M -nographic -serial stdio
+
+disk:
+	dd if=/dev/zero of=disk.img bs=512 count=4096
 
 clean:
 	rm -rf $(BUILDDIR)

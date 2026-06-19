@@ -6,6 +6,7 @@
 #include "fs.h"
 #include "memory.h"
 #include "interrupts.h"
+#include "edit.h"
 
 static char current_path[MAX_PATH_LENGTH];
 
@@ -23,6 +24,7 @@ static int cmd_touch(int argc, char** argv);
 static int cmd_cat(int argc, char** argv);
 static int cmd_whoami(int argc, char** argv);
 static int cmd_version(int argc, char** argv);
+static int cmd_edit(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -36,6 +38,7 @@ static shell_command_t commands[] = {
     {"echo", "Print text", cmd_echo},
     {"whoami", "Print current user", cmd_whoami},
     {"version", "Show OS version", cmd_version},
+    {"edit", "Edit file", cmd_edit},
     {"help", "Show help information", cmd_help},
     {"shutdown", "Shut down the system", cmd_shutdown},
     {NULL, NULL, NULL}
@@ -261,6 +264,8 @@ static int cmd_echo(int argc, char** argv) {
 }
 
 static int cmd_shutdown(int argc, char** argv) {
+    vga_puts("Saving filesystem...\n");
+    fs_save();
     vga_puts("Shutting down Kil0yOS...\n");
     disable_interrupts();
     while (1) {
@@ -363,8 +368,18 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v1.0.1\n");
+    vga_puts("Kil0yOS v1.0.2\n");
     vga_puts("A simple 32-bit x86 operating system\n");
+    return 0;
+}
+
+static int cmd_edit(int argc, char** argv) {
+    if (argc < 2) {
+        vga_puts("edit: missing file operand\n");
+        return 1;
+    }
+    
+    edit_file(argv[1]);
     return 0;
 }
 

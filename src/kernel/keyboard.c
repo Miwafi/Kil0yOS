@@ -13,6 +13,7 @@ static int buffer_count = 0;
 
 static int shift_pressed = 0;
 static int caps_lock = 0;
+static int ctrl_pressed = 0;
 static int extended = 0;
 
 static const char scancode_map[] = {
@@ -44,6 +45,10 @@ static void process_scancode(uint8_t scancode) {
         caps_lock ^= 1;
         return;
     }
+    if (scancode == 29) {
+        ctrl_pressed = 1;
+        return;
+    }
     
     if (scancode >= sizeof(scancode_map)) {
         return;
@@ -51,7 +56,9 @@ static void process_scancode(uint8_t scancode) {
     
     char c = scancode_map[scancode];
     if (c != 0) {
-        if ((shift_pressed ^ caps_lock) && c >= 'a' && c <= 'z') {
+        if (ctrl_pressed && c >= 'a' && c <= 'z') {
+            c = c - 'a' + 1;
+        } else if ((shift_pressed ^ caps_lock) && c >= 'a' && c <= 'z') {
             c = scancode_map_shift[scancode];
         } else if (shift_pressed && c >= '1' && c <= '9') {
             c = scancode_map_shift[scancode];
@@ -81,6 +88,9 @@ void keyboard_handler(interrupt_frame_t* frame) {
         if (scancode == 42 || scancode == 54) {
             shift_pressed = 0;
         }
+        if (scancode == 29) {
+            ctrl_pressed = 0;
+        }
         extended = 0;
         pic_send_eoi(KEYBOARD_IRQ);
         return;
@@ -90,6 +100,30 @@ void keyboard_handler(interrupt_frame_t* frame) {
         if (scancode == 0x53) {
             if (buffer_count < BUFFER_SIZE) {
                 keyboard_buffer[buffer_head] = '\b';
+                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
+                buffer_count++;
+            }
+        } else if (scancode == 0x48) {
+            if (buffer_count < BUFFER_SIZE) {
+                keyboard_buffer[buffer_head] = 0x80;
+                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
+                buffer_count++;
+            }
+        } else if (scancode == 0x50) {
+            if (buffer_count < BUFFER_SIZE) {
+                keyboard_buffer[buffer_head] = 0x81;
+                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
+                buffer_count++;
+            }
+        } else if (scancode == 0x4B) {
+            if (buffer_count < BUFFER_SIZE) {
+                keyboard_buffer[buffer_head] = 0x82;
+                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
+                buffer_count++;
+            }
+        } else if (scancode == 0x4D) {
+            if (buffer_count < BUFFER_SIZE) {
+                keyboard_buffer[buffer_head] = 0x83;
                 buffer_head = (buffer_head + 1) % BUFFER_SIZE;
                 buffer_count++;
             }
