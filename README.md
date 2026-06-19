@@ -76,4 +76,4 @@ grub.cfg         - GRUB configuration
 
 ## License
 
-MIT License
+Apache2.0 License
