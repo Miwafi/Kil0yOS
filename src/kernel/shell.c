@@ -353,10 +353,20 @@ static int cmd_cat(int argc, char** argv) {
             return 1;
         }
         
-        for (uint32_t j = 0; j < file->size; j++) {
-            vga_putchar(file->data[j]);
+        uint8_t* buffer = (uint8_t*)kmalloc(file->size + 1);
+        if (buffer == NULL) {
+            vga_puts("cat: memory error\n");
+            return 1;
+        }
+        
+        int bytes_read = fs_read_file(file, buffer, file->size);
+        if (bytes_read >= 0) {
+            buffer[bytes_read] = '\0';
+            vga_puts((char*)buffer);
         }
         vga_puts("\n");
+        
+        kfree(buffer);
     }
     
     return 0;

@@ -129,3 +129,27 @@ void* kcalloc(size_t nmemb, size_t size) {
     }
     return ptr;
 }
+
+void* krealloc(void* ptr, size_t size) {
+    if (ptr == NULL) {
+        return kmalloc(size);
+    }
+    if (size == 0) {
+        kfree(ptr);
+        return NULL;
+    }
+    
+    heap_block_t* block = (heap_block_t*)ptr - 1;
+    
+    if (block->size >= size) {
+        return ptr;
+    }
+    
+    void* new_ptr = kmalloc(size);
+    if (new_ptr != NULL) {
+        memcpy(new_ptr, ptr, block->size);
+        kfree(ptr);
+    }
+    
+    return new_ptr;
+}
