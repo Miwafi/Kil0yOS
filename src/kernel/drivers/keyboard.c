@@ -94,7 +94,10 @@ void keyboard_handler(interrupt_frame_t* frame) {
         if (scancode == 29) {
             ctrl_pressed = 0;
         }
-        extended = 0;
+        /* Only clear extended flag for extended key releases */
+        if (scancode == 0xE0) {
+            extended = 0;
+        }
         pic_send_eoi(KEYBOARD_IRQ);
         return;
     }

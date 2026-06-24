@@ -22,5 +22,7 @@ typedef struct task {
 void scheduler_init();
 int  task_create(void (*entry)(void), const char* name);
 uint32_t scheduler_tick(uint32_t current_esp);
+int  task_kill(int task_id);
+void task_exit(void);
 
 #endif

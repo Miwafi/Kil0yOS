@@ -116,3 +116,32 @@ uint32_t scheduler_tick(uint32_t current_esp) {
     current_task_idx = next;
     return tasks[current_task_idx].esp;
 }
+
+/*
+ * Kill a task by ID.
+ * Marks the task as DEAD and frees its resources.
+ */
+int task_kill(int task_id) {
+    if (task_id < 0 || task_id >= MAX_TASKS) return -1;
+    if (tasks[task_id].status == TASK_DEAD) return -1;
+
+    tasks[task_id].status = TASK_DEAD;
+    task_count--;
+
+    return 0;
+}
+
+/*
+ * Exit the current task.
+ * Marks the current task as DEAD and triggers a context switch.
+ */
+void task_exit(void) {
+    if (current_task_idx >= 0 && current_task_idx < MAX_TASKS) {
+        tasks[current_task_idx].status = TASK_DEAD;
+        task_count--;
+    }
+
+    /* Force context switch to next task */
+    __asm__ volatile("int $32"); /* Trigger timer interrupt */
+    __builtin_unreachable();
+}

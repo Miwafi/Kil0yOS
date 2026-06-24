@@ -109,10 +109,22 @@ void* kmalloc(size_t size) {
 
 void kfree(void* ptr) {
     if (ptr == NULL) return;
-    
+
+    /* Boundary check: ensure pointer is within heap range */
+    if ((uint8_t*)ptr < heap_start + sizeof(heap_block_t) ||
+        (uint8_t*)ptr >= heap_end) {
+        return; /* Invalid pointer, ignore */
+    }
+
     heap_block_t* block = (heap_block_t*)ptr - 1;
+
+    /* Additional check: ensure block header is within heap range */
+    if ((uint8_t*)block < heap_start || (uint8_t*)block >= heap_end) {
+        return; /* Invalid block header, ignore */
+    }
+
     block->free = 1;
-    
+
     heap_block_t* current = heap_list;
     while (current != NULL && current->next != NULL) {
         if (current->free && current->next->free) {

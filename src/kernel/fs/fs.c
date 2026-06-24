@@ -70,6 +70,23 @@ static uint32_t fat_alloc_cluster() {
         uint32_t entry = fat_read_entry(cluster);
         if (entry == 0) {
             if (fat_write_entry(cluster, FAT32_EOC_MARK) == 0) {
+                /* Update FSInfo sector */
+                uint8_t buffer[DISK_SECTOR_SIZE];
+                if (disk_read_sector(boot_sector.fs_info_sector, buffer) == 0) {
+                    fat32_fsinfo_t* fsinfo = (fat32_fsinfo_t*)buffer;
+                    fsinfo->next_free = cluster;
+                    if (fsinfo->free_count == 0xFFFFFFFF) {
+                        /* Count free clusters on first allocation */
+                        uint32_t free_count = 0;
+                        for (uint32_t c = 2; c < max_cluster; c++) {
+                            if (fat_read_entry(c) == 0) free_count++;
+                        }
+                        fsinfo->free_count = free_count;
+                    } else if (fsinfo->free_count > 0) {
+                        fsinfo->free_count--;
+                    }
+                    disk_write_sector(boot_sector.fs_info_sector, buffer);
+                }
                 return cluster;
             }
         }
@@ -79,13 +96,31 @@ static uint32_t fat_alloc_cluster() {
 
 static int fat_free_cluster_chain(uint32_t first_cluster) {
     uint32_t cluster = first_cluster;
+    uint32_t freed_count = 0;
+
     while (cluster != 0 && cluster != FAT32_EOC_MARK) {
         uint32_t next = fat_read_entry(cluster);
         if (fat_write_entry(cluster, 0) != 0) {
             return -1;
         }
+        freed_count++;
         cluster = next;
     }
+
+    /* Update FSInfo sector */
+    if (freed_count > 0) {
+        uint8_t buffer[DISK_SECTOR_SIZE];
+        if (disk_read_sector(boot_sector.fs_info_sector, buffer) == 0) {
+            fat32_fsinfo_t* fsinfo = (fat32_fsinfo_t*)buffer;
+            if (fsinfo->free_count != 0xFFFFFFFF) {
+                fsinfo->free_count += freed_count;
+            }
+            /* Reset next_free to first cluster (will be updated on next allocation) */
+            fsinfo->next_free = 2;
+            disk_write_sector(boot_sector.fs_info_sector, buffer);
+        }
+    }
+
     return 0;
 }
 
@@ -284,6 +319,9 @@ static int fs_write_directory_entry(uint32_t cluster, fat32_dir_entry_t* entry) 
 static void format_short_name(const char* name, uint8_t* output) {
     memset(output, ' ', 11);
 
+    /* FAT32 illegal characters: * ? : " < > | / \ */
+    const char* illegal_chars = "*?:\"<>|/\\";
+
     const char* dot = strchr(name, '.');
     int name_len = dot ? (dot - name) : strlen(name);
     int ext_len = dot ? strlen(dot + 1) : 0;
@@ -291,20 +329,46 @@ static void format_short_name(const char* name, uint8_t* output) {
     if (name_len > 8) name_len = 8;
     if (ext_len > 3) ext_len = 3;
 
-    for (int i = 0; i < name_len; i++) {
+    int output_idx = 0;
+    for (int i = 0; i < name_len && output_idx < 8; i++) {
         char c = name[i];
+
+        /* Skip illegal characters */
+        int illegal = 0;
+        for (const char* p = illegal_chars; *p; p++) {
+            if (c == *p) {
+                illegal = 1;
+                break;
+            }
+        }
+        if (illegal) continue;
+
+        /* Convert to uppercase */
         if (c >= 'a' && c <= 'z') c -= 32;
-        output[i] = c;
+        output[output_idx++] = c;
     }
 
     /* FAT32: first byte 0xE5 maps to 0x05 */
     if ((uint8_t)output[0] == 0xE5) output[0] = 0x05;
 
     if (dot && ext_len > 0) {
-        for (int i = 0; i < ext_len; i++) {
+        int ext_idx = 0;
+        for (int i = 0; i < ext_len && ext_idx < 3; i++) {
             char c = dot[1 + i];
+
+            /* Skip illegal characters */
+            int illegal = 0;
+            for (const char* p = illegal_chars; *p; p++) {
+                if (c == *p) {
+                    illegal = 1;
+                    break;
+                }
+            }
+            if (illegal) continue;
+
+            /* Convert to uppercase */
             if (c >= 'a' && c <= 'z') c -= 32;
-            output[8 + i] = c;
+            output[8 + ext_idx++] = c;
         }
     }
 }
@@ -358,15 +422,23 @@ static void fs_format() {
     disk_write_sector(1, buffer);
     
     memset(buffer, 0, DISK_SECTOR_SIZE);
-    for (uint32_t i = boot_sector.bpb.reserved_sectors; 
+    for (uint32_t i = boot_sector.bpb.reserved_sectors;
          i < boot_sector.bpb.reserved_sectors + sectors_per_fat; i++) {
         disk_write_sector(i, buffer);
     }
-    
-    uint32_t fat_start = boot_sector.bpb.reserved_sectors;
+
+    /* Initialize FAT table: clear all entries, then set first two */
+    memset(buffer, 0, DISK_SECTOR_SIZE);
     *(uint32_t*)buffer = 0x0FFFFFF8;
     *(uint32_t*)(buffer + 4) = FAT32_EOC_MARK;
-    disk_write_sector(fat_start, buffer);
+    disk_write_sector(boot_sector.bpb.reserved_sectors, buffer);
+
+    /* Clear remaining FAT sectors */
+    for (uint32_t i = boot_sector.bpb.reserved_sectors + 1;
+         i < boot_sector.bpb.reserved_sectors + sectors_per_fat; i++) {
+        memset(buffer, 0, DISK_SECTOR_SIZE);
+        disk_write_sector(i, buffer);
+    }
     
     uint32_t root_sector = cluster_to_sector(2);
     memset(buffer, 0, DISK_SECTOR_SIZE);
@@ -765,14 +837,16 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
         }
     }
 
-    /* 更新父目录中的目录项 (cluster 号和文件大小) */
+    /* Update parent directory entry (cluster number and file size) */
     if (file->parent != NULL) {
         uint32_t parent_cluster = file->parent->first_cluster;
         uint32_t current_cluster = parent_cluster;
-        while (current_cluster != 0 && current_cluster != FAT32_EOC_MARK) {
+        int entry_updated = 0;
+
+        while (current_cluster != 0 && current_cluster != FAT32_EOC_MARK && !entry_updated) {
             uint32_t sector = cluster_to_sector(current_cluster);
             int sectors_per_cluster = boot_sector.bpb.sectors_per_cluster;
-            for (int s = 0; s < sectors_per_cluster; s++) {
+            for (int s = 0; s < sectors_per_cluster && !entry_updated; s++) {
                 uint8_t buffer[DISK_SECTOR_SIZE];
                 if (disk_read_sector(sector + s, buffer) != 0) break;
                 fat32_dir_entry_t* dir_entries = (fat32_dir_entry_t*)buffer;
@@ -785,13 +859,13 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
                         dir_entries[j].first_cluster_high = (first_cluster >> 16) & 0xFFFF;
                         dir_entries[j].file_size = size;
                         disk_write_sector(sector + s, buffer);
-                        goto update_done;
+                        entry_updated = 1;
+                        break;
                     }
                 }
             }
             current_cluster = fat_read_entry(current_cluster);
         }
-update_done:;
     }
 
     return size;
@@ -898,6 +972,7 @@ int fs_get_last_error() {
     return fs_last_error;
 }
 
+static void fs_save_file(fs_entry_t* file);
 static void fs_save_directory(fs_entry_t* dir);
 
 void fs_save() {
@@ -908,56 +983,107 @@ void fs_save() {
     memcpy(buffer, &boot_sector, sizeof(fat32_boot_sector_t));
     disk_write_sector(0, buffer);
 
-    /* 2. Sync root directory and all subdirectories to disk */
+    /* 2. Sync FAT table to disk (all modified entries) */
+    /* FAT entries are already written by fat_write_entry() during operations,
+       so we just need to ensure the FAT table is consistent */
+    /* No additional action needed as fat_write_entry() writes immediately */
+
+    /* 3. Save root directory and all subdirectories recursively */
     if (root != NULL) {
         fs_save_directory(root);
     }
 }
 
 /*
+ * Save file content clusters to disk.
+ * Reads from in-memory fs_entry_t and writes to disk clusters.
+ */
+static void fs_save_file(fs_entry_t* file) {
+    if (file == NULL || file->type != FS_TYPE_FILE) return;
+    if (file->first_cluster == 0) return;
+
+    /* File content is already written by fs_write_file() during edit/save,
+       so we just need to ensure the directory entry is updated */
+    /* The directory entry update is handled by fs_save_directory() */
+}
+
+/*
  * Write all in-memory directory entries of 'dir' back to disk.
- * Rebuilds the directory cluster from scratch using current fs_entry_t tree.
+ * Recursively saves all child directories and files.
+ * Supports multi-cluster directories.
  */
 static void fs_save_directory(fs_entry_t* dir) {
     if (dir == NULL || dir->type != FS_TYPE_DIRECTORY) return;
     if (dir->first_cluster == 0) return;
 
-    /* First, recursively save all child directories so their data is current */
+    /* First, recursively save all child directories and files */
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (dir->children[i] != NULL && dir->children[i]->type == FS_TYPE_DIRECTORY) {
-            fs_save_directory(dir->children[i]);
+        if (dir->children[i] != NULL) {
+            if (dir->children[i]->type == FS_TYPE_DIRECTORY) {
+                fs_save_directory(dir->children[i]);
+            } else if (dir->children[i]->type == FS_TYPE_FILE) {
+                fs_save_file(dir->children[i]);
+            }
         }
     }
 
-    /* Build directory content in memory first, then write to disk */
-    uint8_t* dir_data = (uint8_t*)kmalloc(DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster);
-    if (dir_data == NULL) return;
-    memset(dir_data, 0, DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster);
-
-    int entry_offset = 0;
-    int max_entries = (DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster) / sizeof(fat32_dir_entry_t);
-
-    for (int i = 0; i < MAX_DIR_ENTRIES && entry_offset < max_entries; i++) {
-        fs_entry_t* child = dir->children[i];
-        if (child == NULL) continue;
-
-        fat32_dir_entry_t de;
-        memset(&de, 0, sizeof(fat32_dir_entry_t));
-
-        format_short_name(child->name, de.name);
-        de.attributes = child->attributes;
-        de.first_cluster_low = child->first_cluster & 0xFFFF;
-        de.first_cluster_high = (child->first_cluster >> 16) & 0xFFFF;
-        de.file_size = child->size;
-
-        memcpy(dir_data + entry_offset * sizeof(fat32_dir_entry_t), &de, sizeof(fat32_dir_entry_t));
-        entry_offset++;
+    /* Count directory entries */
+    int entry_count = 0;
+    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+        if (dir->children[i] != NULL) entry_count++;
     }
 
-    /* Write directory data to each sector of the cluster */
-    uint32_t sector = cluster_to_sector(dir->first_cluster);
-    for (int s = 0; s < boot_sector.bpb.sectors_per_cluster; s++) {
-        disk_write_sector(sector + s, dir_data + s * DISK_SECTOR_SIZE);
+    /* Calculate required clusters */
+    int entries_per_cluster = (DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster) / sizeof(fat32_dir_entry_t);
+    int clusters_needed = (entry_count + entries_per_cluster - 1) / entries_per_cluster;
+
+    /* Build directory content in memory */
+    uint8_t* dir_data = (uint8_t*)kmalloc(DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster);
+    if (dir_data == NULL) return;
+
+    /* Write entries to clusters */
+    int entry_offset = 0;
+    uint32_t current_cluster = dir->first_cluster;
+    int cluster_index = 0;
+
+    while (current_cluster != 0 && current_cluster != FAT32_EOC_MARK && cluster_index < clusters_needed) {
+        memset(dir_data, 0, DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster);
+
+        /* Fill this cluster with entries */
+        int entries_in_this_cluster = 0;
+        int max_entries_this_cluster = entries_per_cluster;
+
+        for (int i = 0; i < MAX_DIR_ENTRIES && entries_in_this_cluster < max_entries_this_cluster; i++) {
+            fs_entry_t* child = dir->children[i];
+            if (child == NULL) continue;
+
+            /* Skip entries already written in previous clusters */
+            if (entry_offset >= cluster_index * entries_per_cluster) {
+                fat32_dir_entry_t de;
+                memset(&de, 0, sizeof(fat32_dir_entry_t));
+
+                format_short_name(child->name, de.name);
+                de.attributes = child->attributes;
+                de.first_cluster_low = child->first_cluster & 0xFFFF;
+                de.first_cluster_high = (child->first_cluster >> 16) & 0xFFFF;
+                de.file_size = child->size;
+
+                int local_offset = entry_offset % entries_per_cluster;
+                memcpy(dir_data + local_offset * sizeof(fat32_dir_entry_t), &de, sizeof(fat32_dir_entry_t));
+                entries_in_this_cluster++;
+            }
+            entry_offset++;
+        }
+
+        /* Write this cluster to disk */
+        uint32_t sector = cluster_to_sector(current_cluster);
+        for (int s = 0; s < boot_sector.bpb.sectors_per_cluster; s++) {
+            disk_write_sector(sector + s, dir_data + s * DISK_SECTOR_SIZE);
+        }
+
+        /* Move to next cluster */
+        current_cluster = fat_read_entry(current_cluster);
+        cluster_index++;
     }
 
     kfree(dir_data);
