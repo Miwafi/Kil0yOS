@@ -76,4 +76,4 @@ grub.cfg         - GRUB configuration
 
 ## License
 
-GPLv2 License
+GPL2.0
