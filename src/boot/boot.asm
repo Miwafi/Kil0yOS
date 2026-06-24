@@ -1,26 +1,26 @@
-bits 32 ;想开辟个新天地...
+bits 32
 
-section .multiboot ;可是啊
-align 4 ;我仍感到迷茫
-dd 0x1BADB002 ;老师可否为我指明人生方向
-dd 0x00 ;此刻的我
-dd - (0x1BADB002 + 0x00) ;刚从零点起步
+section .multiboot
+align 4
+dd 0x1BADB002
+dd 0x00
+dd - (0x1BADB002 + 0x00)
 
-section .bss ;无法排列你
-align 16 ;七百颗透明的心脏
-stack_bottom: ;对
-resb 16384 ;沾满泥水的我来说
-stack_top: ;你的描绘
+section .bss
+align 16
+stack_bottom:
+resb 16384
+stack_top:
 
-section .text ;似乎有些
-global _start ;遥不可望
-_start: ;请告诉我
-    mov esp, stack_top ;这些希冀
+section .text
+global _start
+_start:
+    mov esp, stack_top
     
-    extern kernel_main ;并非
-    call kernel_main ;只是
+    extern kernel_main
+    call kernel_main
     
-    cli ;某些
+    cli
 .hang:
     hlt
-    jmp .hang ;痴心妄想
+    jmp .hang

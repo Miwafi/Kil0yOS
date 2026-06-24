@@ -224,32 +224,38 @@ static int cmd_echo(int argc, char** argv) {
             return 1;
         }
         
-        char content[MAX_FILE_SIZE];
+        char* content = (char*)kmalloc(MAX_FILE_SIZE);
+        if (content == NULL) {
+            vga_puts("echo: memory error\n");
+            return 1;
+        }
         int content_len = 0;
-        
+
         for (int i = 1; i < redirect_pos; i++) {
             const char* arg = argv[i];
             size_t arg_len = strlen(arg);
-            
+
             if (content_len + arg_len + 1 > MAX_FILE_SIZE - 1) {
                 break;
             }
-            
+
             if (content_len > 0) {
                 content[content_len++] = ' ';
             }
-            
+
             memcpy(content + content_len, arg, arg_len);
             content_len += arg_len;
         }
-        
+
         content[content_len] = '\0';
-        
+
         if (fs_write_file(file, (uint8_t*)content, content_len) < 0) {
             vga_puts("echo: write error\n");
+            kfree(content);
             return 1;
         }
-        
+
+        kfree(content);
         return 0;
     }
     

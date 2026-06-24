@@ -255,21 +255,25 @@ static int fs_write_directory_entry(uint32_t cluster, fat32_dir_entry_t* entry) 
 
 static void format_short_name(const char* name, uint8_t* output) {
     memset(output, ' ', 11);
-    
+
     const char* dot = strchr(name, '.');
     int name_len = dot ? (dot - name) : strlen(name);
     int ext_len = dot ? strlen(dot + 1) : 0;
-    
+
     if (name_len > 8) name_len = 8;
     if (ext_len > 3) ext_len = 3;
-    
+
     for (int i = 0; i < name_len; i++) {
-        output[i] = name[i];
+        char c = name[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        output[i] = c;
     }
-    
+
     if (dot && ext_len > 0) {
         for (int i = 0; i < ext_len; i++) {
-            output[8 + i] = dot[1 + i];
+            char c = dot[1 + i];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            output[8 + i] = c;
         }
     }
 }
@@ -571,7 +575,30 @@ fs_entry_t* fs_create_dir(const char* name) {
     for (int s = 0; s < boot_sector.bpb.sectors_per_cluster; s++) {
         disk_write_sector(sector + s, buffer);
     }
-    
+
+    /* 写入 "." 目录项 (当前目录) */
+    fat32_dir_entry_t dot_entry;
+    memset(&dot_entry, 0, sizeof(fat32_dir_entry_t));
+    dot_entry.name[0] = '.';
+    dot_entry.attributes = ATTR_DIRECTORY;
+    dot_entry.first_cluster_low = new_cluster & 0xFFFF;
+    dot_entry.first_cluster_high = (new_cluster >> 16) & 0xFFFF;
+    memset(buffer, 0, DISK_SECTOR_SIZE);
+    memcpy(buffer, &dot_entry, sizeof(fat32_dir_entry_t));
+
+    /* 写入 ".." 目录项 (父目录) */
+    fat32_dir_entry_t dotdot_entry;
+    memset(&dotdot_entry, 0, sizeof(fat32_dir_entry_t));
+    dotdot_entry.name[0] = '.';
+    dotdot_entry.name[1] = '.';
+    dotdot_entry.attributes = ATTR_DIRECTORY;
+    uint32_t parent_cluster = current->first_cluster;
+    if (parent_cluster == 0) parent_cluster = boot_sector.root_cluster;
+    dotdot_entry.first_cluster_low = parent_cluster & 0xFFFF;
+    dotdot_entry.first_cluster_high = (parent_cluster >> 16) & 0xFFFF;
+    memcpy(buffer + sizeof(fat32_dir_entry_t), &dotdot_entry, sizeof(fat32_dir_entry_t));
+    disk_write_sector(sector, buffer);
+
     fat32_dir_entry_t dir_entry;
     memset(&dir_entry, 0, sizeof(fat32_dir_entry_t));
     format_short_name(name, dir_entry.name);
@@ -664,7 +691,36 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
             current_cluster = next_cluster;
         }
     }
-    
+
+    /* 更新父目录中的目录项 (cluster 号和文件大小) */
+    if (file->parent != NULL) {
+        uint32_t parent_cluster = file->parent->first_cluster;
+        uint32_t current_cluster = parent_cluster;
+        while (current_cluster != 0 && current_cluster != FAT32_EOC_MARK) {
+            uint32_t sector = cluster_to_sector(current_cluster);
+            int sectors_per_cluster = boot_sector.bpb.sectors_per_cluster;
+            for (int s = 0; s < sectors_per_cluster; s++) {
+                uint8_t buffer[DISK_SECTOR_SIZE];
+                if (disk_read_sector(sector + s, buffer) != 0) break;
+                fat32_dir_entry_t* dir_entries = (fat32_dir_entry_t*)buffer;
+                for (int j = 0; j < 16; j++) {
+                    char entry_name[256];
+                    parse_short_name(dir_entries[j].name, entry_name);
+                    if (strcmp(entry_name, file->name) == 0 &&
+                        dir_entries[j].name[0] != 0xE5) {
+                        dir_entries[j].first_cluster_low = first_cluster & 0xFFFF;
+                        dir_entries[j].first_cluster_high = (first_cluster >> 16) & 0xFFFF;
+                        dir_entries[j].file_size = size;
+                        disk_write_sector(sector + s, buffer);
+                        goto update_done;
+                    }
+                }
+            }
+            current_cluster = fat_read_entry(current_cluster);
+        }
+update_done:;
+    }
+
     return size;
 }
 
@@ -728,16 +784,40 @@ void fs_delete_entry_recursive(fs_entry_t* entry) {
 
 int fs_delete_entry(const char* name) {
     if (name == NULL) return -1;
-    
+
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (current->children[i] != NULL && 
+        if (current->children[i] != NULL &&
             strcmp(current->children[i]->name, name) == 0) {
+
+            /* 将磁盘目录项标记为已删除 (0xE5) */
+            uint32_t cluster = current->first_cluster;
+            uint32_t current_cluster = cluster;
+            while (current_cluster != 0 && current_cluster != FAT32_EOC_MARK) {
+                uint32_t sector = cluster_to_sector(current_cluster);
+                int sectors_per_cluster = boot_sector.bpb.sectors_per_cluster;
+                for (int s = 0; s < sectors_per_cluster; s++) {
+                    uint8_t buffer[DISK_SECTOR_SIZE];
+                    if (disk_read_sector(sector + s, buffer) != 0) break;
+                    fat32_dir_entry_t* dir_entries = (fat32_dir_entry_t*)buffer;
+                    for (int j = 0; j < 16; j++) {
+                        char entry_name[256];
+                        parse_short_name(dir_entries[j].name, entry_name);
+                        if (strcmp(entry_name, name) == 0) {
+                            dir_entries[j].name[0] = 0xE5;
+                            disk_write_sector(sector + s, buffer);
+                            goto delete_done;
+                        }
+                    }
+                }
+                current_cluster = fat_read_entry(current_cluster);
+            }
+delete_done:
             fs_delete_entry_recursive(current->children[i]);
             current->children[i] = NULL;
             return 0;
         }
     }
-    
+
     return -1;
 }
 
@@ -746,4 +826,9 @@ int fs_get_last_error() {
 }
 
 void fs_save() {
+    /* 将 boot sector 写回磁盘 0 扇区 */
+    uint8_t buffer[DISK_SECTOR_SIZE];
+    memset(buffer, 0, DISK_SECTOR_SIZE);
+    memcpy(buffer, &boot_sector, sizeof(fat32_boot_sector_t));
+    disk_write_sector(0, buffer);
 }

@@ -244,7 +244,7 @@ static void edit_save_file(const char* fname) {
     int pos = 0;
     for (int i = 0; i < line_count; i++) {
         int len = strlen(lines[i]);
-        if (pos + len + 1 >= total_size) break;
+        if (pos + len + 1 > total_size) break;
         
         memcpy(content + pos, lines[i], len);
         pos += len;

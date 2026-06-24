@@ -1,6 +1,6 @@
-# Kil0yOS
+# <center> Kil0yOS
 
-A 32-bit microkernel operating system written in C and Assembly.
+![LOGO](./assets/banner.png)
 
 ## Features
 
