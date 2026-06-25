@@ -1,6 +1,7 @@
 #include "shell/shell.h"
 #include "drivers/vga.h"
 #include "drivers/keyboard.h"
+#include "drivers/mouse.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "fs/fs.h"
@@ -394,7 +395,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v1.1.0\n");
+    vga_puts("Kil0yOS v1.1.2\n");
     vga_puts("A simple 32-bit x86 operating system\n");
     return 0;
 }
@@ -726,10 +727,29 @@ static int cmd_gui(int argc, char** argv) {
     vga_fill_rect(2, taskbar_y + taskbar_h - 3, 40, 1, 0x08);
     vga_fill_rect(41, taskbar_y + 2, 1, taskbar_h - 4, 0x08);
 
-    while (keyboard_getc() != 'q') {
-        __asm__ volatile("nop");
+    mouse_state_t prev = { .x = -1, .y = -1, .buttons = 0 };
+
+    while (1) {
+        if (keyboard_has_input()) {
+            char c = keyboard_getc();
+            if (c == 'q') break;
+        }
+
+        mouse_state_t state;
+        mouse_get_state(&state);
+
+        if (state.x != prev.x || state.y != prev.y) {
+            mouse_erase_cursor(prev.x, prev.y);
+            mouse_draw_cursor(state.x, state.y);
+            prev = state;
+        }
+
+        for (volatile int i = 0; i < 5000; i++) {
+            __asm__ volatile("nop");
+        }
     }
 
+    mouse_erase_cursor(prev.x, prev.y);
     vga_set_text_mode();
     vga_puts("Returned to text mode.\n");
     return 0;

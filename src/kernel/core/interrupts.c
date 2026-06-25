@@ -29,14 +29,16 @@ void pic_init() {
 void pic_enable_irq(uint8_t irq) {
     uint16_t port;
     uint8_t value;
-    
+
     if (irq < 8) {
         port = PIC1_DATA;
     } else {
         port = PIC2_DATA;
         irq -= 8;
+        uint8_t master = inb(PIC1_DATA) & ~(1 << 2);
+        outb(PIC1_DATA, master);
     }
-    
+
     value = inb(port) & ~(1 << irq);
     outb(port, value);
 }

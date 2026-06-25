@@ -5,6 +5,7 @@
 #include "mm/memory.h"
 #include "drivers/vga.h"
 #include "drivers/keyboard.h"
+#include "drivers/mouse.h"
 #include "drivers/power.h"
 #include "drivers/pci.h"
 #include "shell/shell.h"
@@ -17,7 +18,7 @@ void kernel_main() {
     vga_init();
     
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    vga_puts("Kil0yOS v1.1.0\n");
+    vga_puts("Kil0yOS v1.1.2\n");
     vga_puts("==================================\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
     
@@ -57,6 +58,10 @@ void kernel_main() {
     vga_puts("[Keyboard] Initializing\n");
     keyboard_init();
     vga_puts("[Keyboard] OK\n");
+
+    vga_puts("[Mouse] Initializing\n");
+    mouse_init();
+    vga_puts("[Mouse] OK\n");
     
     vga_puts("[Scheduler] Initializing\n");
     scheduler_init();

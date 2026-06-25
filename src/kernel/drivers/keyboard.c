@@ -237,3 +237,10 @@ char keyboard_getc() {
         __asm__ volatile("hlt");
     }
 }
+
+int keyboard_has_input() {
+    disable_interrupts();
+    int count = buffer_count;
+    enable_interrupts();
+    return count > 0;
+}

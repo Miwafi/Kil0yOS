@@ -9,6 +9,7 @@
 
 void keyboard_init();
 char keyboard_getc();
+int keyboard_has_input();
 void keyboard_handler(interrupt_frame_t* frame);
 
 #endif
