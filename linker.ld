@@ -4,6 +4,7 @@ ENTRY(_start)
 
 SECTIONS {
     . = 0x100000;
+    kernel_start = .;
 
     .text : {
         *(.multiboot2)
@@ -21,4 +22,5 @@ SECTIONS {
     .bss : {
         *(.bss)
     }
+    kernel_end = .;
 }

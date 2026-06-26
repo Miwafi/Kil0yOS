@@ -7,6 +7,9 @@
 ## Features
 
 - **x86-64 long mode** with 4-level page tables and identity-mapped first 4 GiB
+- **Physical Memory Manager (PMM)** — bitmap-based 4 KiB page frame allocator with Multiboot2 mmap parsing
+- **Virtual Memory Manager (VMM)** — on-demand 4-level page table mapping, unmapping, and address translation
+- **Kernel panic & assert** (`PANIC`, `ASSERT`) with serial + VGA output and CPU halt
 - Memory management with heap allocation
 - VGA text mode display
 - **TempleOS-style tiling GUI desktop** (320x200 VGA mode 13h)

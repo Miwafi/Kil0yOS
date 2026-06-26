@@ -400,7 +400,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.0.1\n");
+    vga_puts("Kil0yOS v2.1.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     return 0;
 }
@@ -1040,7 +1040,7 @@ static int cmd_gui(int argc, char** argv) {
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.0.1", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.1.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);

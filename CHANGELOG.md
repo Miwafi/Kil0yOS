@@ -1,6 +1,36 @@
 # Changelog
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+## [2.1.0] - 2026-06-26
+ This release introduces physical and virtual memory management alongside kernel panic and assertion facilities, laying the groundwork for a robust 64-bit memory subsystem.
+## Added
+ ### Physical Memory Manager (PMM)
+  - Bitmap-based physical page frame allocator managing the first 4 GiB of RAM
+  - `pmm_init(uint64_t mb_info_phys)`: parses Multiboot2 memory map tag to discover available RAM regions
+  - `pmm_alloc_page()`: allocates a single 4 KiB physical page
+  - `pmm_alloc_pages(size_t count)`: allocates contiguous physical pages
+  - `pmm_free_page()` / `pmm_free_pages()`: releases physical pages back to the bitmap
+  - Automatic reservation of kernel image, page bitmap, low 2 MiB, and non-RAM regions
+ ### Virtual Memory Manager (VMM)
+  - Simple 4-level page table manipulation on top of the existing identity-mapped address space
+  - `vmm_init()`: discovers current PML4 from CR3
+  - `vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags)`: maps a 4 KiB virtual page, allocating intermediate PDPT/PD/PT tables on demand via PMM
+  - `vmm_unmap_page(uint64_t virt)`: removes a virtual mapping
+  - `vmm_get_phys(uint64_t virt)`: translates a virtual address to its physical counterpart (supports both 4 KiB and 2 MiB huge pages)
+  - `vmm_reload_cr3()`: flushes TLB after page table modifications
+ ### Kernel Panic & Assert
+  - `panic(const char* msg, const char* file, int line)`: disables interrupts, prints panic details to serial COM1 and VGA console, then halts the CPU
+  - `panic_assert(const char* cond, const char* file, int line)`: assertion failure wrapper
+  - `PANIC(msg)` and `ASSERT(cond)` macros providing `__FILE__` and `__LINE__` automatically
+## Changed
+  - `kernel_main` now accepts `uint64_t mb_info_phys` to receive the Multiboot2 info structure from the bootloader
+  - Boot sequence extended with `[PMM]` and `[VMM]` initialization stages before heap setup
+  - `linker.ld` exports `kernel_start` and `kernel_end` symbols for accurate kernel image reservation
+## File Changes
+  - `include/mm/memory.h`: added PMM, VMM, and panic/assert declarations
+  - `src/kernel/mm/memory.c`: implemented PMM bitmap allocator, VMM page table walker, and panic output routines
+  - `src/kernel/core/main.c`: updated boot flow to initialize PMM/VMM and pass Multiboot2 pointer
+  - `linker.ld`: added `kernel_start` / `kernel_end` linker symbols
 ## [2.0.1] - 2026-06-26
  This release completes the architecture migration from 32-bit to 64-bit x86-64, upgrading the bootloader to GRUB2 with Multiboot2 protocol and enabling long mode.
 ## Added

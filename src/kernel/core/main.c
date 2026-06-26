@@ -47,66 +47,78 @@ static void serial_puts(const char* s) {
     }
 }
 
-void kernel_main() {
+void kernel_main(uint64_t mb_info_phys) {
     serial_init();
     serial_puts("kernel_main entered\n");
 
     vga_init();
-    
+
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    vga_puts("Kil0yOS v2.0.1\n");
+    vga_puts("Kil0yOS v2.1.0\n");
     vga_puts("==================================\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
-    
+
     vga_puts("[GDT] Initializing\n");
     serial_puts("[GDT] Initializing\n");
     gdt_init();
     vga_puts("[GDT] OK\n");
     serial_puts("[GDT] OK\n");
-    
+
     vga_puts("[IDT] Initializing\n");
     serial_puts("[IDT] Initializing\n");
     idt_init();
     vga_puts("[IDT] OK\n");
     serial_puts("[IDT] OK\n");
-    
+
     vga_puts("[ISRs] Initializing\n");
     serial_puts("[ISRs] Initializing\n");
     isr_init();
     vga_puts("[ISRs] OK\n");
     serial_puts("[ISRs] OK\n");
-    
+
     vga_puts("[PIC] Initializing\n");
     serial_puts("[PIC] Initializing\n");
     interrupts_init();
     vga_puts("[PIC] OK\n");
     serial_puts("[PIC] OK\n");
-    
-    vga_puts("[Memory] Initializing\n");
-    serial_puts("[Memory] Initializing\n");
+
+    vga_puts("[PMM] Initializing\n");
+    serial_puts("[PMM] Initializing\n");
+    pmm_init(mb_info_phys);
+    vga_puts("[PMM] OK\n");
+    serial_puts("[PMM] OK\n");
+
+    vga_puts("[VMM] Initializing\n");
+    serial_puts("[VMM] Initializing\n");
+    vmm_init();
+    vga_puts("[VMM] OK\n");
+    serial_puts("[VMM] OK\n");
+
+    vga_puts("[Memory] Initializing heap\n");
+    serial_puts("[Memory] Initializing heap\n");
     memory_map_t map = {0};
     memory_init(&map, 1);
     vga_puts("[Memory] OK\n");
     serial_puts("[Memory] OK\n");
-    
+
     vga_puts("[DeviceManager] Initializing\n");
     serial_puts("[DeviceManager] Initializing\n");
     device_init();
     vga_puts("[DeviceManager] OK\n");
     serial_puts("[DeviceManager] OK\n");
-    
+
     vga_puts("[Filesystem] Initializing\n");
     serial_puts("[Filesystem] Initializing\n");
     fs_init();
     vga_puts("[Filesystem] OK\n");
     serial_puts("[Filesystem] OK\n");
-    
+
     vga_puts("[Shell] Initializing\n");
     serial_puts("[Shell] Initializing\n");
     shell_init();
     vga_puts("[Shell] OK\n");
     serial_puts("[Shell] OK\n");
-    
+
     vga_puts("[Keyboard] Initializing\n");
     serial_puts("[Keyboard] Initializing\n");
     keyboard_init();
@@ -118,43 +130,43 @@ void kernel_main() {
     mouse_init();
     vga_puts("[Mouse] OK\n");
     serial_puts("[Mouse] OK\n");
-    
+
     vga_puts("[Scheduler] Initializing\n");
     serial_puts("[Scheduler] Initializing\n");
     scheduler_init();
     vga_puts("[Scheduler] OK\n");
     serial_puts("[Scheduler] OK\n");
-    
+
     vga_puts("[PIT] Initializing\n");
     serial_puts("[PIT] Initializing\n");
     pit_init(100);
     vga_puts("[PIT] OK\n");
     serial_puts("[PIT] OK\n");
-    
+
     vga_puts("[Power] Initializing ACPI...\n");
     serial_puts("[Power] Initializing ACPI...\n");
     power_init();
     vga_puts("[Power] OK\n");
     serial_puts("[Power] OK\n");
-    
+
     vga_puts("[PCI] Initializing\n");
     serial_puts("[PCI] Initializing\n");
     pci_init();
     vga_puts("[PCI] OK\n");
     serial_puts("[PCI] OK\n");
-    
+
     vga_puts("[Network] Initializing\n");
     serial_puts("[Network] Initializing\n");
     net_init();
     vga_puts("[Network] OK\n");
     serial_puts("[Network] OK\n");
-    
+
     vga_puts("\nWelcome!\n");
     serial_puts("\nWelcome!\n");
     vga_puts("Type 'help' for available commands.\n\n");
     serial_puts("Type 'help' for available commands.\n\n");
-    
+
     enable_interrupts();
-    
+
     shell_run();
 }
