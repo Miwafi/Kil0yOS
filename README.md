@@ -81,6 +81,12 @@ Because every OS needs a cat.
 
 ![=^._.^=](assets/mew.png)
 
+### System GUI
+
+Wanna check the system status?
+
+![System GUI](assets/systemgui.png)
+
 ## Project Structure
 
 ```
