@@ -47,7 +47,8 @@ LIB_SRCS = $(SRCDIR)/kernel/lib/string.c \
            $(SRCDIR)/kernel/lib/stdlib.c
 
 # --- Shell ---
-SHELL_SRCS = $(SRCDIR)/kernel/shell/shell.c
+SHELL_SRCS = $(SRCDIR)/kernel/shell/shell.c \
+             $(SRCDIR)/kernel/shell/terminal.c
 
 # --- Scheduler ---
 SCHED_SRCS = $(SRCDIR)/kernel/sched/scheduler.c

@@ -1,4 +1,5 @@
 #include "shell/shell.h"
+#include "shell/terminal.h"
 #include "drivers/vga.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
@@ -14,6 +15,12 @@
 #include "net/net.h"
 #include "net/dhcp.h"
 #include "net/e1000.h"
+
+/* Redirect VGA output calls inside command handlers to the active terminal */
+#define vga_puts      term_puts
+#define vga_putchar   term_putchar
+#define vga_set_color term_set_color
+#define vga_clear     term_clear
 
 static char current_path[MAX_PATH_LENGTH];
 
@@ -781,198 +788,25 @@ static void gui_shell_init(int left_w, int header_h) {
     gui_shell_draw_prompt();
 }
 
-static void gui_shell_check_scroll(int left_w, int header_h, int content_h) {
-    if (gui_shell_y > GFX_HEIGHT - 20) {
-        vga_fill_rect(left_w + 1, header_h + 1, GFX_WIDTH - left_w - 2, content_h - 2, 0x00);
-        gui_shell_y = header_h + 14;
-    }
-}
+static int execute_command(char* cmd);
 
 static void gui_shell_execute(int left_w, int header_h, int content_h) {
     gui_shell_buf[gui_shell_len] = '\0';
-    gui_shell_y += 10;
 
-    /* parse command and arguments */
     char cmd_buf[GUI_SHELL_BUF_SIZE];
     strncpy(cmd_buf, gui_shell_buf, GUI_SHELL_BUF_SIZE - 1);
     cmd_buf[GUI_SHELL_BUF_SIZE - 1] = '\0';
 
-    char* argv[8];
-    int argc = 0;
-
-    char* token = strtok(cmd_buf, " \t");
-    while (token != NULL && argc < 8) {
-        argv[argc++] = token;
-        token = strtok(NULL, " \t");
-    }
-
-    if (argc == 0) {
-        /* empty command */
-    } else if (strcmp(argv[0], "help") == 0) {
-        vga_draw_string(gui_shell_x, gui_shell_y, "Commands:", 0x0E);
-        gui_shell_y += 10;
-        gui_shell_check_scroll(left_w, header_h, content_h);
-        vga_draw_string(gui_shell_x, gui_shell_y, " help ls cd", 0x0F);
-        gui_shell_y += 10;
-        gui_shell_check_scroll(left_w, header_h, content_h);
-        vga_draw_string(gui_shell_x, gui_shell_y, " mkdir touch pwd", 0x0F);
-        gui_shell_y += 10;
-        gui_shell_check_scroll(left_w, header_h, content_h);
-        vga_draw_string(gui_shell_x, gui_shell_y, " date time clear", 0x0F);
-        gui_shell_y += 10;
-        gui_shell_check_scroll(left_w, header_h, content_h);
-        vga_draw_string(gui_shell_x, gui_shell_y, " version whoami", 0x0F);
-        gui_shell_y += 10;
-        gui_shell_check_scroll(left_w, header_h, content_h);
-        vga_draw_string(gui_shell_x, gui_shell_y, " shutdown", 0x0F);
-        gui_shell_y += 10;
-    } else if (strcmp(argv[0], "clear") == 0) {
-        vga_fill_rect(left_w + 1, header_h + 1, GFX_WIDTH - left_w - 2, content_h - 2, 0x00);
-        gui_shell_y = header_h + 14;
-    } else if (strcmp(argv[0], "version") == 0) {
-        vga_draw_string(gui_shell_x, gui_shell_y, "Kil0yOS v1.2.0", 0x0F);
-        gui_shell_y += 10;
-    } else if (strcmp(argv[0], "date") == 0) {
-        rtc_time_t t;
-        if (rtc_read(&t) != 0) {
-            vga_draw_string(gui_shell_x, gui_shell_y, "Failed to read RTC", 0x0C);
-        } else {
-            char buf[32];
-            itoa(t.year, buf, 10, sizeof(buf));
-            vga_draw_string(gui_shell_x, gui_shell_y, buf, 0x0F);
-            vga_draw_string(gui_shell_x + strlen(buf) * 6, gui_shell_y, "-", 0x0F);
-            int x = gui_shell_x + (strlen(buf) + 1) * 6;
-            if (t.month < 10) {
-                vga_draw_string(x, gui_shell_y, "0", 0x0F); x += 6;
-            }
-            itoa(t.month, buf, 10, sizeof(buf));
-            vga_draw_string(x, gui_shell_y, buf, 0x0F); x += strlen(buf) * 6;
-            vga_draw_string(x, gui_shell_y, "-", 0x0F); x += 6;
-            if (t.day < 10) {
-                vga_draw_string(x, gui_shell_y, "0", 0x0F); x += 6;
-            }
-            itoa(t.day, buf, 10, sizeof(buf));
-            vga_draw_string(x, gui_shell_y, buf, 0x0F);
-        }
-        gui_shell_y += 10;
-    } else if (strcmp(argv[0], "time") == 0) {
-        rtc_time_t t;
-        if (rtc_read(&t) != 0) {
-            vga_draw_string(gui_shell_x, gui_shell_y, "Failed to read RTC", 0x0C);
-        } else {
-            char buf[32];
-            int x = gui_shell_x;
-            if (t.hour < 10) {
-                vga_draw_string(x, gui_shell_y, "0", 0x0F); x += 6;
-            }
-            itoa(t.hour, buf, 10, sizeof(buf));
-            vga_draw_string(x, gui_shell_y, buf, 0x0F); x += strlen(buf) * 6;
-            vga_draw_string(x, gui_shell_y, ":", 0x0F); x += 6;
-            if (t.minute < 10) {
-                vga_draw_string(x, gui_shell_y, "0", 0x0F); x += 6;
-            }
-            itoa(t.minute, buf, 10, sizeof(buf));
-            vga_draw_string(x, gui_shell_y, buf, 0x0F); x += strlen(buf) * 6;
-            vga_draw_string(x, gui_shell_y, ":", 0x0F); x += 6;
-            if (t.second < 10) {
-                vga_draw_string(x, gui_shell_y, "0", 0x0F); x += 6;
-            }
-            itoa(t.second, buf, 10, sizeof(buf));
-            vga_draw_string(x, gui_shell_y, buf, 0x0F);
-        }
-        gui_shell_y += 10;
-    } else if (strcmp(argv[0], "whoami") == 0) {
-        vga_draw_string(gui_shell_x, gui_shell_y, "user", 0x0F);
-        gui_shell_y += 10;
-    } else if (strcmp(argv[0], "pwd") == 0) {
-        vga_draw_string(gui_shell_x, gui_shell_y, current_path, 0x0F);
-        gui_shell_y += 10;
-    } else if (strcmp(argv[0], "shutdown") == 0) {
-        vga_draw_string(gui_shell_x, gui_shell_y, "Saving filesystem...", 0x0F);
-        gui_shell_y += 10;
-        fs_save();
-        vga_draw_string(gui_shell_x, gui_shell_y, "Shutting down...", 0x0F);
-        gui_shell_y += 10;
-        power_shutdown();
-    } else if (strcmp(argv[0], "ls") == 0) {
-        fs_entry_t* dir = fs_current();
-        if (argc > 1) {
-            dir = fs_resolve_path(argv[1]);
-        }
-        if (dir == NULL) {
-            vga_draw_string(gui_shell_x, gui_shell_y, "ls: No such file or directory", 0x0C);
-            gui_shell_y += 10;
-        } else if (dir->type != FS_TYPE_DIRECTORY) {
-            vga_draw_string(gui_shell_x, gui_shell_y, dir->name, 0x0F);
-            gui_shell_y += 10;
-        } else {
-            for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-                if (dir->children[i] != NULL) {
-                    uint8_t color = (dir->children[i]->type == FS_TYPE_DIRECTORY) ? 0x09 : 0x0F;
-                    vga_draw_string(gui_shell_x, gui_shell_y, dir->children[i]->name, color);
-                    gui_shell_y += 10;
-                    gui_shell_check_scroll(left_w, header_h, content_h);
-                }
-            }
-        }
-    } else if (strcmp(argv[0], "cd") == 0) {
-        if (argc < 2) {
-            fs_set_current(fs_root());
-            update_prompt();
-        } else {
-            fs_entry_t* dir = fs_resolve_path(argv[1]);
-            if (dir == NULL) {
-                vga_draw_string(gui_shell_x, gui_shell_y, "cd: No such file or directory", 0x0C);
-                gui_shell_y += 10;
-            } else if (dir->type != FS_TYPE_DIRECTORY) {
-                vga_draw_string(gui_shell_x, gui_shell_y, "cd: Not a directory", 0x0C);
-                gui_shell_y += 10;
-            } else {
-                fs_set_current(dir);
-                update_prompt();
-            }
-        }
-    } else if (strcmp(argv[0], "mkdir") == 0) {
-        if (argc < 2) {
-            vga_draw_string(gui_shell_x, gui_shell_y, "mkdir: missing operand", 0x0C);
-            gui_shell_y += 10;
-        } else {
-            for (int i = 1; i < argc; i++) {
-                fs_entry_t* result = fs_create_dir(argv[i]);
-                if (result == NULL) {
-                    vga_draw_string(gui_shell_x, gui_shell_y, "mkdir: Cannot create '", 0x0C);
-                    gui_shell_y += 10;
-                    gui_shell_check_scroll(left_w, header_h, content_h);
-                }
-            }
-        }
-    } else if (strcmp(argv[0], "touch") == 0) {
-        if (argc < 2) {
-            vga_draw_string(gui_shell_x, gui_shell_y, "touch: missing operand", 0x0C);
-            gui_shell_y += 10;
-        } else {
-            for (int i = 1; i < argc; i++) {
-                fs_entry_t* result = fs_create_file(argv[i]);
-                if (result == NULL) {
-                    vga_draw_string(gui_shell_x, gui_shell_y, "touch: Cannot create '", 0x0C);
-                    gui_shell_y += 10;
-                    gui_shell_check_scroll(left_w, header_h, content_h);
-                }
-            }
-        }
-    } else {
-        vga_draw_string(gui_shell_x, gui_shell_y, argv[0], 0x0C);
-        int len = strlen(argv[0]) * 6;
-        vga_draw_string(gui_shell_x + len, gui_shell_y, " not found", 0x0C);
-        gui_shell_y += 10;
-    }
-
-    gui_shell_check_scroll(left_w, header_h, content_h);
+    term_putchar('\n');
+    execute_command(cmd_buf);
+    term_putchar('\n');
+    term_gui_render();
 
     gui_shell_len = 0;
     gui_shell_buf[0] = '\0';
-    gui_shell_draw_prompt();
+    gui_shell_y = term_gui_get_cursor_y();
     gui_shell_input_x = gui_shell_x + 12;
+    gui_shell_draw_prompt();
 }
 
 static void gui_draw_content(int left_w, int header_h, int content_h, int active_idx) {
@@ -985,6 +819,7 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
     switch (active_idx) {
         case 0: /* Shell */
             vga_draw_string(cx, cy, "Shell Terminal", 0x0E);
+            term_init_gui(left_w, header_h, content_h);
             gui_shell_init(left_w, header_h);
             break;
         case 1: /* Files */
@@ -1008,6 +843,51 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
             vga_draw_string(cx, cy + 20, "Meow!", 0x0F);
             break;
     }
+}
+
+static void gui_draw_datetime(int footer_h) {
+    rtc_time_t t;
+    if (rtc_read(&t) != 0) return;
+
+    char buf[32];
+    char* p = buf;
+
+    /* year */
+    itoa((int)t.year, p, 10, 16);
+    while (*p) p++;
+    *p++ = '-';
+    /* month */
+    if (t.month < 10) *p++ = '0';
+    itoa((int)t.month, p, 10, 4);
+    while (*p) p++;
+    *p++ = '-';
+    /* day */
+    if (t.day < 10) *p++ = '0';
+    itoa((int)t.day, p, 10, 4);
+    while (*p) p++;
+    *p++ = ' ';
+    /* hour */
+    if (t.hour < 10) *p++ = '0';
+    itoa((int)t.hour, p, 10, 4);
+    while (*p) p++;
+    *p++ = ':';
+    /* minute */
+    if (t.minute < 10) *p++ = '0';
+    itoa((int)t.minute, p, 10, 4);
+    while (*p) p++;
+    *p++ = ':';
+    /* second */
+    if (t.second < 10) *p++ = '0';
+    itoa((int)t.second, p, 10, 4);
+    while (*p) p++;
+    *p = '\0';
+
+    int len = strlen(buf);
+    int x = GFX_WIDTH - len * 6 - 4;
+    if (x < 0) x = 0;
+
+    vga_fill_rect(x, GFX_HEIGHT - footer_h + 1, len * 6 + 2, 8, 0x01);
+    vga_draw_string(x, GFX_HEIGHT - footer_h + 2, buf, 0x0F);
 }
 
 static int cmd_gui(int argc, char** argv) {
@@ -1061,14 +941,22 @@ static int cmd_gui(int argc, char** argv) {
     /* bottom footer bar */
     vga_fill_rect(0, GFX_HEIGHT - footer_h, GFX_WIDTH, footer_h, 0x01);
     vga_draw_rect(0, GFX_HEIGHT - footer_h, GFX_WIDTH, footer_h, 0x0E);
-    vga_draw_string(4, GFX_HEIGHT - footer_h + 2, "Press 'q' to return to text mode", 0x0F);
 
     mouse_state_t prev = { .x = -1, .y = -1, .buttons = 0 };
+    uint8_t last_second = 0xFF;
+
+    gui_draw_datetime(footer_h);
 
     while (1) {
+        /* update clock every second */
+        rtc_time_t t;
+        if (rtc_read(&t) == 0 && t.second != last_second) {
+            last_second = t.second;
+            gui_draw_datetime(footer_h);
+        }
+
         if (keyboard_has_input()) {
             unsigned char c = (unsigned char)keyboard_getc();
-            if (c == 'q') break;
 
             if (c == KEY_UP || c == KEY_DOWN) {
                 int old_idx = selected_idx;
@@ -1133,6 +1021,7 @@ static int cmd_gui(int argc, char** argv) {
 
     mouse_erase_cursor(prev.x, prev.y);
     vga_set_text_mode();
+    term_init_text();
     vga_puts("Returned to text mode.\n");
     return 0;
 }
@@ -1164,6 +1053,7 @@ static int execute_command(char* cmd) {
 }
 
 void shell_init() {
+    term_init_text();
     update_prompt();
 }
 

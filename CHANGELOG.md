@@ -1,6 +1,23 @@
 # Changelog
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+## [2.2.0] - 2026-06-26
+ This release introduces a unified terminal abstraction layer and a GUI terminal emulator, replacing the legacy GUI shell with a proper text buffer renderer.
+## Added
+- Terminal abstraction layer (`terminal.h` / `terminal.c`) providing a unified interface for text and graphical terminals
+- GUI terminal emulator with a character grid buffer (35x19 cells) supporting `\n`, `\b`, `\t`, scrolling, and color attributes
+- `term_gui_render()`: renders the terminal buffer to the VGA graphics canvas
+- `term_gui_get_cursor_y()`: returns the pixel Y coordinate of the current cursor row for input positioning
+- Real-time date/time display in the GUI footer bar (RTC-based, updates every second)
+## Changed
+- GUI Shell now shares the same `execute_command()` logic as the text shell via the terminal abstraction layer
+- Command output inside the GUI is captured by the terminal buffer instead of direct VGA drawing, preventing overlap with user input
+- Footer bar text changed from `"Press 'q' to return to text mode"` to live clock display
+- Updated GUI screenshots (`assets/shellgui.png`, `assets/mew.png`)
+## Removed
+- Pressing `q` in GUI mode no longer returns to text mode; GUI is now the persistent desktop environment
+## Fixed
+- User input no longer overlaps previous command output in the GUI shell; the input prompt follows the terminal cursor
 ## [2.1.0] - 2026-06-26
  This release introduces physical and virtual memory management alongside kernel panic and assertion facilities, laying the groundwork for a robust 64-bit memory subsystem.
 ## Added

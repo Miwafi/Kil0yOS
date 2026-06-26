@@ -290,7 +290,7 @@ void vga_draw_string(int x, int y, const char* str, uint8_t color) {
     while (*str) {
         if (*str == '\n') {
             current_x = x;
-            y += 6;
+            y += 8;
         } else {
             vga_draw_char(current_x, y, *str, color);
             current_x += 6;
