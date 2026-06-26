@@ -7,6 +7,7 @@
 #include "lib/stdlib.h"
 #include "fs/fs.h"
 #include "mm/memory.h"
+#include "sched/scheduler.h"
 #include "core/interrupts.h"
 #include "drivers/power.h"
 #include "drivers/pci.h"
@@ -832,10 +833,79 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
             vga_draw_string(cx, cy + 10, "Edit text files", 0x0F);
             vga_draw_string(cx, cy + 20, "in memory.", 0x0F);
             break;
-        case 3: /* Viewer */
-            vga_draw_string(cx, cy, "Image Viewer", 0x0E);
-            vga_draw_string(cx, cy + 10, "View images in", 0x0F);
-            vga_draw_string(cx, cy + 20, "320x200 mode.", 0x0F);
+        case 3: /* System */
+            vga_draw_string(cx, cy, "System Monitor", 0x0E);
+
+            /* Memory stats */
+            {
+                uint64_t total_p, used_p, free_p;
+                pmm_get_stats(&total_p, &used_p, &free_p);
+                uint64_t total_mb = (total_p * PAGE_SIZE) / (1024 * 1024);
+                uint64_t used_mb  = (used_p  * PAGE_SIZE) / (1024 * 1024);
+                uint64_t free_mb  = (free_p  * PAGE_SIZE) / (1024 * 1024);
+
+                char mem_buf[64];
+                char* mp = mem_buf;
+                strcpy(mp, "Mem: ");
+                mp += strlen(mp);
+                itoa((int)used_mb, mp, 10, 8);
+                mp += strlen(mp);
+                strcpy(mp, " / ");
+                mp += strlen(mp);
+                itoa((int)total_mb, mp, 10, 8);
+                mp += strlen(mp);
+                strcpy(mp, " MB");
+                vga_draw_string(cx, cy + 12, mem_buf, 0x0F);
+
+                /* Progress bar */
+                int bar_x = cx;
+                int bar_y = cy + 24;
+                int bar_w = GFX_WIDTH - left_w - 12;
+                int bar_h = 6;
+                int fill_w = (bar_w * (int)used_mb) / (int)(total_mb ? total_mb : 1);
+
+                vga_fill_rect(bar_x, bar_y, bar_w, bar_h, 0x00);
+                vga_draw_rect(bar_x, bar_y, bar_w, bar_h, 0x0F);
+                vga_fill_rect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, 0x0A);
+
+                char free_buf[32];
+                char* fp = free_buf;
+                strcpy(fp, "Free: ");
+                fp += strlen(fp);
+                itoa((int)free_mb, fp, 10, 8);
+                fp += strlen(fp);
+                strcpy(fp, " MB");
+                vga_draw_string(cx, cy + 34, free_buf, 0x0B);
+            }
+
+            /* Process list */
+            {
+                int proc_y = cy + 50;
+                int ntasks = task_get_count();
+                char proc_title[32];
+                char* pt = proc_title;
+                strcpy(pt, "Processes (");
+                pt += strlen(pt);
+                itoa(ntasks, pt, 10, 4);
+                pt += strlen(pt);
+                strcpy(pt, "):");
+                vga_draw_string(cx, proc_y, proc_title, 0x0E);
+
+                int row = 0;
+                for (int i = 0; i < MAX_TASKS && row < 8; i++) {
+                    int st = task_get_status(i);
+                    if (st == TASK_DEAD) continue;
+
+                    int py = proc_y + 12 + row * 10;
+                    const char* name = task_get_name(i);
+                    const char* sstr = task_status_str(st);
+
+                    vga_draw_string(cx, py, name, 0x0F);
+                    vga_draw_string(cx + 80, py, sstr,
+                        (st == TASK_RUNNING) ? 0x0A : 0x0E);
+                    row++;
+                }
+            }
             break;
         case 4: /* CATs */
             vga_draw_string(cx, cy, "CAT Viewer", 0x0E);
@@ -906,7 +976,7 @@ static int cmd_gui(int argc, char** argv) {
 #define KEY_RIGHT 0x83
 
     /* menu state */
-    const char* menu_items[] = {"Shell", "Files", "Edit", "Viewer", "CATs"};
+    const char* menu_items[] = {"Shell", "Files", "Edit", "System", "CATs"};
     int menu_count = 5;
     int selected_idx = 0;
     int active_idx = 0;

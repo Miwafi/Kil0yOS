@@ -22,4 +22,9 @@ uint64_t scheduler_tick(uint64_t current_rsp);
 int  task_kill(int task_id);
 void task_exit(void);
 
+int task_get_count(void);
+const char* task_get_name(int idx);
+int task_get_status(int idx);
+const char* task_status_str(int status);
+
 #endif

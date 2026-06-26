@@ -300,6 +300,17 @@ void pmm_free_pages(uint64_t phys, size_t count) {
         pmm_free_page(phys + i * PAGE_SIZE);
 }
 
+void pmm_get_stats(uint64_t* total_pages, uint64_t* used_pages, uint64_t* free_pages) {
+    uint64_t used = 0;
+    for (uint64_t i = 0; i < PMM_MAX_PAGES; i++) {
+        if (bitmap_test(i))
+            used++;
+    }
+    if (total_pages) *total_pages = PMM_MAX_PAGES;
+    if (used_pages)  *used_pages  = used;
+    if (free_pages)  *free_pages  = PMM_MAX_PAGES - used;
+}
+
 /* ======================================================================== */
 /*  VMM — Simple Virtual Memory Manager (4-level page tables)               */
 /* ======================================================================== */

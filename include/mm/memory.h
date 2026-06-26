@@ -31,6 +31,7 @@ uint64_t pmm_alloc_page(void);
 uint64_t pmm_alloc_pages(size_t count);
 void pmm_free_page(uint64_t phys);
 void pmm_free_pages(uint64_t phys, size_t count);
+void pmm_get_stats(uint64_t* total_pages, uint64_t* used_pages, uint64_t* free_pages);
 
 /* --- VMM --- */
 #define VMM_PRESENT  0x001

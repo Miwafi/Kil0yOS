@@ -124,3 +124,26 @@ void task_exit(void) {
     __asm__ volatile("int $32");
     __builtin_unreachable();
 }
+
+int task_get_count(void) {
+    return task_count;
+}
+
+const char* task_get_name(int idx) {
+    if (idx < 0 || idx >= MAX_TASKS) return "???";
+    return tasks[idx].name;
+}
+
+int task_get_status(int idx) {
+    if (idx < 0 || idx >= MAX_TASKS) return TASK_DEAD;
+    return tasks[idx].status;
+}
+
+const char* task_status_str(int status) {
+    switch (status) {
+        case TASK_READY:   return "Ready";
+        case TASK_RUNNING: return "Running";
+        case TASK_DEAD:    return "Dead";
+        default:           return "???";
+    }
+}
