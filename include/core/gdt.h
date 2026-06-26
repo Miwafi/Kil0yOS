@@ -17,6 +17,10 @@ typedef struct gdt_ptr {
     uint64_t base;
 } __attribute__((packed)) gdt_ptr_t;
 
+extern gdt_entry_t gdt[5];
+extern gdt_ptr_t gdt_ptr;
+
 void gdt_init();
+void gdt_reload();
 
 #endif

@@ -1,6 +1,7 @@
 CC = gcc
 AS = nasm
 LD = ld
+OBJCOPY = objcopy
 QEMU = qemu-system-x86_64
 
 CFLAGS = -std=c11 -ffreestanding -O2 -Wall -Wextra -fno-stack-protector -m64 -mno-red-zone -fno-pie -mcmodel=large -mno-sse -mno-sse2 -mno-mmx -I$(INCDIR)
@@ -16,7 +17,8 @@ CORE_SRCS = $(SRCDIR)/kernel/core/main.c \
             $(SRCDIR)/kernel/core/gdt.c \
             $(SRCDIR)/kernel/core/idt.c \
             $(SRCDIR)/kernel/core/isr.c \
-            $(SRCDIR)/kernel/core/interrupts.c
+            $(SRCDIR)/kernel/core/interrupts.c \
+            $(SRCDIR)/kernel/core/smp.c
 
 # --- Memory Management ---
 MM_SRCS = $(SRCDIR)/kernel/mm/memory.c
@@ -29,7 +31,8 @@ DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
                $(SRCDIR)/kernel/drivers/device.c \
                $(SRCDIR)/kernel/drivers/power.c \
                $(SRCDIR)/kernel/drivers/pci.c \
-               $(SRCDIR)/kernel/drivers/rtc.c
+               $(SRCDIR)/kernel/drivers/rtc.c \
+               $(SRCDIR)/kernel/drivers/speaker.c
 
 # --- Network ---
 NET_SRCS = $(SRCDIR)/kernel/net/net.c \
@@ -87,8 +90,16 @@ $(KERNEL_ASM_OBJS): $(SRCDIR)/kernel/core/isr.asm
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) $< -o $@
 
-$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ)
-	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) -o $@
+$(BUILDDIR)/ap_trampoline.bin: $(SRCDIR)/kernel/core/ap_trampoline.asm | $(BUILDDIR)
+	@mkdir -p $(dir $@)
+	$(AS) -f bin $< -o $@
+
+$(BUILDDIR)/kernel/core/ap_trampoline.o: $(BUILDDIR)/ap_trampoline.bin | $(BUILDDIR)
+	@mkdir -p $(dir $@)
+	$(OBJCOPY) -I binary -O elf64-x86-64 $< $@
+
+$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o
+	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o -o $@
 
 $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 	@mkdir -p $(BUILDDIR)/iso/boot/grub

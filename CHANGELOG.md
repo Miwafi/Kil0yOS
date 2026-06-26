@@ -1,6 +1,42 @@
 # Changelog
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+## [2.3.0] - 2026-06-26
+ This release focuses on driver-level improvements: SMP multicore support, ATA DMA, PC speaker audio, and critical ACPI fixes.
+## Added
+ ### SMP / Multicore Support
+ - AP (Application Processor) trampoline (`ap_trampoline.asm`) for 16-bit real mode to 64-bit long mode transition
+ - MADT (Multiple APIC Description Table) parser to detect available CPU cores via ACPI
+ - `smp_init()`: initializes and starts all AP cores using INIT-SIPI-SIPI sequence via LAPIC ICR
+ - `ap_main()`: AP entry point that reloads GDT/IDT and enters idle halt loop
+ - `smp_get_cpu_count()`: returns the number of online CPUs
+ ### ATA DMA (Bus Master IDE)
+ - Bus Master IDE DMA support for ATA disk reads with automatic fallback to PIO
+ - PRDT (Physical Region Descriptor Table) setup for single-sector DMA transfers
+ - `ata_read_sector_dma()`: performs disk reads via DMA engine instead of CPU-driven PIO
+ ### PC Speaker Audio
+ - New speaker driver (`speaker.c` / `speaker.h`) using PIT channel 2 square wave generation
+ - `speaker_play(uint32_t freq_hz)`: plays a tone at the specified frequency
+ - `speaker_stop()`: disables the PC speaker gate
+ - `speaker_beep(uint32_t freq_hz, uint32_t duration_ms)`: synchronous beep with PIT-based delay
+ - `pit_delay_ms()`: precise millisecond delay using PIT counter reads
+ ### ACPI Infrastructure
+ - Public `acpi_find_table(const char* sig)` exposed via `power.h` for external ACPI table lookup
+## Fixed
+ - **XSDT pointer truncation** in `power.c`: 64-bit XSDT addresses were truncated to 32-bit, causing ACPI table lookup failures on systems with tables above 4 GiB. Now properly reads the 64-bit extended field and skips entries beyond identity-mapped range.
+## Changed
+ - `gdt_reload()` and `idt_reload()`: new functions to reload GDT/IDT without reinitializing entries, used by AP cores
+ - `gdt[]`, `gdt_ptr`, `idt[]`, `idt_ptr`: removed `static` linkage so AP trampoline and SMP code can reference them
+## File Changes
+ - `src/kernel/core/ap_trampoline.asm`: new AP startup trampoline
+ - `src/kernel/core/smp.c`, `include/core/smp.h`: SMP initialization and AP management
+ - `src/kernel/core/gdt.c`, `include/core/gdt.h`: exposed GDT symbols and added reload function
+ - `src/kernel/core/idt.c`, `include/core/idt.h`: exposed IDT symbols and added reload function
+ - `src/kernel/drivers/disk.c`: added Bus Master IDE DMA implementation
+ - `src/kernel/drivers/speaker.c`, `include/drivers/speaker.h`: new PC speaker driver
+ - `src/kernel/timer/pit.c`, `include/timer/pit.h`: added `pit_delay_ms()`
+ - `src/kernel/drivers/power.c`, `include/drivers/power.h`: fixed XSDT 64-bit handling, exposed `acpi_find_table()`
+ - `Makefile`: added AP trampoline binary embedding via `objcopy`
 ## [2.2.0] - 2026-06-26
  This release introduces a unified terminal abstraction layer and a GUI terminal emulator, replacing the legacy GUI shell with a proper text buffer renderer.
 ## Added

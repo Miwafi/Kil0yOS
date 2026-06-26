@@ -132,16 +132,31 @@ static void* find_table(const char* sig) {
     } else {
         /* XSDT uses 64-bit pointers - read from extended field */
         uint64_t xsdt_addr = *(uint64_t*)((uint8_t*)rsdp + 24); /* offset 24 in v2+ RSDP */
-        acpi_sdt_header_t* xsdt = (acpi_sdt_header_t*)(uint32_t)(xsdt_addr & 0xFFFFFFFF);
-        int entries = (xsdt->length - sizeof(acpi_sdt_header_t)) / 4;
-        uint32_t* ptrs = (uint32_t*)(xsdt + 1);
+
+        /* For now we require ACPI tables to be identity-mapped below 4 GiB.
+         * Mapping tables above 4 GiB needs a temporary VMM mapping.
+         */
+        if (xsdt_addr >= 0x100000000ULL) {
+            /* XSDT above 4 GiB — not supported without temp mapping */
+            return NULL;
+        }
+
+        acpi_sdt_header_t* xsdt = (acpi_sdt_header_t*)(uintptr_t)xsdt_addr;
+        int entries = (xsdt->length - sizeof(acpi_sdt_header_t)) / 8;
+        uint64_t* ptrs = (uint64_t*)(xsdt + 1);
         for (int i = 0; i < entries; i++) {
-            acpi_sdt_header_t* hdr = (acpi_sdt_header_t*)ptrs[i];
+            uint64_t entry_addr = ptrs[i];
+            if (entry_addr >= 0x100000000ULL) continue; /* skip >4 GiB entries */
+            acpi_sdt_header_t* hdr = (acpi_sdt_header_t*)(uintptr_t)entry_addr;
             if (memcmp(hdr->signature, sig, 4) == 0) return hdr;
         }
     }
 
     return NULL;
+}
+
+void* acpi_find_table(const char* sig) {
+    return find_table(sig);
 }
 
 void power_init(void) {

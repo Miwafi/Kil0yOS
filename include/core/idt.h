@@ -20,7 +20,11 @@ typedef struct idt_ptr {
 
 #include "core/isr.h"
 
+extern idt_entry_t idt[256];
+extern idt_ptr_t idt_ptr;
+
 void idt_init();
+void idt_reload();
 void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags);
 
 #endif

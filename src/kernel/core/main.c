@@ -2,12 +2,14 @@
 #include "core/idt.h"
 #include "core/isr.h"
 #include "core/interrupts.h"
+#include "core/smp.h"
 #include "mm/memory.h"
 #include "drivers/vga.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "drivers/power.h"
 #include "drivers/pci.h"
+#include "drivers/speaker.h"
 #include "shell/shell.h"
 #include "fs/fs.h"
 #include "drivers/device.h"
@@ -54,7 +56,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    vga_puts("Kil0yOS v2.1.0\n");
+    vga_puts("Kil0yOS v2.3.0\n");
     vga_puts("==================================\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -131,6 +133,12 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_puts("[Mouse] OK\n");
     serial_puts("[Mouse] OK\n");
 
+    vga_puts("[Speaker] Initializing\n");
+    serial_puts("[Speaker] Initializing\n");
+    speaker_init();
+    vga_puts("[Speaker] OK\n");
+    serial_puts("[Speaker] OK\n");
+
     vga_puts("[Scheduler] Initializing\n");
     serial_puts("[Scheduler] Initializing\n");
     scheduler_init();
@@ -154,6 +162,12 @@ void kernel_main(uint64_t mb_info_phys) {
     pci_init();
     vga_puts("[PCI] OK\n");
     serial_puts("[PCI] OK\n");
+
+    vga_puts("[SMP] Initializing\n");
+    serial_puts("[SMP] Initializing\n");
+    smp_init();
+    vga_puts("[SMP] OK\n");
+    serial_puts("[SMP] OK\n");
 
     vga_puts("[Network] Initializing\n");
     serial_puts("[Network] Initializing\n");
