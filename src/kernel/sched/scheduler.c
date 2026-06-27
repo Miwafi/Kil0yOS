@@ -5,6 +5,9 @@ static task_t tasks[MAX_TASKS];
 static int task_count = 0;
 static int current_task_idx = 0;
 
+volatile uint64_t cpu_busy_ticks = 0;
+volatile uint64_t cpu_idle_ticks = 0;
+
 void scheduler_init() {
     task_count = 1;
     current_task_idx = 0;
@@ -91,8 +94,11 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
     tasks[current_task_idx].rsp = current_rsp;
 
     if (task_count <= 1) {
+        cpu_idle_ticks++;
         return tasks[current_task_idx].rsp;
     }
+
+    cpu_busy_ticks++;
 
     int next = current_task_idx;
     do {

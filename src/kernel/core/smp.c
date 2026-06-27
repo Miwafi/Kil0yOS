@@ -25,6 +25,8 @@ static volatile uint32_t ap_ready_count = 0;
 static uint8_t num_cpus = 1;
 static uint8_t apic_ids[MAX_APS];
 
+volatile uint32_t cpu_usage_percent[MAX_APS + 1] = {0};
+
 /* MADT structures */
 typedef struct {
     char     signature[4];
@@ -200,4 +202,27 @@ void smp_init(void) {
 
 uint32_t smp_get_cpu_count(void) {
     return ap_ready_count + 1;
+}
+
+void smp_update_cpu_usage(void) {
+    extern volatile uint64_t cpu_busy_ticks;
+    extern volatile uint64_t cpu_idle_ticks;
+
+    uint64_t busy = cpu_busy_ticks;
+    uint64_t idle = cpu_idle_ticks;
+    uint64_t total = busy + idle;
+
+    if (total > 0) {
+        cpu_usage_percent[0] = (uint32_t)((busy * 100) / total);
+    } else {
+        cpu_usage_percent[0] = 0;
+    }
+
+    /* AP cores are always idle (halt loop) */
+    for (uint32_t i = 1; i < MAX_APS + 1; i++) {
+        cpu_usage_percent[i] = 0;
+    }
+
+    cpu_busy_ticks = 0;
+    cpu_idle_ticks = 0;
 }

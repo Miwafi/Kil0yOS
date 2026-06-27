@@ -15,7 +15,6 @@
 #include "drivers/device.h"
 #include "timer/pit.h"
 #include "sched/scheduler.h"
-#include "net/net.h"
 
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -168,12 +167,6 @@ void kernel_main(uint64_t mb_info_phys) {
     smp_init();
     vga_puts("[SMP] OK\n");
     serial_puts("[SMP] OK\n");
-
-    vga_puts("[Network] Initializing\n");
-    serial_puts("[Network] Initializing\n");
-    net_init();
-    vga_puts("[Network] OK\n");
-    serial_puts("[Network] OK\n");
 
     vga_puts("\nWelcome!\n");
     serial_puts("\nWelcome!\n");

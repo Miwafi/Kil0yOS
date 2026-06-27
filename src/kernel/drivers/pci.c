@@ -86,19 +86,6 @@ void pci_init() {
                     dev->next = pci_devices;
                     pci_devices = dev;
 
-                    if (class_code == PCI_CLASS_NETWORK) {
-                        vga_puts("[PCI] Found network device: ");
-                        char buf[8];
-                        utoa(vendor_id, buf, 16, sizeof(buf));
-                        vga_puts(buf);
-                        vga_puts(":");
-                        utoa(device_id, buf, 16, sizeof(buf));
-                        vga_puts(buf);
-                        vga_puts(" IRQ:");
-                        itoa(irq, buf, 10, sizeof(buf));
-                        vga_puts(buf);
-                        vga_puts("\n");
-                    }
                 }
             }
         }
@@ -127,14 +114,3 @@ pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass_code) {
     return NULL;
 }
 
-void pci_get_network_devices(pci_device_t** devices, int* count) {
-    *count = 0;
-    pci_device_t* dev = pci_devices;
-    while (dev != NULL) {
-        if (dev->class_code == PCI_CLASS_NETWORK) {
-            devices[*count] = dev;
-            (*count)++;
-        }
-        dev = dev->next;
-    }
-}

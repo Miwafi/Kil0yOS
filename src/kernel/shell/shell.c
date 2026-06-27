@@ -9,13 +9,11 @@
 #include "mm/memory.h"
 #include "sched/scheduler.h"
 #include "core/interrupts.h"
+#include "core/smp.h"
 #include "drivers/power.h"
 #include "drivers/pci.h"
 #include "drivers/rtc.h"
 #include "fs/edit.h"
-#include "net/net.h"
-#include "net/dhcp.h"
-#include "net/e1000.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -42,8 +40,6 @@ static int cmd_version(int argc, char** argv);
 static int cmd_edit(int argc, char** argv);
 static int cmd_date(int argc, char** argv);
 static int cmd_time(int argc, char** argv);
-static int cmd_net(int argc, char** argv);
-static int cmd_ping(int argc, char** argv);
 static int cmd_gfx(int argc, char** argv);
 static int cmd_gui(int argc, char** argv);
 
@@ -60,8 +56,6 @@ static shell_command_t commands[] = {
     {"whoami", "Print current user", cmd_whoami},
     {"version", "Show OS version", cmd_version},
     {"edit", "Edit file", cmd_edit},
-    {"net", "Network management", cmd_net},
-    {"ping", "Send ICMP echo requests", cmd_ping},
     {"gfx", "Graphical display test", cmd_gfx},
     {"gui", "Launch desktop GUI", cmd_gui},
     {"date", "Show current date", cmd_date},
@@ -458,291 +452,6 @@ static int cmd_time(int argc, char** argv) {
     return 0;
 }
 
-static int cmd_net(int argc, char** argv) {
-    if (argc < 2) {
-        vga_puts("Usage: net <subcommand>\n");
-        vga_puts("Available subcommands:\n");
-        vga_puts("  chknic             - Check available network interfaces\n");
-        vga_puts("  wire <interface>   - Connect to wired network via DHCP\n");
-        vga_puts("  status             - Show network status\n");
-        vga_puts("  help               - Show this help\n");
-        return 0;
-    }
-
-    if (strcmp(argv[1], "chknic") == 0) {
-        vga_puts("Available Network Interfaces:\n");
-        vga_puts("============================\n");
-
-        pci_device_t* devices[16];
-        int count = 0;
-        pci_get_network_devices(devices, &count);
-
-        if (count == 0) {
-            vga_puts("No network devices found.\n");
-            return 0;
-        }
-
-        for (int i = 0; i < count; i++) {
-            pci_device_t* dev = devices[i];
-            vga_puts("eth");
-            char idx_buf[4];
-            itoa(i, idx_buf, 10, sizeof(idx_buf));
-            vga_puts(idx_buf);
-            vga_puts(": ");
-
-            if (dev->vendor_id == E1000_VENDOR_ID && dev->device_id == E1000_DEVICE_ID) {
-                vga_puts("Intel PRO/1000 MT");
-            } else if (dev->vendor_id == RTL8139_VENDOR_ID) {
-                vga_puts("Realtek RTL8139");
-            } else {
-                vga_puts("Unknown (");
-                char buf[8];
-                utoa(dev->vendor_id, buf, 16, sizeof(buf));
-                vga_puts(buf);
-                vga_puts(":");
-                utoa(dev->device_id, buf, 16, sizeof(buf));
-                vga_puts(buf);
-                vga_puts(")");
-            }
-
-            vga_puts(" [");
-            vga_puts(net_interface.initialized ? "active" : "inactive");
-            vga_puts("]\n");
-
-            vga_puts("       Bus:Dev:Func = ");
-            char bus_buf[8], dev_buf[8], func_buf[8];
-            itoa(dev->bus, bus_buf, 10, sizeof(bus_buf));
-            itoa(dev->device, dev_buf, 10, sizeof(dev_buf));
-            itoa(dev->function, func_buf, 10, sizeof(func_buf));
-            vga_puts(bus_buf);
-            vga_puts(":");
-            vga_puts(dev_buf);
-            vga_puts(":");
-            vga_puts(func_buf);
-            vga_puts(", IRQ: ");
-            itoa(dev->irq, bus_buf, 10, sizeof(bus_buf));
-            vga_puts(bus_buf);
-            vga_puts("\n");
-        }
-
-        return 0;
-    }
-
-    if (strcmp(argv[1], "wire") == 0) {
-        if (argc < 3) {
-            vga_puts("Usage: net wire <interface>\n");
-            vga_puts("Example: net wire eth0\n");
-            return 1;
-        }
-
-        vga_puts("Connecting to wired network on interface '");
-        vga_puts(argv[2]);
-        vga_puts("'...\n");
-
-        if (strcmp(argv[2], "eth0") != 0) {
-            vga_puts("[ERROR] Interface '");
-            vga_puts(argv[2]);
-            vga_puts("' not found\n");
-            return 1;
-        }
-
-        if (!net_interface.initialized) {
-            vga_puts("[ERROR] Network interface not initialized\n");
-            return 1;
-        }
-
-        vga_puts("[OK] Link detected\n");
-        vga_puts("[OK] Obtaining IP address via DHCP...\n");
-
-        dhcp_discover();
-
-        for (int i = 0; i < 20000000; i++) {
-            __asm__ volatile("nop");
-            if ((i % 10000) == 0) {
-                e1000_poll();
-            }
-            if (net_interface.ip != 0) {
-                break;
-            }
-        }
-
-        if (net_interface.ip != 0) {
-            vga_puts("[OK] Connected\n");
-            vga_puts("     IP Address: ");
-            char ip_buf[16];
-            net_ip_to_str(net_interface.ip, ip_buf);
-            vga_puts(ip_buf);
-            vga_puts("\n");
-            vga_puts("     Subnet Mask: ");
-            net_ip_to_str(net_interface.subnet, ip_buf);
-            vga_puts(ip_buf);
-            vga_puts("\n");
-            vga_puts("     Gateway: ");
-            net_ip_to_str(net_interface.gateway, ip_buf);
-            vga_puts(ip_buf);
-            vga_puts("\n");
-            vga_puts("     DNS: ");
-            net_ip_to_str(net_interface.dns, ip_buf);
-            vga_puts(ip_buf);
-            vga_puts("\n");
-        } else {
-            vga_puts("[ERROR] Failed to obtain IP address\n");
-            vga_puts("[INFO] Check if DHCP server is available on the network\n");
-            return 1;
-        }
-
-        return 0;
-    }
-
-    if (strcmp(argv[1], "status") == 0) {
-        vga_puts("Network Status:\n");
-        vga_puts("===============\n");
-
-        if (net_interface.initialized) {
-            vga_puts(NET_IFACE_NAME ": ");
-            vga_puts(net_interface.link_up ? "UP" : "DOWN");
-            vga_puts(" (Wired)\n");
-
-            vga_puts("      MAC: ");
-            for (int i = 0; i < ETH_MAC_LEN; i++) {
-                char buf[3];
-                utoa(net_interface.mac[i], buf, 16, sizeof(buf));
-                vga_puts(buf);
-                if (i < ETH_MAC_LEN - 1) vga_puts(":");
-            }
-            vga_puts("\n");
-
-            if (net_interface.ip != 0) {
-                vga_puts("      IP: ");
-                char ip_buf[16];
-                net_ip_to_str(net_interface.ip, ip_buf);
-                vga_puts(ip_buf);
-                vga_puts("\n");
-            } else {
-                vga_puts("      IP: Not assigned\n");
-            }
-        } else {
-            vga_puts(NET_IFACE_NAME ": DOWN (No interface)\n");
-        }
-
-        vga_puts("wlan0: DOWN (Wireless)\n");
-        return 0;
-    }
-
-    if (strcmp(argv[1], "help") == 0) {
-        vga_puts("net - Network management utility\n");
-        vga_puts("================================\n");
-        vga_puts("Usage: net <subcommand> [options]\n");
-        vga_puts("\n");
-        vga_puts("Subcommands:\n");
-        vga_puts("  wire <interface>    Connect to wired network via DHCP\n");
-        vga_puts("  status              Display network interface status\n");
-        vga_puts("  help                Show this help message\n");
-        return 0;
-    }
-
-    vga_puts("net: unknown subcommand '");
-    vga_puts(argv[1]);
-    vga_puts("'\n");
-    vga_puts("Type 'net help' for available subcommands.\n");
-    return 1;
-}
-
-static int cmd_ping(int argc, char** argv) {
-    if (argc < 2) {
-        vga_puts("Usage: ping <host>\n");
-        vga_puts("Example: ping 192.168.1.1\n");
-        vga_puts("         ping google.com\n");
-        return 1;
-    }
-
-    if (!net_interface.initialized) {
-        vga_puts("ping: Network interface not initialized\n");
-        return 1;
-    }
-
-    if (net_interface.ip == 0) {
-        vga_puts("ping: No IP address assigned. Use 'net wire eth0' first.\n");
-        return 1;
-    }
-
-    const char* host = argv[1];
-    int count = 4;
-
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            count = atoi(argv[i + 1]);
-            if (count <= 0) count = 4;
-            i++;
-        }
-    }
-
-    uint32_t dest_ip = net_str_to_ip(host);
-
-    vga_puts("PING ");
-    vga_puts(host);
-    vga_puts(" (");
-    char ip_buf[16];
-    net_ip_to_str(dest_ip, ip_buf);
-    vga_puts(ip_buf);
-    vga_puts("): 64 bytes of data.\n");
-
-    int received = 0;
-    uint16_t ping_id = 1234;
-
-    for (int i = 0; i < count; i++) {
-        int result = net_send_icmp_echo(dest_ip, ping_id, i + 1);
-
-        if (result == 0) {
-            vga_puts("64 bytes from ");
-            vga_puts(host);
-            vga_puts(": icmp_seq=");
-
-            char seq_buf[4];
-            itoa(i + 1, seq_buf, 10, sizeof(seq_buf));
-            vga_puts(seq_buf);
-
-            vga_puts(" ttl=64 time=");
-
-            char time_buf[8];
-            int rtt = 10 + (i * 5) % 50;
-            itoa(rtt, time_buf, 10, sizeof(time_buf));
-            vga_puts(time_buf);
-            vga_puts(" ms\n");
-
-            received++;
-        } else {
-            vga_puts("ping: send failed\n");
-        }
-
-        for (int d = 0; d < 1000000; d++) {
-            __asm__ volatile("nop");
-        }
-    }
-
-    vga_puts("\n--- ");
-    vga_puts(host);
-    vga_puts(" ping statistics ---\n");
-
-    char count_buf[4];
-    itoa(count, count_buf, 10, sizeof(count_buf));
-    vga_puts(count_buf);
-    vga_puts(" packets transmitted, ");
-
-    char recv_buf[4];
-    itoa(received, recv_buf, 10, sizeof(recv_buf));
-    vga_puts(recv_buf);
-    vga_puts(" received, ");
-
-    int loss = ((count - received) * 100) / count;
-    char loss_buf[4];
-    itoa(loss, loss_buf, 10, sizeof(loss_buf));
-    vga_puts(loss_buf);
-    vga_puts("% packet loss\n");
-
-    return 0;
-}
-
 static int cmd_edit(int argc, char** argv) {
     if (argc < 2) {
         vga_puts("edit: missing file operand\n");
@@ -836,6 +545,53 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
         case 3: /* System */
             vga_draw_string(cx, cy, "System Monitor", 0x0E);
 
+            /* CPU stats */
+            {
+                uint32_t ncpus = smp_get_cpu_count();
+                char cpu_title[32];
+                char* cp = cpu_title;
+                strcpy(cp, "CPUs: ");
+                cp += strlen(cp);
+                itoa((int)ncpus, cp, 10, 4);
+                cp += strlen(cp);
+                vga_draw_string(cx, cy + 12, cpu_title, 0x0F);
+
+                int bar_w = GFX_WIDTH - left_w - 12;
+                int bar_h = 6;
+                int bar_x = cx;
+                int max_cores = (int)ncpus;
+                if (max_cores > 4) max_cores = 4;
+
+                for (int i = 0; i < max_cores; i++) {
+                    int bar_y = cy + 24 + i * 12;
+                    uint32_t usage = cpu_usage_percent[i];
+                    if (usage > 100) usage = 100;
+                    int fill_w = (bar_w * (int)usage) / 100;
+
+                    char label[16];
+                    char* lp = label;
+                    strcpy(lp, "CPU");
+                    lp += strlen(lp);
+                    itoa(i, lp, 10, 2);
+                    lp += strlen(lp);
+                    strcpy(lp, ":");
+                    vga_draw_string(bar_x, bar_y - 1, label, 0x0E);
+
+                    vga_fill_rect(bar_x + 30, bar_y, bar_w - 30, bar_h, 0x00);
+                    vga_draw_rect(bar_x + 30, bar_y, bar_w - 30, bar_h, 0x0F);
+
+                    uint8_t color = 0x0A;
+                    if (usage > 50) color = 0x0E;
+                    if (usage > 80) color = 0x0C;
+                    vga_fill_rect(bar_x + 31, bar_y + 1, fill_w - 2, bar_h - 2, color);
+
+                    char pct[8];
+                    itoa((int)usage, pct, 10, 4);
+                    int plen = strlen(pct);
+                    vga_draw_string(bar_x + 30 + bar_w - 30 - plen * 6 - 2, bar_y - 1, pct, 0x0F);
+                }
+            }
+
             /* Memory stats */
             {
                 uint64_t total_p, used_p, free_p;
@@ -855,11 +611,11 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
                 itoa((int)total_mb, mp, 10, 8);
                 mp += strlen(mp);
                 strcpy(mp, " MB");
-                vga_draw_string(cx, cy + 12, mem_buf, 0x0F);
+                vga_draw_string(cx, cy + 66, mem_buf, 0x0F);
 
                 /* Progress bar */
                 int bar_x = cx;
-                int bar_y = cy + 24;
+                int bar_y = cy + 78;
                 int bar_w = GFX_WIDTH - left_w - 12;
                 int bar_h = 6;
                 int fill_w = (bar_w * (int)used_mb) / (int)(total_mb ? total_mb : 1);
@@ -875,12 +631,12 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
                 itoa((int)free_mb, fp, 10, 8);
                 fp += strlen(fp);
                 strcpy(fp, " MB");
-                vga_draw_string(cx, cy + 34, free_buf, 0x0B);
+                vga_draw_string(cx, cy + 88, free_buf, 0x0B);
             }
 
             /* Process list */
             {
-                int proc_y = cy + 50;
+                int proc_y = cy + 104;
                 int ntasks = task_get_count();
                 char proc_title[32];
                 char* pt = proc_title;
@@ -1023,6 +779,12 @@ static int cmd_gui(int argc, char** argv) {
         if (rtc_read(&t) == 0 && t.second != last_second) {
             last_second = t.second;
             gui_draw_datetime(footer_h);
+
+            /* auto-refresh System Monitor CPU stats */
+            if (active_idx == 3) {
+                smp_update_cpu_usage();
+                gui_draw_content(left_w, header_h, content_h, active_idx);
+            }
         }
 
         if (keyboard_has_input()) {
