@@ -3,6 +3,7 @@
 #include "drivers/io.h"
 #include "core/interrupts.h"
 #include "sched/scheduler.h"
+#include "timer/pit.h"
 
 #define IRQ0 32
 
@@ -81,10 +82,13 @@ uint64_t irq_handler(interrupt_frame_t* frame) {
     }
 
     if (irq_num == 0) {
+        pit_ticks++;
         pic_send_eoi(0);
         return scheduler_tick((uint64_t)frame);
     }
 
-    pic_send_eoi(irq_num);
+    /* Non-zero IRQ handlers must send EOI themselves; do NOT send fallback EOI here
+     * to avoid double-EOI which corrupts PIC state (especially on VirtualBox).
+     */
     return (uint64_t)frame;
 }

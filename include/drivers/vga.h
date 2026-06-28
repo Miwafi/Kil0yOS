@@ -58,6 +58,9 @@ void vga_fill_rect(int x, int y, int w, int h, uint8_t color);
 void vga_draw_rect(int x, int y, int w, int h, uint8_t color);
 void vga_draw_char(int x, int y, char c, uint8_t color);
 void vga_draw_string(int x, int y, const char* str, uint8_t color);
+
+/* Kernel log – prints timestamped message to both VGA and serial */
+extern void klog(const char* s);
 void vga_draw_window(int x, int y, int w, int h, const char* title);
 
 #endif

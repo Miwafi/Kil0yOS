@@ -9,6 +9,43 @@
 
 static uint32_t pit_divisor = 1193;
 
+volatile uint64_t pit_ticks = 0;
+
+void pit_format_time(char* buf, size_t len) {
+    if (len < 20) { buf[0] = '\0'; return; }
+
+    uint64_t ticks = pit_ticks;
+    uint64_t sec = ticks / 100;
+    uint64_t usec = (ticks % 100) * 10000ULL;
+
+    char sec_str[16];
+    int sec_len = 0;
+    uint64_t t = sec;
+    do {
+        sec_str[sec_len++] = '0' + (t % 10);
+        t /= 10;
+    } while (t > 0);
+
+    int pos = 0;
+    buf[pos++] = '[';
+    int padding = 5 - sec_len;
+    if (padding < 0) padding = 0;
+    for (int i = 0; i < padding; i++) buf[pos++] = ' ';
+    for (int i = sec_len - 1; i >= 0; i--) buf[pos++] = sec_str[i];
+
+    buf[pos++] = '.';
+
+    uint64_t div = 100000;
+    while (div > 0) {
+        buf[pos++] = '0' + (usec / div) % 10;
+        div /= 10;
+    }
+
+    buf[pos++] = ']';
+    buf[pos++] = ' ';
+    buf[pos] = '\0';
+}
+
 void pit_init(uint32_t frequency) {
     if (frequency == 0 || frequency > PIT_BASE_FREQ) frequency = 1000;
 

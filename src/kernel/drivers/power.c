@@ -3,6 +3,7 @@
 #include "drivers/io.h"
 #include "core/interrupts.h"
 #include "lib/string.h"
+#include "mm/memory.h"
 
 /* RSDP (Root System Description Pointer) */
 typedef struct {
@@ -76,6 +77,24 @@ typedef struct {
 static int acpi_available = 0;
 static acpi_fadt_t* fadt = NULL;
 
+/* Temporary mapping window for ACPI tables located above 4 GiB */
+#define ACPI_TEMP_VIRT 0xFFFFFFFFC0000000ULL
+
+static void* acpi_temp_map(uint64_t phys, size_t size) {
+    if (phys < 0x100000000ULL) {
+        return (void*)(uintptr_t)phys;
+    }
+    uint64_t start_page = phys & ~0xFFF;
+    uint64_t offset = phys & 0xFFF;
+    uint64_t pages = (offset + size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++) {
+        vmm_map_page(ACPI_TEMP_VIRT + i * PAGE_SIZE,
+                     start_page + i * PAGE_SIZE,
+                     VMM_PRESENT | VMM_WRITABLE);
+    }
+    return (void*)(ACPI_TEMP_VIRT + offset);
+}
+
 /* Simple checksum: sum of all bytes should be 0 */
 static uint8_t checksum(void* ptr, size_t len) {
     uint8_t sum = 0;
@@ -89,11 +108,14 @@ static uint8_t checksum(void* ptr, size_t len) {
 /* Search for RSDP in EBDA and BIOS ROM area */
 static acpi_rsdp_t* find_rsdp() {
     /* Check EBDA (first KB at 40:0E) */
-    uint16_t ebda_addr = *(uint16_t*)0x0000040E;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+    uint16_t ebda_addr = *(volatile uint16_t*)(uintptr_t)0x0000040E;
+#pragma GCC diagnostic pop
     if (ebda_addr) {
         ebda_addr *= 16; /* Convert to physical address */
         for (uint16_t off = 0; off < 1024; off += 16) {
-            acpi_rsdp_t* rsdp = (acpi_rsdp_t*)(ebda_addr + off);
+            acpi_rsdp_t* rsdp = (acpi_rsdp_t*)(uintptr_t)(ebda_addr + off);
             if (memcmp(rsdp->signature, "RSD PTR ", 8) == 0 &&
                 checksum(rsdp, sizeof(acpi_rsdp_t)) == 0) {
                 return rsdp;
@@ -103,7 +125,7 @@ static acpi_rsdp_t* find_rsdp() {
 
     /* Search BIOS ROM area (0xE0000 - 0xFFFFF) */
     for (uint32_t addr = 0xE0000; addr < 0x100000; addr += 16) {
-        acpi_rsdp_t* rsdp = (acpi_rsdp_t*)addr;
+        acpi_rsdp_t* rsdp = (acpi_rsdp_t*)(uintptr_t)addr;
         if (memcmp(rsdp->signature, "RSD PTR ", 8) == 0 &&
             checksum(rsdp, sizeof(acpi_rsdp_t)) == 0) {
             return rsdp;
@@ -122,33 +144,36 @@ static void* find_table(const char* sig) {
 
     if (!is_xsdt) {
         /* RSDT uses 32-bit pointers */
-        acpi_sdt_header_t* rsdt = (acpi_sdt_header_t*)rsdp->rsdt_address;
+        acpi_sdt_header_t* rsdt = (acpi_sdt_header_t*)(uintptr_t)rsdp->rsdt_address;
         int entries = (rsdt->length - sizeof(acpi_sdt_header_t)) / 4;
         uint32_t* ptrs = (uint32_t*)(rsdt + 1);
         for (int i = 0; i < entries; i++) {
-            acpi_sdt_header_t* hdr = (acpi_sdt_header_t*)ptrs[i];
+            acpi_sdt_header_t* hdr = (acpi_sdt_header_t*)(uintptr_t)ptrs[i];
             if (memcmp(hdr->signature, sig, 4) == 0) return hdr;
         }
     } else {
         /* XSDT uses 64-bit pointers - read from extended field */
         uint64_t xsdt_addr = *(uint64_t*)((uint8_t*)rsdp + 24); /* offset 24 in v2+ RSDP */
 
-        /* For now we require ACPI tables to be identity-mapped below 4 GiB.
-         * Mapping tables above 4 GiB needs a temporary VMM mapping.
-         */
-        if (xsdt_addr >= 0x100000000ULL) {
-            /* XSDT above 4 GiB — not supported without temp mapping */
-            return NULL;
-        }
-
-        acpi_sdt_header_t* xsdt = (acpi_sdt_header_t*)(uintptr_t)xsdt_addr;
+        acpi_sdt_header_t* xsdt = (acpi_sdt_header_t*)acpi_temp_map(xsdt_addr, sizeof(acpi_sdt_header_t));
         int entries = (xsdt->length - sizeof(acpi_sdt_header_t)) / 8;
+        /* Remap with full entries region */
+        xsdt = (acpi_sdt_header_t*)acpi_temp_map(xsdt_addr, sizeof(acpi_sdt_header_t) + entries * 8);
         uint64_t* ptrs = (uint64_t*)(xsdt + 1);
         for (int i = 0; i < entries; i++) {
             uint64_t entry_addr = ptrs[i];
-            if (entry_addr >= 0x100000000ULL) continue; /* skip >4 GiB entries */
-            acpi_sdt_header_t* hdr = (acpi_sdt_header_t*)(uintptr_t)entry_addr;
-            if (memcmp(hdr->signature, sig, 4) == 0) return hdr;
+            acpi_sdt_header_t* hdr = (acpi_sdt_header_t*)acpi_temp_map(entry_addr, sizeof(acpi_sdt_header_t));
+            if (memcmp(hdr->signature, sig, 4) == 0) {
+                uint32_t len = hdr->length;
+                hdr = (acpi_sdt_header_t*)acpi_temp_map(entry_addr, len);
+                /* Copy table to heap so the temp mapping can be reused safely */
+                void* copy = kmalloc(len);
+                if (copy) {
+                    memcpy(copy, hdr, len);
+                    return copy;
+                }
+                return hdr;
+            }
         }
     }
 

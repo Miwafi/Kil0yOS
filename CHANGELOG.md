@@ -1,6 +1,38 @@
 # Changelog
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+## [2.4.0] - 2026-06-28
+ This release restores the network subsystem, fixes critical PIC and ACPI bugs, and adopts Linux-style boot messages with live PIT timestamps.
+## Added
+ ### Network Stack (Restored)
+ - Re-introduced full network stack: `netif`, Ethernet, ARP, IPv4, ICMP, UDP
+ - Intel E1000 and Realtek RTL8139 NIC drivers
+ - Shell network commands: `ping`, `ifconfig`, `netstat`
+ - QEMU `run` target now includes `-netdev user,id=net0 -device rtl8139,netdev=net0`
+ ### Kernel Boot Logging
+ - `klog()`: unified kernel logger that prints timestamped messages to both VGA and serial
+ - Linux-style `[    sec.usec] subsystem: message...` format for all boot messages
+ ### Live Timestamps
+ - `pit_ticks`: 64-bit global tick counter incremented on every IRQ0
+ - `pit_format_time()`: formats ticks into `[    sec.usec]` string
+ - Boot messages after PIT initialization now display real elapsed time instead of `0.000000`
+## Fixed
+ - **Double EOI corruption**: removed fallback `pic_send_eoi()` for non-zero IRQs in `irq_handler()`; each handler now sends EOI exactly once, preventing PIC state corruption on VirtualBox
+ - **ACPI 64-bit address truncation**: `power.c` now uses temporary virtual mapping via `vmm_map_page()` to safely read ACPI tables located above 4 GiB
+## Changed
+ - All boot initialization messages in `main.c`, `pci.c`, and `smp.c` migrated to `klog()` with automatic timestamps; manual `[    0.000000]` prefixes removed
+## File Changes
+ - `src/kernel/core/isr.c`: IRQ0 increments `pit_ticks`; removed fallback EOI for non-zero IRQs
+ - `src/kernel/core/main.c`: converted all init messages to `klog()`
+ - `src/kernel/core/smp.c`: converted SMP messages to `klog()`
+ - `src/kernel/drivers/pci.c`: converted PCI scan message to `klog()`
+ - `src/kernel/drivers/mouse.c`: added explicit `pic_send_eoi()` in mouse handler
+ - `src/kernel/drivers/power.c`: added `acpi_temp_map()` for safe 64-bit ACPI table access
+ - `src/kernel/timer/pit.c/h`: added `pit_ticks` and `pit_format_time()`
+ - `include/drivers/vga.h`: declared external `klog()`
+ - `src/kernel/shell/shell.c`: added `ping`, `ifconfig`, `netstat` commands
+ - `Makefile`: added network sources and QEMU netdev options
+ - `include/net/*`, `src/kernel/net/*`: restored network subsystem headers and drivers
 ## [2.3.0] - 2026-06-26
  This release focuses on driver-level improvements: SMP multicore support, ATA DMA, PC speaker audio, and critical ACPI fixes.
 ## Added

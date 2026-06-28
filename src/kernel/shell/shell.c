@@ -14,6 +14,10 @@
 #include "drivers/pci.h"
 #include "drivers/rtc.h"
 #include "fs/edit.h"
+#include "net/netif.h"
+#include "net/icmp.h"
+#include "net/arp.h"
+#include "net/udp.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -42,6 +46,9 @@ static int cmd_date(int argc, char** argv);
 static int cmd_time(int argc, char** argv);
 static int cmd_gfx(int argc, char** argv);
 static int cmd_gui(int argc, char** argv);
+static int cmd_ping(int argc, char** argv);
+static int cmd_ifconfig(int argc, char** argv);
+static int cmd_netstat(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -58,6 +65,9 @@ static shell_command_t commands[] = {
     {"edit", "Edit file", cmd_edit},
     {"gfx", "Graphical display test", cmd_gfx},
     {"gui", "Launch desktop GUI", cmd_gui},
+    {"ping", "Ping a host", cmd_ping},
+    {"ifconfig", "Show network configuration", cmd_ifconfig},
+    {"netstat", "Show network status", cmd_netstat},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
     {"help", "Show help information", cmd_help},
@@ -855,6 +865,158 @@ static int cmd_gui(int argc, char** argv) {
     vga_set_text_mode();
     term_init_text();
     vga_puts("Returned to text mode.\n");
+    return 0;
+}
+
+static uint32_t parse_ip(const char* s) {
+    uint32_t ip = 0;
+    int part = 0;
+    int dots = 0;
+    while (*s) {
+        if (*s == '.') {
+            ip = (ip << 8) | (part & 0xFF);
+            part = 0;
+            dots++;
+        } else if (*s >= '0' && *s <= '9') {
+            part = part * 10 + (*s - '0');
+        }
+        s++;
+    }
+    ip = (ip << 8) | (part & 0xFF);
+    return ip;
+}
+
+static void print_ip(uint32_t ip) {
+    uint8_t* b = (uint8_t*)&ip;
+    char buf[16];
+    itoa(b[3], buf, 10, 4);
+    vga_puts(buf);
+    vga_putchar('.');
+    itoa(b[2], buf, 10, 4);
+    vga_puts(buf);
+    vga_putchar('.');
+    itoa(b[1], buf, 10, 4);
+    vga_puts(buf);
+    vga_putchar('.');
+    itoa(b[0], buf, 10, 4);
+    vga_puts(buf);
+}
+
+static int cmd_ifconfig(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+
+    if (!g_netif.flags) {
+        vga_puts("No network interface available.\n");
+        return 1;
+    }
+
+    vga_puts("eth0: flags=UP\n");
+    vga_puts("  MAC: ");
+    for (int i = 0; i < 6; i++) {
+        char buf[4];
+        itoa(g_netif.mac[i], buf, 16, 3);
+        if (g_netif.mac[i] < 16) vga_putchar('0');
+        vga_puts(buf);
+        if (i < 5) vga_putchar(':');
+    }
+    vga_puts("\n  IP: ");
+    print_ip(g_netif.ip);
+    vga_puts("\n  Netmask: ");
+    print_ip(g_netif.netmask);
+    vga_puts("\n  Gateway: ");
+    print_ip(g_netif.gateway);
+    vga_puts("\n");
+    return 0;
+}
+
+static int cmd_ping(int argc, char** argv) {
+    if (argc < 2) {
+        vga_puts("Usage: ping <ip>\n");
+        return 1;
+    }
+
+    if (!g_netif.flags) {
+        vga_puts("Network not available.\n");
+        return 1;
+    }
+
+    uint32_t target = parse_ip(argv[1]);
+    vga_puts("Pinging ");
+    print_ip(target);
+    vga_puts(" ...\n");
+
+    int ok = 0;
+    for (int i = 0; i < 4; i++) {
+        if (icmp_ping(&g_netif, target, (uint16_t)i, 1000) == 0) {
+            vga_puts("Reply from ");
+            print_ip(target);
+            vga_puts(": seq=");
+            char buf[8];
+            itoa(i, buf, 10, 3);
+            vga_puts(buf);
+            vga_puts(" ok\n");
+            ok++;
+        } else {
+            vga_puts("Request timed out.\n");
+        }
+    }
+
+    vga_puts("--- ping statistics ---\n");
+    char buf[16];
+    itoa(ok, buf, 10, 3);
+    vga_puts(buf);
+    vga_puts("/4 packets received\n");
+    return (ok == 0) ? 1 : 0;
+}
+
+static int cmd_netstat(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+
+    vga_puts("ARP cache:\n");
+    int arp_count = 0;
+    const arp_entry_t* arp = arp_get_cache(&arp_count);
+    if (arp_count == 0) {
+        vga_puts("  (empty)\n");
+    } else {
+        for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+            if (arp[i].valid) {
+                vga_puts("  ");
+                print_ip(arp[i].ip);
+                vga_puts(" -> ");
+                for (int j = 0; j < 6; j++) {
+                    char buf[4];
+                    itoa(arp[i].mac[j], buf, 16, 3);
+                    if (arp[i].mac[j] < 16) vga_putchar('0');
+                    vga_puts(buf);
+                    if (j < 5) vga_putchar(':');
+                }
+                vga_puts("\n");
+            }
+        }
+    }
+
+    vga_puts("UDP sockets:\n");
+    int udp_count = 0;
+    const udp_socket_t* socks = udp_get_sockets(&udp_count);
+    int any = 0;
+    for (int i = 0; i < udp_count; i++) {
+        if (socks[i].used) {
+            any = 1;
+            vga_puts("  port=");
+            char buf[8];
+            itoa(socks[i].local_port, buf, 10, 6);
+            vga_puts(buf);
+            if (socks[i].rx_count) {
+                vga_puts(" rx_pending=");
+                itoa(socks[i].rx_count, buf, 10, 6);
+                vga_puts(buf);
+            }
+            vga_puts("\n");
+        }
+    }
+    if (!any) vga_puts("  (none)\n");
     return 0;
 }
 

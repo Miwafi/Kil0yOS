@@ -130,13 +130,13 @@ void smp_init(void) {
 
     smp_parse_madt();
     if (num_cpus <= 1) {
-        vga_puts("[SMP] No additional CPUs found\n");
+        klog("SMP: no additional CPUs found\n");
         enable_interrupts();
         return;
     }
 
     char buf[16];
-    vga_puts("[SMP] Found ");
+    klog("SMP: found ");
     itoa(num_cpus, buf, 10, sizeof(buf));
     vga_puts(buf);
     vga_puts(" CPU(s)\n");
@@ -147,7 +147,7 @@ void smp_init(void) {
     for (uint8_t i = 0; i < num_cpus; i++) {
         if (apic_ids[i] == bsp_apic_id) continue;
 
-        vga_puts("[SMP] Starting AP ");
+        klog("SMP: starting AP ");
         itoa(apic_ids[i], buf, 10, sizeof(buf));
         vga_puts(buf);
         vga_puts("... ");
@@ -185,14 +185,14 @@ void smp_init(void) {
         }
 
         if (started) {
-            vga_puts("OK\n");
+            vga_puts("ok\n");
         } else {
-            vga_puts("TIMEOUT\n");
+            vga_puts("timeout\n");
         }
     }
 
     char cpu_buf[16];
-    vga_puts("[SMP] ");
+    klog("SMP: ");
     itoa(ap_ready_count + 1, cpu_buf, 10, sizeof(cpu_buf));
     vga_puts(cpu_buf);
     vga_puts(" CPU(s) online\n");

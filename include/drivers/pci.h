@@ -33,6 +33,7 @@ typedef struct pci_device {
 void pci_init();
 pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id);
 pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass_code);
+pci_device_t* pci_get_device_list(void);
 uint32_t pci_read_dword(uint16_t bus, uint16_t device, uint16_t function, uint16_t offset);
 uint16_t pci_read_word(uint16_t bus, uint16_t device, uint16_t function, uint16_t offset);
 uint8_t pci_read_byte(uint16_t bus, uint16_t device, uint16_t function, uint16_t offset);

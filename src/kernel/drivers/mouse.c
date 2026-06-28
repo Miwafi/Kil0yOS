@@ -90,9 +90,11 @@ void mouse_handler(interrupt_frame_t* frame) {
 
     uint8_t status = inb(MOUSE_STATUS_PORT);
     if ((status & 0x01) == 0) {
+        pic_send_eoi(MOUSE_IRQ);
         return;
     }
     if ((status & 0x20) == 0) {
+        pic_send_eoi(MOUSE_IRQ);
         return;
     }
 
@@ -101,6 +103,7 @@ void mouse_handler(interrupt_frame_t* frame) {
     switch (mouse_cycle) {
         case 0:
             if ((data & 0x08) == 0) {
+                pic_send_eoi(MOUSE_IRQ);
                 return;
             }
             mouse_packet[0] = data;
@@ -135,6 +138,8 @@ void mouse_handler(interrupt_frame_t* frame) {
             mouse_cycle = 0;
             break;
     }
+
+    pic_send_eoi(MOUSE_IRQ);
 }
 
 void mouse_init() {

@@ -52,6 +52,16 @@ SCHED_SRCS = $(SRCDIR)/kernel/sched/scheduler.c
 # --- Timer ---
 TIMER_SRCS = $(SRCDIR)/kernel/timer/pit.c
 
+# --- Network ---
+NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
+           $(SRCDIR)/kernel/net/ethernet.c \
+           $(SRCDIR)/kernel/net/arp.c \
+           $(SRCDIR)/kernel/net/ipv4.c \
+           $(SRCDIR)/kernel/net/icmp.c \
+           $(SRCDIR)/kernel/net/udp.c \
+           $(SRCDIR)/kernel/net/rtl8139.c \
+           $(SRCDIR)/kernel/net/e1000.c
+
 # --- All kernel sources ---
 KERNEL_SRCS = $(CORE_SRCS) \
               $(MM_SRCS) \
@@ -60,7 +70,8 @@ KERNEL_SRCS = $(CORE_SRCS) \
               $(LIB_SRCS) \
               $(SHELL_SRCS) \
               $(SCHED_SRCS) \
-              $(TIMER_SRCS)
+              $(TIMER_SRCS) \
+              $(NET_SRCS)
 
 KERNEL_OBJS = $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(KERNEL_SRCS))
 KERNEL_ASM_OBJS = $(BUILDDIR)/kernel/core/isr_asm.o
@@ -102,7 +113,7 @@ $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 iso: $(BUILDDIR)/kil0yos.iso
 
 run: $(BUILDDIR)/kil0yos.iso
-	$(QEMU) -cdrom $(BUILDDIR)/kil0yos.iso -m 512M -nographic -serial stdio
+	$(QEMU) -cdrom $(BUILDDIR)/kil0yos.iso -m 512M -nographic -serial stdio -netdev user,id=net0 -device rtl8139,netdev=net0
 
 disk:
 	dd if=/dev/zero of=disk.img bs=512 count=4096

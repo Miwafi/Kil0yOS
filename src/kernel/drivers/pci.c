@@ -49,7 +49,7 @@ void pci_write_byte(uint16_t bus, uint16_t device, uint16_t function, uint16_t o
 }
 
 void pci_init() {
-    vga_puts("[PCI] Scanning PCI buses...\n");
+    klog("PCI: scanning buses...\n");
 
     for (int bus = 0; bus < 256; bus++) {
         for (int device = 0; device < 32; device++) {
@@ -112,5 +112,9 @@ pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass_code) {
         dev = dev->next;
     }
     return NULL;
+}
+
+pci_device_t* pci_get_device_list(void) {
+    return pci_devices;
 }
 
