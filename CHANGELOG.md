@@ -1,6 +1,22 @@
 # Changelog
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+## [2.4.1] - 2026-06-29
+ This release focuses on fixing critical and medium-priority bugs in the FAT32 filesystem implementation, improving data consistency, directory persistence, and error handling.
+## Fixed
+ - **fs_load_directory recursive loading**: subdirectories are now recursively loaded into memory on boot, ensuring their contents remain visible after a reboot
+ - **fs_write_directory_entry FAT corruption**: fixed incorrect FAT chain update during multi-cluster directory expansion by tracking `prev_cluster` instead of overwriting the current EOC marker
+ - **fs_write_file data consistency**: on write failure, the original file is no longer corrupted. New clusters are allocated and written first; in-memory state and old cluster chain are only updated after all disk writes succeed
+ - **fs_save_directory entry offset bug**: fixed incorrect `entry_offset` calculation that skipped entries when NULL gaps existed in the children array
+ - **fs_save_directory . and .. preservation**: non-root directories now correctly preserve `.` and `..` entries when saved back to disk
+ - **fs_save_directory cluster expansion/truncation**: directory saving now supports allocating new clusters when more space is needed and freeing excess clusters when shrinking
+ - **read_directory_entries . / .. filtering**: special FAT32 `.` and `..` entries are now excluded from the children array to prevent slot wastage
+ - **fs_delete_entry path support**: `fs_delete_entry()` now uses `resolve_parent_and_name()` to support deleting files and directories via full paths
+ - **fs_load Boot Signature validation**: added `0xAA55` boot signature verification to prevent loading corrupted boot sectors
+ - **fs_create_file/dir orphan entries**: memory is now allocated before writing disk directory entries. On allocation failure, no orphan directory entries are left on disk
+ - **fat_read_entry I/O error handling**: `fat_read_entry()` now returns `FAT32_IO_ERROR` (0xFFFFFFFF) on I/O failure instead of 0, and all cluster chain traversals have been updated to safely abort on this error value
+## File Changes
+ - `src/kernel/fs/fs.c`: comprehensive fixes for directory loading, saving, file writing, entry deletion, creation, and FAT I/O error handling
 ## [2.4.0] - 2026-06-28
  This release restores the network subsystem, fixes critical PIC and ACPI bugs, and adopts Linux-style boot messages with live PIT timestamps.
 ## Added
