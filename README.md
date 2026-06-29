@@ -2,6 +2,23 @@
   <img src="assets/banner.svg" alt="kil0yOSnotCtOS" width="100%" />
   <h1>kil0yOS</h1>
   <p><strong>A 64-bit x86-64 microkernel operating system</strong></p>
+
+  <p>
+    <a href="#">
+      <img src="https://img.shields.io/github/stars/Miwafi/Kil0yOS?style=social" alt="GitHub stars" />
+    </a>
+    <a href="https://github.com/Miwafi/Kil0yOS/issues">
+      <img src="https://img.shields.io/github/issues/Miwafi/Kil0yOS?style=social" alt="GitHub issues" />
+    </a>
+    <a href="https://github.com/Miwafi/Kil0yOS">
+      <img src="https://img.shields.io/github/repo-size/Miwafi/Kil0yOS?style=social" alt="GitHub repo size" />
+    </a>
+  </p>
+
+  <p>
+    <a href="README.md"><strong>English</strong></a> |
+    <a href="README.zh.md"><strong>简体中文</strong></a>
+  </p>
 </div>
 
 ## Features
