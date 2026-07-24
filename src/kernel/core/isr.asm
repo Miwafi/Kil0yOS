@@ -90,6 +90,59 @@ IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
 
+; System call handler (int 0x80)
+extern syscall_dispatcher
+global syscall_entry
+syscall_entry:
+    cli
+    ; Save user registers
+    push rbp
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rsi
+    push rdi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+
+    ; System call number in rax, args in rdi, rsi, rdx, r10, r8, r9
+    mov rdi, rax          ; syscall number
+    mov rsi, rbx          ; arg0
+    mov rdx, rcx          ; arg1
+    mov rcx, r8           ; arg2
+    mov r8, r9            ; arg3
+    mov r9, r10           ; arg4
+    mov r10, r11          ; arg5 (use stack for 6th arg)
+    push qword [rsp + 8*15]  ; arg5 from stack
+    call syscall_dispatcher
+    add rsp, 8            ; clean up arg5
+
+    ; Restore user registers
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rbp
+    ; Return value in rax, skip pushed error code and vector
+    add rsp, 16
+    iretq
+
 isr_common_stub:
     push rax
     push rbx

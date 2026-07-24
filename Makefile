@@ -18,7 +18,10 @@ CORE_SRCS = $(SRCDIR)/kernel/core/main.c \
             $(SRCDIR)/kernel/core/idt.c \
             $(SRCDIR)/kernel/core/isr.c \
             $(SRCDIR)/kernel/core/interrupts.c \
-            $(SRCDIR)/kernel/core/smp.c
+            $(SRCDIR)/kernel/core/smp.c \
+            $(SRCDIR)/kernel/core/tss.c \
+            $(SRCDIR)/kernel/core/process.c \
+            $(SRCDIR)/kernel/core/syscall.c
 
 # --- Memory Management ---
 MM_SRCS = $(SRCDIR)/kernel/mm/memory.c

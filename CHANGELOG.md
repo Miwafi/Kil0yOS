@@ -1,6 +1,61 @@
 # Changelog
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+
+## [2.5.0] - 2026-06-29
+This release introduces foundational user mode (Ring 3) support, enabling the kernel to run user programs in a protected environment with system call interfaces.
+
+### Added
+- **User mode (Ring 3) support**: complete infrastructure for executing user programs outside kernel space
+  - GDT entries for user code (0x18) and data (0x20) segments with DPL=3
+  - TSS (Task State Segment) for privilege level transitions
+  - `iretq`-based kernel-to-user transition via `jump_to_user()`
+- **System call framework**: `int 0x80`-based syscall interface accessible from Ring 3
+  - Initial syscalls: `SYS_EXIT`, `SYS_WRITE`, `SYS_GETPID`, `SYS_PUTS`
+  - Extensible syscall table with runtime handler registration
+- **Process management foundation**: basic process control block and lifecycle
+  - Process table with PID allocation
+  - User memory layout: code at 4MB, data at 8MB, stack at ~2GB
+  - Program loader skeleton for flat binary format
+- **User program build system**: cross-compiler toolchain for user-space programs
+  - Separate linker script (`user/user.ld`)
+  - Test program: `user/hello.c`
+
+### Technical Details
+- **Memory layout**:
+  - User code base: `0x00400000` (4 MiB)
+  - User data base: `0x00800000` (8 MiB)
+  - User stack top: `0x7FFFF000` (~2 GiB, grows down)
+  - Stack size: 64 KiB default
+- **GDT layout** (expanded from 5 to 8 entries):
+  - 0x00: Null descriptor
+  - 0x08: Kernel code (64-bit, DPL=0)
+  - 0x10: Kernel data (DPL=0)
+  - 0x18: User code (64-bit, DPL=3)
+  - 0x20: User data (DPL=3)
+  - 0x28: TSS descriptor (16 bytes)
+
+### File Changes
+- `include/core/gdt.h`: expanded GDT with TSS descriptor support
+- `src/kernel/core/gdt.c`: GDT initialization with `gdt_set_tss()`
+- `include/core/tss.h`: TSS structure definitions
+- `src/kernel/core/tss.c`: TSS initialization and kernel stack management
+- `include/core/process.h`: process control block and loader interface
+- `src/kernel/core/process.c`: process management implementation
+- `include/core/syscall.h`: syscall interface definitions
+- `src/kernel/core/syscall.c`: syscall dispatcher and handlers
+- `src/kernel/core/isr.asm`: syscall entry point via `int 0x80`
+- `src/kernel/core/isr.c`: IDT gate setup with DPL=3 for syscall
+- `user/hello.c`: test user program
+- `user/user.ld`: user program linker script
+- `user/Makefile`: user program build system
+
+### Notes
+- User mode is now ready for testing. Next steps include:
+  - Implementing more syscalls (file operations, memory allocation)
+  - Adding proper process scheduling for user programs
+  - Creating shell commands to load and execute user programs
+
 ## [2.4.2] - 2026-06-29
  This release fixes critical memory management bugs that caused kernel crashes (Triple Fault) on VirtualBox.
 ## Fixed

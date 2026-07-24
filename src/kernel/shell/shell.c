@@ -412,8 +412,9 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.4.2\n");
+    vga_puts("Kil0yOS v2.5.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
+    vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
 }
 
