@@ -357,12 +357,13 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     }
     uint64_t* pd = (uint64_t*)(pdpt[pdpti] & ~0xFFF);
 
-    /* If there's a huge page here, overwrite it (caller beware) */
-    if ((pd[pdi] & VMM_PRESENT) && (pd[pdi] & VMM_HUGE)) {
-        pd[pdi] = 0;
-    }
-
-    if (!(pd[pdi] & VMM_PRESENT)) {
+    /* Do NOT overwrite existing huge pages - this would corrupt kernel mappings */
+    if (pd[pdi] & VMM_PRESENT) {
+        if (pd[pdi] & VMM_HUGE) {
+            /* Huge page already maps this region, cannot create 4K mapping */
+            return;
+        }
+    } else {
         uint64_t new_pt = pmm_alloc_page();
         if (!new_pt) PANIC("vmm_map_page: out of physical memory (pt)");
         pd[pdi] = vmm_make_entry(new_pt, VMM_WRITABLE);

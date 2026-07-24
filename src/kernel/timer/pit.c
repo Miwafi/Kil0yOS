@@ -12,19 +12,22 @@ static uint32_t pit_divisor = 1193;
 volatile uint64_t pit_ticks = 0;
 
 void pit_format_time(char* buf, size_t len) {
-    if (len < 20) { buf[0] = '\0'; return; }
+    if (len < 24) { buf[0] = '\0'; return; }
 
     uint64_t ticks = pit_ticks;
     uint64_t sec = ticks / 100;
     uint64_t usec = (ticks % 100) * 10000ULL;
 
-    char sec_str[16];
+    /* Cap seconds to avoid buffer overflow (max ~136 years at 100Hz) */
+    if (sec > 99999) sec = 99999;
+
+    char sec_str[8];
     int sec_len = 0;
     uint64_t t = sec;
     do {
         sec_str[sec_len++] = '0' + (t % 10);
         t /= 10;
-    } while (t > 0);
+    } while (t > 0 && sec_len < 7);
 
     int pos = 0;
     buf[pos++] = '[';

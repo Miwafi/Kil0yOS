@@ -1,6 +1,16 @@
 # Changelog
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+## [2.4.2] - 2026-06-29
+ This release fixes critical memory management bugs that caused kernel crashes (Triple Fault) on VirtualBox.
+## Fixed
+ - **VMM huge page corruption (CRITICAL)**: `vmm_map_page()` no longer overwrites existing 2 MiB huge page entries with zero. Previously, this would corrupt kernel identity mappings, causing Page Fault → Double Fault → Triple Fault when executing code in affected regions. Huge pages are now preserved; if a 4 KiB mapping is requested in a huge-page region, the function returns early.
+ - **pit_format_time buffer overflow**: capped seconds value to 99999 (~27 hours at 100 Hz tick) and added boundary check in the digit extraction loop to prevent stack corruption if `pit_ticks` overflows or is corrupted. Reduced `sec_str` buffer from 16 to 8 bytes.
+## Security
+ - Both fixes address potential kernel instability or crashes that could be triggered by long uptime or ACPI memory mapping operations.
+## File Changes
+ - `src/kernel/mm/memory.c`: fixed `vmm_map_page()` huge page handling
+ - `src/kernel/timer/pit.c`: added overflow protection to `pit_format_time()`
 ## [2.4.1] - 2026-06-29
  This release focuses on fixing critical and medium-priority bugs in the FAT32 filesystem implementation, improving data consistency, directory persistence, and error handling.
 ## Fixed
