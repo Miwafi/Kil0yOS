@@ -2,7 +2,7 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
-## [2.5.0] - 2026-06-29
+## [2.5.0] - 2026-07-24
 This release introduces foundational user mode (Ring 3) support, enabling the kernel to run user programs in a protected environment with system call interfaces.
 
 ### Added
@@ -56,7 +56,7 @@ This release introduces foundational user mode (Ring 3) support, enabling the ke
   - Adding proper process scheduling for user programs
   - Creating shell commands to load and execute user programs
 
-## [2.4.2] - 2026-06-29
+## [2.4.2] - 2026-07-24
  This release fixes critical memory management bugs that caused kernel crashes (Triple Fault) on VirtualBox.
 ## Fixed
  - **VMM huge page corruption (CRITICAL)**: `vmm_map_page()` no longer overwrites existing 2 MiB huge page entries with zero. Previously, this would corrupt kernel identity mappings, causing Page Fault → Double Fault → Triple Fault when executing code in affected regions. Huge pages are now preserved; if a 4 KiB mapping is requested in a huge-page region, the function returns early.
