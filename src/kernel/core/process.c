@@ -4,12 +4,15 @@
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "fs/fs.h"
-#include "fs/fs.h"  /* for fs_find */
 
 /* Process table */
 static process_t processes[MAX_PROCESSES];
 static int current_process = -1;
 static uint32_t next_pid = 1;
+
+/* Kernel stack for user mode transitions (16 KB) */
+#define KERNEL_STACK_SIZE 0x4000
+static uint8_t kernel_stacks[MAX_PROCESSES][KERNEL_STACK_SIZE] __attribute__((aligned(16)));
 
 void process_init(void) {
     memset(processes, 0, sizeof(processes));
@@ -38,32 +41,59 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     proc->state = PROCESS_STATE_READY;
     strncpy(proc->name, name, sizeof(proc->name) - 1);
 
-    /* Allocate code area */
+    /* Set up kernel stack for this process (used during syscalls) */
+    int proc_index = proc - processes;
+    proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
+
+    /* Allocate code area at USER_CODE_BASE (0x400000 = 4 MB)
+     * This is above the kernel but below the stack
+     * We use identity mapping, so we need to:
+     * 1. Allocate physical pages
+     * 2. Map them to USER_CODE_BASE
+     * 3. Copy code through the identity-mapped physical addresses
+     */
+
     proc->code_base = USER_CODE_BASE;
 
-    /* Map user code pages */
-    for (size_t offset = 0; offset < code_size; offset += 4096) {
+    /* Calculate number of pages needed */
+    size_t pages_needed = (code_size + 4095) / 4096;
+    if (pages_needed == 0) pages_needed = 1;
+
+    /* Allocate and map code pages */
+    for (size_t i = 0; i < pages_needed; i++) {
         uint64_t phys = pmm_alloc_page();
         if (phys == 0) {
+            /* TODO: free previously allocated pages */
             return -1;  /* Out of memory */
         }
-        vmm_map_page(proc->code_base + offset, phys, 0x07);  /* User, R/W, Present */
-    }
 
-    /* Copy code to user space */
-    /* Since we're in kernel mode, we need to access the mapped pages */
-    /* For now, use identity mapping assumption */
-    memcpy((void*)proc->code_base, code, code_size);
+        uint64_t virt = USER_CODE_BASE + i * 4096;
+
+        /* Map user virtual address to physical page */
+        /* Flags: Present (1), Writable (2), User (4) = 0x07 */
+        vmm_map_page(virt, phys, 0x07);
+
+        /* Copy code to the page using physical address (identity mapped) */
+        /* Since boot.asm identity maps the first 4GB, phys == virt for low addresses */
+        /* But USER_CODE_BASE might map to a different physical address, so use phys */
+        size_t offset = i * 4096;
+        size_t copy_size = (code_size > offset + 4096) ? 4096 : code_size - offset;
+        if (copy_size > 0 && offset < code_size) {
+            /* Use physical address which is identity-mapped and accessible */
+            memcpy((void*)phys, code + offset, copy_size);
+        }
+    }
 
     /* Set up stack */
     proc->stack_top = USER_STACK_BASE;
 
-    /* Map user stack pages */
+    /* Map user stack pages (stack grows downward) */
     for (uint64_t addr = USER_STACK_BASE - USER_STACK_SIZE + 0x1000;
          addr <= USER_STACK_BASE;
          addr += 4096) {
         uint64_t phys = pmm_alloc_page();
         if (phys == 0) {
+            /* TODO: free previously allocated pages */
             return -1;
         }
         vmm_map_page(addr, phys, 0x07);  /* User, R/W, Present */
@@ -76,6 +106,7 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
 }
 
 void process_exit(int status) {
+    (void)status;
     if (current_process < 0) return;
 
     process_t* proc = &processes[current_process];
@@ -105,27 +136,31 @@ process_t* process_get_by_pid(uint32_t pid) {
  * This function sets up the stack and uses iretq to jump to Ring 3
  */
 void jump_to_user(uint64_t entry, uint64_t stack) {
-    /* Set TSS stack pointer for syscalls */
+    /* Set TSS kernel stack pointer - this is where CPU will jump on syscall/interrupt */
     uint64_t kernel_stack;
     __asm__ volatile("mov %%rsp, %0" : "=r"(kernel_stack));
     tss_set_kernel_stack(kernel_stack);
 
-    /* Push values for iretq in reverse order:
-     * SS, RSP, RFLAGS, CS, RIP
-     * We need to set RFLAGS with bit 1 set (reserved) and interrupt flag set
+    /* Prepare for iretq:
+     * Stack layout after pushes (grows downward):
+     * SS      (user data segment + RPL 3)
+     * RSP     (user stack pointer)
+     * RFLAGS  (with interrupt flag set)
+     * CS      (user code segment + RPL 3)
+     * RIP     (entry point)
      */
 
     __asm__ volatile(
-        "cli\n"                      /* Disable interrupts */
-        "mov %0, %%rax\n"            /* Load stack address */
-        "mov %%rax, %%rsp\n"         /* Set user stack */
-        "pushq %1\n"                 /* SS = user data segment (0x20 | 3) */
-        "pushq %%rax\n"              /* RSP */
-        "pushfq\n"                   /* RFLAGS (current) */
-        "orq $0x200, (%%rsp)\n"      /* Set interrupt flag in RFLAGS on stack */
-        "pushq %2\n"                 /* CS = user code segment (0x18 | 3) */
-        "pushq %3\n"                 /* RIP = entry point */
-        "iretq\n"                    /* Jump to user mode */
+        "cli\n"                       /* Disable interrupts */
+        "mov %0, %%rax\n"             /* Load stack address */
+        "lea -8(%%rax), %%rsp\n"      /* Align stack to 16 bytes */
+        "pushq %1\n"                  /* SS = user data segment (0x20 | 3) */
+        "pushq %%rax\n"               /* RSP = user stack */
+        "pushfq\n"                    /* Push RFLAGS */
+        "orq $0x200, (%%rsp)\n"       /* Set interrupt flag in saved RFLAGS */
+        "pushq %2\n"                  /* CS = user code segment (0x18 | 3) */
+        "pushq %3\n"                  /* RIP = entry point */
+        "iretq\n"                     /* Jump to user mode */
         :
         : "r"(stack), "i"(USER_DS | 3), "i"(USER_CS | 3), "r"(entry)
         : "rax", "memory"

@@ -10,6 +10,7 @@
 #include "sched/scheduler.h"
 #include "core/interrupts.h"
 #include "core/smp.h"
+#include "core/process.h"
 #include "drivers/power.h"
 #include "drivers/pci.h"
 #include "drivers/rtc.h"
@@ -49,6 +50,7 @@ static int cmd_gui(int argc, char** argv);
 static int cmd_ping(int argc, char** argv);
 static int cmd_ifconfig(int argc, char** argv);
 static int cmd_netstat(int argc, char** argv);
+static int cmd_exec(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -70,6 +72,7 @@ static shell_command_t commands[] = {
     {"netstat", "Show network status", cmd_netstat},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
+    {"exec", "Execute a user program", cmd_exec},
     {"help", "Show help information", cmd_help},
     {"shutdown", "Shut down the system", cmd_shutdown},
     {NULL, NULL, NULL}
@@ -1018,6 +1021,114 @@ static int cmd_netstat(int argc, char** argv) {
         }
     }
     if (!any) vga_puts("  (none)\n");
+    return 0;
+}
+
+static int cmd_exec(int argc, char** argv) {
+    if (argc < 2) {
+        vga_puts("Usage: exec <program>\n");
+        vga_puts("Example: exec hello.bin\n");
+        return 1;
+    }
+
+    const char* program_path = argv[1];
+
+    /* Check if file exists */
+    fs_entry_t* entry = fs_resolve_path(program_path);
+    if (entry == NULL) {
+        vga_puts("exec: program not found: ");
+        vga_puts(program_path);
+        vga_puts("\n");
+        return 1;
+    }
+
+    if (entry->type != FS_TYPE_FILE) {
+        vga_puts("exec: not a file: ");
+        vga_puts(program_path);
+        vga_puts("\n");
+        return 1;
+    }
+
+    vga_puts("Loading program: ");
+    vga_puts(program_path);
+    vga_puts(" (");
+    char size_buf[16];
+    itoa(entry->size, size_buf, 10, 10);
+    vga_puts(size_buf);
+    vga_puts(" bytes)\n");
+
+    /* Read the program file */
+    uint8_t* program_data = (uint8_t*)kmalloc(entry->size);
+    if (program_data == NULL) {
+        vga_puts("exec: out of memory\n");
+        return 1;
+    }
+
+    int bytes_read = fs_read_file(entry, program_data, entry->size);
+    if (bytes_read != (int)entry->size) {
+        vga_puts("exec: failed to read program\n");
+        kfree(program_data);
+        return 1;
+    }
+
+    /* Check for user program magic header */
+    if (entry->size >= 4) {
+        uint32_t magic = *(uint32_t*)program_data;
+        if (magic == USER_MAGIC) {
+            /* This is a Kil0yOS user program with header */
+            user_program_header_t* header = (user_program_header_t*)program_data;
+            vga_puts("Program header found:\n");
+            vga_puts("  Entry offset: ");
+            itoa(header->entry_offset, size_buf, 10, 8);
+            vga_puts(size_buf);
+            vga_puts("\n  Code size: ");
+            itoa(header->code_size, size_buf, 10, 8);
+            vga_puts(size_buf);
+            vga_puts("\n");
+
+            uint64_t entry_point = USER_CODE_BASE + header->entry_offset;
+
+            /* Create user process */
+            int pid = process_create(program_path,
+                                     program_data + sizeof(user_program_header_t),
+                                     header->code_size,
+                                     entry_point);
+
+            if (pid < 0) {
+                vga_puts("exec: failed to create process\n");
+                kfree(program_data);
+                return 1;
+            }
+
+            vga_puts("Process created with PID: ");
+            itoa(pid, size_buf, 10, 4);
+            vga_puts(size_buf);
+            vga_puts("\n");
+
+            /* For now, just show a message - actual execution requires more work */
+            vga_puts("Note: User mode execution not yet fully implemented.\n");
+            vga_puts("The process has been created but cannot run yet.\n");
+        } else {
+            /* Raw binary - try to execute directly */
+            vga_puts("Raw binary detected (no KIL0 header).\n");
+            vga_puts("Attempting direct execution at 0x400000...\n");
+
+            /* Create process with raw binary */
+            int pid = process_create(program_path, program_data, entry->size, USER_CODE_BASE);
+            if (pid < 0) {
+                vga_puts("exec: failed to create process\n");
+                kfree(program_data);
+                return 1;
+            }
+
+            vga_puts("Process created with PID: ");
+            itoa(pid, size_buf, 10, 4);
+            vga_puts(size_buf);
+            vga_puts("\n");
+        }
+    }
+
+    kfree(program_data);
     return 0;
 }
 

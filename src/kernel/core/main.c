@@ -3,6 +3,7 @@
 #include "core/isr.h"
 #include "core/interrupts.h"
 #include "core/smp.h"
+#include "core/tss.h"
 #include "mm/memory.h"
 #include "drivers/vga.h"
 #include "drivers/keyboard.h"
@@ -75,6 +76,9 @@ void kernel_main(uint64_t mb_info_phys) {
 
     klog("GDT: loading GDT...\n");
     gdt_init();
+
+    klog("TSS: initializing Task State Segment...\n");
+    tss_init();
 
     klog("IDT: loading IDT...\n");
     idt_init();
