@@ -159,29 +159,41 @@ void jump_to_user(uint64_t entry, uint64_t stack) {
     __asm__ volatile("mov %%rsp, %0" : "=r"(kernel_stack));
     tss_set_kernel_stack(kernel_stack);
 
-    /* Prepare for iretq:
+    /* Prepare for iretq on the CURRENT (kernel) stack:
+     * We push values onto kernel stack, then iretq will:
+     * 1. Pop RIP, CS, RFLAGS, RSP, SS from stack
+     * 2. Load them into registers
+     * 3. Jump to RIP in Ring 3
+     *
      * Stack layout after pushes (grows downward):
-     * SS      (user data segment + RPL 3)
-     * RSP     (user stack pointer)
-     * RFLAGS  (with interrupt flag set)
-     * CS      (user code segment + RPL 3)
-     * RIP     (entry point)
+     * [top] SS      (user data segment + RPL 3)
+     *       RSP     (user stack pointer)
+     *       RFLAGS  (with interrupt flag set)
+     *       CS      (user code segment + RPL 3)
+     *       RIP     (entry point)
+     * [bottom - iretq pops from here]
      */
 
+    uint64_t user_cs = USER_CS | 3;  /* 0x18 | 3 = 0x1B */
+    uint64_t user_ss = USER_DS | 3;  /* 0x20 | 3 = 0x23 */
+    uint64_t rflags;
+
+    /* Get current RFLAGS */
+    __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+    rflags |= 0x200;  /* Set interrupt flag */
+
+    /* Disable interrupts and jump to user mode */
     __asm__ volatile(
-        "cli\n"                       /* Disable interrupts */
-        "mov %0, %%rax\n"             /* Load stack address */
-        "lea -8(%%rax), %%rsp\n"      /* Align stack to 16 bytes */
-        "pushq %1\n"                  /* SS = user data segment (0x20 | 3) */
-        "pushq %%rax\n"               /* RSP = user stack */
-        "pushfq\n"                    /* Push RFLAGS */
-        "orq $0x200, (%%rsp)\n"       /* Set interrupt flag in saved RFLAGS */
-        "pushq %2\n"                  /* CS = user code segment (0x18 | 3) */
-        "pushq %3\n"                  /* RIP = entry point */
-        "iretq\n"                     /* Jump to user mode */
+        "pushq %[ss]\n"            /* SS */
+        "pushq %[stack]\n"         /* RSP (user stack) */
+        "pushq %[rflags]\n"        /* RFLAGS */
+        "pushq %[cs]\n"            /* CS */
+        "pushq %[entry]\n"         /* RIP */
+        "iretq\n"                  /* Jump to user mode */
         :
-        : "r"(stack), "i"(USER_DS | 3), "i"(USER_CS | 3), "r"(entry)
-        : "rax", "memory"
+        : [ss] "r"(user_ss), [stack] "r"(stack),
+          [rflags] "r"(rflags), [cs] "r"(user_cs), [entry] "r"(entry)
+        : "memory"
     );
 }
 
