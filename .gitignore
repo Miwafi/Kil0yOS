@@ -4,4 +4,6 @@ disk.img
 *.o
 *.bin
 *.iso
-e1000driverexpemple
+userdisk.img
+userdisk.vdi
+*.log
