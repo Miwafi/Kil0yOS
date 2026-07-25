@@ -1105,9 +1105,17 @@ static int cmd_exec(int argc, char** argv) {
             vga_puts(size_buf);
             vga_puts("\n");
 
-            /* For now, just show a message - actual execution requires more work */
-            vga_puts("Note: User mode execution not yet fully implemented.\n");
-            vga_puts("The process has been created but cannot run yet.\n");
+            /* Free program data before jumping to user mode */
+            kfree(program_data);
+
+            vga_puts("Jumping to user mode...\n");
+
+            /* Actually run the process */
+            process_run(pid);
+
+            /* If we return here, the process exited */
+            vga_puts("Process exited.\n");
+            return 0;
         } else {
             /* Raw binary - try to execute directly */
             vga_puts("Raw binary detected (no KIL0 header).\n");
@@ -1125,6 +1133,18 @@ static int cmd_exec(int argc, char** argv) {
             itoa(pid, size_buf, 10, 4);
             vga_puts(size_buf);
             vga_puts("\n");
+
+            /* Free program data before jumping to user mode */
+            kfree(program_data);
+
+            vga_puts("Jumping to user mode...\n");
+
+            /* Actually run the process */
+            process_run(pid);
+
+            /* If we return here, the process exited */
+            vga_puts("Process exited.\n");
+            return 0;
         }
     }
 

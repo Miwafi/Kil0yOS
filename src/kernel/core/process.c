@@ -132,6 +132,24 @@ process_t* process_get_by_pid(uint32_t pid) {
     return NULL;
 }
 
+/* Run a process - jump to user mode */
+void process_run(uint32_t pid) {
+    process_t* proc = process_get_by_pid(pid);
+    if (proc == NULL || proc->state != PROCESS_STATE_READY) {
+        return;
+    }
+
+    /* Mark as running */
+    proc->state = PROCESS_STATE_RUNNING;
+    current_process = proc - processes;
+
+    /* Set TSS kernel stack for syscall returns */
+    tss_set_kernel_stack(proc->kernel_stack);
+
+    /* Jump to user mode */
+    jump_to_user(proc->entry_point, proc->stack_top);
+}
+
 /* Jump to user mode using iretq
  * This function sets up the stack and uses iretq to jump to Ring 3
  */

@@ -59,6 +59,7 @@ typedef struct process {
 /* Process management functions */
 void process_init(void);
 int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t entry);
+void process_run(uint32_t pid);
 void process_exit(int status);
 process_t* process_get_current(void);
 process_t* process_get_by_pid(uint32_t pid);
