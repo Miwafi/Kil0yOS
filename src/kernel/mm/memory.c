@@ -357,16 +357,40 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     }
     uint64_t* pd = (uint64_t*)(pdpt[pdpti] & ~0xFFF);
 
-    /* Do NOT overwrite existing huge pages - this would corrupt kernel mappings */
+    /* Handle existing entries */
     if (pd[pdi] & VMM_PRESENT) {
         if (pd[pdi] & VMM_HUGE) {
-            /* Huge page already maps this region, cannot create 4K mapping */
-            return;
+            /* Huge page exists - check if we need user-mode access */
+            if (flags & VMM_USER) {
+                /* Need to split this huge page into 4KB pages for user-mode access
+                 * This is a simplified approach: we'll create a new page table
+                 * and copy the huge page's identity mapping, then update permissions
+                 */
+                uint64_t huge_phys = pd[pdi] & ~0x1FFFFF;  /* Get physical base */
+                
+                /* Allocate a new page table */
+                uint64_t new_pt = pmm_alloc_page();
+                if (!new_pt) PANIC("vmm_map_page: out of memory splitting huge page");
+                
+                /* Fill the page table with 4KB entries mapping the same physical memory */
+                uint64_t* pt_entries = (uint64_t*)new_pt;
+                for (int i = 0; i < 512; i++) {
+                    pt_entries[i] = vmm_make_entry(huge_phys + i * PAGE_SIZE, VMM_WRITABLE | VMM_USER);
+                }
+                
+                /* Replace the huge page with the page table */
+                pd[pdi] = vmm_make_entry(new_pt, VMM_WRITABLE | VMM_USER);
+                
+                /* Now fall through to update the specific 4KB entry */
+            } else {
+                /* Huge page already maps this region, cannot create 4K mapping */
+                return;
+            }
         }
     } else {
         uint64_t new_pt = pmm_alloc_page();
         if (!new_pt) PANIC("vmm_map_page: out of physical memory (pt)");
-        pd[pdi] = vmm_make_entry(new_pt, VMM_WRITABLE);
+        pd[pdi] = vmm_make_entry(new_pt, VMM_WRITABLE | VMM_USER);
         memset((void*)new_pt, 0, PAGE_SIZE);
     }
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
