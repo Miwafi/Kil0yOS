@@ -375,11 +375,11 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
                 /* Fill the page table with 4KB entries mapping the same physical memory */
                 uint64_t* pt_entries = (uint64_t*)new_pt;
                 for (int i = 0; i < 512; i++) {
-                    pt_entries[i] = vmm_make_entry(huge_phys + i * PAGE_SIZE, VMM_WRITABLE | VMM_USER);
+                    pt_entries[i] = vmm_make_entry(huge_phys + i * PAGE_SIZE, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
                 }
                 
                 /* Replace the huge page with the page table */
-                pd[pdi] = vmm_make_entry(new_pt, VMM_WRITABLE | VMM_USER);
+                pd[pdi] = vmm_make_entry(new_pt, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
                 
                 /* Now fall through to update the specific 4KB entry */
             } else {
@@ -390,7 +390,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     } else {
         uint64_t new_pt = pmm_alloc_page();
         if (!new_pt) PANIC("vmm_map_page: out of physical memory (pt)");
-        pd[pdi] = vmm_make_entry(new_pt, VMM_WRITABLE | VMM_USER);
+        pd[pdi] = vmm_make_entry(new_pt, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
         memset((void*)new_pt, 0, PAGE_SIZE);
     }
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
