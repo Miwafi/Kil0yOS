@@ -4,6 +4,6 @@ disk.img
 *.o
 *.bin
 *.iso
-userdisk.img
-userdisk.vdi
+*.vdi
 *.log
+*.img

@@ -124,23 +124,30 @@ syscall_entry:
     call syscall_dispatcher
     add rsp, 8            ; clean up arg5
 
-    ; Restore user registers
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rsi
-    pop rdi
-    pop rdx
-    pop rcx
+    ; Store return value
+    mov r15, rax
+
+    ; Restore user registers (in reverse order of push)
+    pop rax
     pop rbx
+    pop rcx
+    pop rdx
+    pop rdi
+    pop rsi
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
     pop rbp
-    ; Return value in rax, skip pushed error code and vector
-    add rsp, 16
+
+    ; Restore return value
+    mov rax, r15
+
+    ; Return to user mode
     iretq
 
 isr_common_stub:
