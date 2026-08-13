@@ -84,7 +84,26 @@ void isr_init() {
 }
 
 uint64_t isr_handler(interrupt_frame_t* frame) {
-    (void)frame;
+    /* Debug: Print exception info */
+    extern void vga_puts(const char*);
+    extern void vga_puthex(uint64_t);
+
+    vga_puts("\n[EXCEPTION] ISR #");
+    vga_puthex(frame->interrupt_number);
+    vga_puts(" at RIP: 0x");
+    vga_puthex(frame->rip);
+    vga_puts("\n  Error code: 0x");
+    vga_puthex(frame->error_code);
+
+    /* For page faults, read CR2 to get the faulting address */
+    if (frame->interrupt_number == 14) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        vga_puts("\n  CR2 (fault address): 0x");
+        vga_puthex(cr2);
+    }
+    vga_puts("\n");
+
     return (uint64_t)frame;
 }
 

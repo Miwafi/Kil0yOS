@@ -366,21 +366,46 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
                  * This is a simplified approach: we'll create a new page table
                  * and copy the huge page's identity mapping, then update permissions
                  */
+                extern void vga_puts(const char*);
+                extern void vga_puthex(uint64_t);
+
+                uint64_t pd_entry = pd[pdi];
+                vga_puts("[DEBUG] PD entry before split: 0x");
+                vga_puthex(pd_entry);
+                vga_puts("\n");
+
                 uint64_t huge_phys = pd[pdi] & ~0x1FFFFF;  /* Get physical base */
-                
+
+                vga_puts("[DEBUG] Splitting huge page at virt 0x");
+                vga_puthex(virt);
+                vga_puts("\n  PD entry: 0x");
+                vga_puthex(pd_entry);
+                vga_puts(" -> huge_phys: 0x");
+                vga_puthex(huge_phys);
+                vga_puts("\n");
+
                 /* Allocate a new page table */
                 uint64_t new_pt = pmm_alloc_page();
                 if (!new_pt) PANIC("vmm_map_page: out of memory splitting huge page");
-                
+
                 /* Fill the page table with 4KB entries mapping the same physical memory */
                 uint64_t* pt_entries = (uint64_t*)new_pt;
                 for (int i = 0; i < 512; i++) {
                     pt_entries[i] = vmm_make_entry(huge_phys + i * PAGE_SIZE, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
                 }
-                
+
                 /* Replace the huge page with the page table */
                 pd[pdi] = vmm_make_entry(new_pt, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
-                
+
+                vga_puts("[DEBUG] Replaced PD entry with PT at phys 0x");
+                vga_puthex(new_pt);
+                vga_puts("\n");
+
+                /* Debug: Show PT[0] before override */
+                vga_puts("[DEBUG] PT[0] before override: 0x");
+                vga_puthex(((uint64_t*)new_pt)[0]);
+                vga_puts("\n");
+
                 /* Now fall through to update the specific 4KB entry */
             } else {
                 /* Huge page already maps this region, cannot create 4K mapping */
@@ -395,7 +420,27 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     }
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
 
+    extern void vga_puts(const char*);
+    extern void vga_puthex(uint64_t);
+
+    vga_puts("[DEBUG] Setting PT entry: pt=0x");
+    vga_puthex((uint64_t)pt);
+    vga_puts(" pti=0x");
+    vga_puthex(pti);
+    vga_puts("\n");
+
     pt[pti] = vmm_make_entry(phys, flags);
+
+    vga_puts("[DEBUG] Set PT[");
+    vga_puthex(pti);
+    vga_puts("] = 0x");
+    vga_puthex(pt[pti]);
+    vga_puts(" (phys=0x");
+    vga_puthex(phys);
+    vga_puts(", flags=0x");
+    vga_puthex(flags);
+    vga_puts(")\n");
+
     vmm_reload_cr3();
 }
 

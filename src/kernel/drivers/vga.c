@@ -81,6 +81,19 @@ void vga_puts(const char* str) {
     }
 }
 
+void vga_puthex(uint64_t value) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    char buffer[17];
+    buffer[16] = '\0';
+
+    for (int i = 15; i >= 0; i--) {
+        buffer[i] = hex_chars[value & 0xF];
+        value >>= 4;
+    }
+
+    vga_puts(buffer);
+}
+
 void vga_set_cursor(int x, int y) {
     uint16_t pos = y * VGA_WIDTH + x;
     outb(0x3D4, 0x0F);

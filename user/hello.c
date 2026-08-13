@@ -32,15 +32,17 @@ static inline long syscall2(long num, long arg0, long arg1) {
 
 /* Entry point - called by kernel after loading */
 void _start(void) {
-    /* Print a message using syscall */
-    const char* msg = "Hello from user mode!\n";
-    
-    /* Use SYS_PUTS syscall */
-    syscall2(SYS_PUTS, (long)msg, 0);
-    
-    /* Exit with status 0 */
-    syscall1(SYS_EXIT, 0);
-    
-    /* Should never reach here */
-    while (1);
+    /* Use inline assembly to avoid absolute address references */
+    __asm__ volatile(
+        "lea msg(%%rip), %%rbx\n"    /* Load address of msg using RIP-relative addressing */
+        "mov $6, %%rax\n"             /* SYS_PUTS */
+        "xor %%rcx, %%rcx\n"          /* arg1 = 0 */
+        "int $0x80\n"
+        "mov $0, %%rax\n"             /* SYS_EXIT */
+        "xor %%rbx, %%rbx\n"          /* status = 0 */
+        "int $0x80\n"
+        "jmp .\n"                     /* Should never reach here */
+        "msg: .ascii \"Hello from user mode!\\n\\0\"\n"
+        ::: "rax", "rbx", "rcx", "memory"
+    );
 }
