@@ -2,6 +2,32 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.5.1] - 2026-08-27
+ This release focuses on debugging, crash-safety, and robustness improvements: it adds a RAM-disk fallback when no ATA disk is present, halts on CPU exceptions to avoid fault loops, enables debug symbols, adds extensive boot/filesystem tracing, and configures the GRUB menu.
+
+### Added
+- **RAM disk fallback**: `disk.c` now allocates an in-memory RAM disk when no ATA disk is detected (e.g. QEMU without `-hda`), routing `disk_read_sector()` / `disk_write_sector()` through it so the filesystem can still initialize and format. Prevents a hard boot failure on diskless environments.
+- **GRUB menu configuration**: `grub.cfg` now sets `timeout=2` and `default=0` for automated/bootable image selection.
+- **Debug symbols in build**: `Makefile` CFLAGS now include `-g` to emit DWARF debug info for `objdump`-based analysis.
+- **`find_call.py`**: new helper script that disassembles `build/kernel.bin` with `objdump` and locates `call` instructions to `strcmp` within a target address range (useful for tracing filesystem string comparisons).
+- **Extensive boot & filesystem tracing**: added `klog()` diagnostics throughout `kernel_main()` (one per subsystem init) and across the FAT32 layer — `fs_init()`, `fat_alloc_cluster()`, `fs_check_entry_exists()`, `fs_create_dir()`, and `fs_load_directory()` now log their progress, child pointers, and resolved entry names.
+
+### Fixed
+- **CPU exception infinite fault loop**: `isr.c` now executes `hlt` after printing an unhandled exception, halting the CPU instead of spinning on repeated fault/print cycles.
+- **Filesystem debug logging safety**: `fs_check_entry_exists()` now bounds-checks each child's `name` and sanitizes non-printable bytes before logging, avoiding garbage reads while enumerating directory children.
+
+### File Changes
+- `Makefile`: added `-g` debug flag to CFLAGS
+- `find_call.py`: new disassembly/ call-tracing helper script
+- `grub.cfg`: added `timeout` and `default` settings
+- `src/kernel/core/isr.c`: halt on CPU exception
+- `src/kernel/core/main.c`: added per-subsystem init tracing
+- `src/kernel/drivers/disk.c`: RAM disk fallback when no ATA disk present
+- `src/kernel/fs/fs.c`: debug-only tracing and safer name logging across FS operations
+
+### Notes
+- Most additions in this release are debug/observability aids (kernel `klog` output and `find_call.py`). These are intended for diagnosis and do not change runtime behavior of the production paths beyond the RAM-disk and exception-halt fixes.
+
 ## [2.5.0] - 2026-07-24
 This release introduces foundational user mode (Ring 3) support, enabling the kernel to run user programs in a protected environment with system call interfaces.
 
