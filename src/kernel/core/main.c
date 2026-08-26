@@ -107,27 +107,35 @@ void kernel_main(uint64_t mb_info_phys) {
 
     klog("Shell: initializing command interpreter...\n");
     shell_init();
+    klog("[init] shell_init done\n");
 
     klog("input: keyboard initializing...\n");
     keyboard_init();
+    klog("[init] keyboard_init done\n");
 
     klog("input: mouse initializing...\n");
     mouse_init();
+    klog("[init] mouse_init done\n");
 
     klog("Speaker: initializing...\n");
     speaker_init();
+    klog("[init] speaker_init done\n");
 
     klog("Scheduler: initializing round-robin scheduler...\n");
     scheduler_init();
+    klog("[init] scheduler_init done\n");
 
     klog("PIT: initializing timer (100 Hz)...\n");
     pit_init(100);
+    klog("[init] pit_init done\n");
 
     klog("ACPI: initializing...\n");
     power_init();
+    klog("[init] power_init done\n");
 
     klog("PCI: initializing bus...\n");
     pci_init();
+    klog("[init] pci_init done\n");
 
     klog("net: initializing network stack...\n");
     netif_init();
@@ -145,15 +153,19 @@ void kernel_main(uint64_t mb_info_phys) {
     } else {
         klog("net: no NIC found\n");
     }
+    klog("[init] net done\n");
 
     klog("SMP: initializing multiprocessor...\n");
     smp_init();
+    klog("[init] smp_init done\n");
 
     klog("\n");
     klog("Welcome to Kil0yOS!\n");
     klog("Type 'help' for available commands.\n\n");
+    klog("[init] before enable_interrupts\n");
 
     enable_interrupts();
+    klog("[init] interrupts enabled\n");
 
     shell_run();
 }

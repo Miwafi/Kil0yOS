@@ -104,6 +104,8 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
     }
     vga_puts("\n");
 
+    /* Halt on CPU exceptions to avoid an infinite fault/print loop. */
+    __asm__ volatile("hlt");
     return (uint64_t)frame;
 }
 

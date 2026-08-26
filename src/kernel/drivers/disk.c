@@ -2,6 +2,7 @@
 #include "drivers/io.h"
 #include "drivers/device.h"
 #include "drivers/pci.h"
+#include "drivers/vga.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 
@@ -49,6 +50,11 @@ static uint16_t bm_base = 0; /* Bus Master I/O base */
 
 static uint8_t* dma_buffer = NULL;
 static uint8_t* prdt_buffer = NULL;
+
+/* RAM disk fallback used when no ATA disk is present (e.g. QEMU without -hda). */
+static uint8_t* ram_disk = NULL;
+#define RAM_DISK_SECTORS DISK_MAX_SECTORS
+
 
 typedef struct __attribute__((packed)) {
     uint32_t phys_addr;
@@ -191,6 +197,18 @@ static int ata_do_dma(uint32_t sector, uint8_t* buffer, int is_write) {
     return 0;
 }
 
+/* Initialize RAM disk fallback when no real ATA disk is present. */
+static void disk_init_ram_fallback(void) {
+    ram_disk = (uint8_t*)kmalloc((size_t)RAM_DISK_SECTORS * DISK_SECTOR_SIZE);
+    if (ram_disk == NULL) {
+        klog("disk: failed to allocate RAM disk\n");
+        return;
+    }
+    memset(ram_disk, 0, (size_t)RAM_DISK_SECTORS * DISK_SECTOR_SIZE);
+    disk_present = 1; /* route read/write through RAM disk */
+    klog("disk: no ATA disk found, using RAM disk fallback\n");
+}
+
 void disk_init() {
     outb(ATA_PRIMARY_IO_BASE + ATA_REG_DEVICE, 0xA0);
     io_wait();
@@ -204,18 +222,18 @@ void disk_init() {
 
     uint8_t status = inb(ATA_PRIMARY_IO_BASE + ATA_REG_STATUS);
     if (status == 0) {
-        disk_present = 0;
+        disk_init_ram_fallback();
         return;
     }
 
     if (disk_wait_ready() != 0) {
-        disk_present = 0;
+        disk_init_ram_fallback();
         return;
     }
 
     status = inb(ATA_PRIMARY_IO_BASE + ATA_REG_STATUS);
     if ((status & ATA_STATUS_ERROR) || !(status & ATA_STATUS_DRQ)) {
-        disk_present = 0;
+        disk_init_ram_fallback();
         return;
     }
 
@@ -235,6 +253,12 @@ int disk_read_sector(uint32_t sector, uint8_t* buffer) {
     if (!disk_present) return -1;
     if (sector >= DISK_MAX_SECTORS) return -1;
     if (buffer == NULL) return -1;
+
+    /* RAM disk fallback */
+    if (ram_disk != NULL) {
+        memcpy(buffer, ram_disk + (size_t)sector * DISK_SECTOR_SIZE, DISK_SECTOR_SIZE);
+        return 0;
+    }
 
     /* Try DMA first, fall back to PIO */
     if (dma_enabled) {
@@ -263,6 +287,12 @@ int disk_write_sector(uint32_t sector, const uint8_t* buffer) {
     if (!disk_present) return -1;
     if (sector >= DISK_MAX_SECTORS) return -1;
     if (buffer == NULL) return -1;
+
+    /* RAM disk fallback */
+    if (ram_disk != NULL) {
+        memcpy(ram_disk + (size_t)sector * DISK_SECTOR_SIZE, buffer, DISK_SECTOR_SIZE);
+        return 0;
+    }
 
     /* Try DMA first, fall back to PIO */
     if (dma_enabled) {

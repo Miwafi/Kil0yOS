@@ -1,6 +1,7 @@
 #include "fs/fs.h"
 #include "mm/memory.h"
 #include "lib/string.h"
+#include "lib/stdlib.h"
 #include "drivers/disk.h"
 
 static fat32_boot_sector_t boot_sector;
@@ -67,6 +68,11 @@ static int fat_write_entry(uint32_t cluster, uint32_t value) {
 static uint32_t fat_alloc_cluster() {
     uint32_t data_sectors = DISK_MAX_SECTORS - get_first_data_sector();
     uint32_t max_cluster = 2 + (data_sectors / boot_sector.bpb.sectors_per_cluster);
+    char tmp[16];
+    itoa((int)max_cluster, tmp, 10, sizeof(tmp));
+    klog("[fs] alloc_cluster max_cluster=");
+    klog(tmp);
+    klog("\n");
 
     for (uint32_t cluster = 2; cluster < max_cluster; cluster++) {
         uint32_t entry = fat_read_entry(cluster);
@@ -499,26 +505,41 @@ int fs_load() {
 }
 
 void fs_init() {
+    klog("[fs] disk_init start\n");
     disk_init();
-    
+    klog("[fs] disk_init done\n");
+
     if (fs_load() == 0) {
+        klog("[fs] fs_load ok (disk present)\n");
         return;
     }
-    
+
+    klog("[fs] no disk, formatting\n");
     fs_format();
+    klog("[fs] format done, reloading\n");
     fs_load();
-    
+    klog("[fs] reload done\n");
+
     fs_create_dir("home");
+    klog("[fs] created home\n");
     fs_create_dir("bin");
+    klog("[fs] created bin\n");
     fs_create_dir("etc");
+    klog("[fs] created etc\n");
     fs_create_dir("tmp");
+    klog("[fs] created tmp\n");
     
     fs_entry_t* home = fs_resolve_path("/home");
+    klog("[fs] resolved /home\n");
     if (home != NULL) {
         fs_set_current(home);
+        klog("[fs] set current home\n");
         fs_create_dir("user");
+        klog("[fs] created user\n");
         fs_set_current(root);
+        klog("[fs] set current root\n");
     }
+    klog("[fs] fs_init complete\n");
 }
 
 fs_entry_t* fs_root() {
@@ -589,14 +610,24 @@ fs_entry_t* fs_resolve_path(const char* path) {
 
 static int fs_check_entry_exists(fs_entry_t* dir, const char* name) {
     if (dir == NULL || name == NULL) return FS_ERR_INVALID;
-    
+    char dbg[16]; itoa((int)(uint64_t)dir, dbg, 16, sizeof(dbg));
+    klog("[fs] check_exists dir=0x"); klog(dbg); klog(" name="); klog(name); klog("\n");
+
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (dir->children[i] != NULL && 
-            strcmp(dir->children[i]->name, name) == 0) {
-            return FS_ERR_EXISTS;
+        char di[8]; itoa(i, di, 10, sizeof(di));
+        char dc[16]; itoa((int)(uint64_t)dir->children[i], dc, 16, sizeof(dc));
+        klog("[fs]   i="); klog(di); klog(" child=0x"); klog(dc); klog("\n");
+        if (dir->children[i] != NULL) {
+            char nb[16];
+            for (int j=0;j<16;j++){ nb[j] = ((char*)(dir->children[i]->name))[j]; if(nb[j]<0x20&&nb[j]!='\n')nb[j]='.'; }
+            nb[15]=0;
+            klog("[fs]     name='"); klog(nb); klog("'\n");
+            if (strcmp(dir->children[i]->name, name) == 0) {
+                return FS_ERR_EXISTS;
+            }
         }
     }
-    
+
     return FS_ERR_NONE;
 }
 
@@ -708,7 +739,10 @@ fs_entry_t* fs_create_file(const char* name) {
 
 fs_entry_t* fs_create_dir(const char* name) {
     fs_last_error = FS_ERR_NONE;
-    
+    klog("[fs] create_dir: ");
+    klog(name);
+    klog("\n");
+
     if (name == NULL || strlen(name) >= 256) {
         fs_last_error = FS_ERR_INVALID;
         return NULL;
@@ -717,6 +751,7 @@ fs_entry_t* fs_create_dir(const char* name) {
     fs_entry_t* parent_dir;
     const char* base_name;
     resolve_parent_and_name(name, &parent_dir, &base_name);
+    klog("[fs] create_dir: resolved parent\n");
 
     if (parent_dir == NULL || base_name == NULL || *base_name == '\0') {
         fs_last_error = FS_ERR_INVALID;
@@ -724,18 +759,21 @@ fs_entry_t* fs_create_dir(const char* name) {
     }
 
     int exists = fs_check_entry_exists(parent_dir, base_name);
+    klog("[fs] create_dir: checked exists\n");
     if (exists == FS_ERR_EXISTS) {
         fs_last_error = FS_ERR_EXISTS;
         return NULL;
     }
 
     int full = fs_check_dir_full(parent_dir);
+    klog("[fs] create_dir: checked full\n");
     if (full == FS_ERR_FULL) {
         fs_last_error = FS_ERR_FULL;
         return NULL;
     }
     
     uint32_t new_cluster = fat_alloc_cluster();
+    klog("[fs] create_dir: allocated cluster\n");
     if (new_cluster == 0) {
         fs_last_error = FS_ERR_FULL;
         return NULL;

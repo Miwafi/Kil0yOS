@@ -4,7 +4,7 @@ LD = ld
 OBJCOPY = objcopy
 QEMU = qemu-system-x86_64
 
-CFLAGS = -std=c11 -ffreestanding -O2 -Wall -Wextra -fno-stack-protector -m64 -mno-red-zone -fno-pie -mcmodel=large -mno-sse -mno-sse2 -mno-mmx -I$(INCDIR)
+CFLAGS = -std=c11 -ffreestanding -O2 -g -Wall -Wextra -fno-stack-protector -m64 -mno-red-zone -fno-pie -mcmodel=large -mno-sse -mno-sse2 -mno-mmx -I$(INCDIR)
 ASFLAGS = -f elf64
 LDFLAGS = -T linker.ld -O2 -nostdlib -m elf_x86_64
 
