@@ -1,6 +1,8 @@
 #include "core/process.h"
 #include "core/gdt.h"
 #include "core/tss.h"
+#include "sched/scheduler.h"
+#include "shell/shell.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "fs/fs.h"
@@ -46,12 +48,11 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     int proc_index = proc - processes;
     proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
 
-    /* Allocate code area at USER_CODE_BASE (0x400000 = 4 MB)
-     * This is above the kernel but below the stack
-     * We use identity mapping, so we need to:
+    /* Allocate code area at USER_CODE_BASE (0x10000000 = 256 MB, above
+     * the kernel heap arena so we never rewrite heap PTEs):
      * 1. Allocate physical pages
-     * 2. Map them to USER_CODE_BASE
-     * 3. Copy code through the identity-mapped physical addresses
+     * 2. Map them into the shared page tables at the user VA
+     * 3. Copy code through the user VA
      */
 
     proc->code_base = USER_CODE_BASE;
@@ -74,27 +75,24 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
         /* Flags: Present (1), Writable (2), User (4) = 0x07 */
         vmm_map_page(virt, phys, 0x07);
 
-        vga_puts("[DEBUG] Mapped page: virt=0x");
-        vga_puthex(virt);
-        vga_puts(" -> phys=0x");
-        vga_puthex(phys);
-        vga_puts("\n");
-
-        /* Copy code to the page using physical address (identity mapped) */
-        /* Since boot.asm identity maps the first 4GB, phys == virt for low addresses */
-        /* But USER_CODE_BASE might map to a different physical address, so use phys */
+        /* Copy code through the freshly mapped user VA (ring0 may write
+         * user pages). Copying via the physical address relied on the
+         * identity map, which we may have just re-pointed above. */
         size_t offset = i * 4096;
         size_t copy_size = (code_size > offset + 4096) ? 4096 : code_size - offset;
         if (copy_size > 0 && offset < code_size) {
-            /* Use physical address which is identity-mapped and accessible */
-            memcpy((void*)phys, code + offset, copy_size);
+            memcpy((void*)virt, code + offset, copy_size);
         }
     }
+    proc->code_pages = (uint32_t)pages_needed;
+
+    klog("[create] code mapped\n");
 
     /* Set up stack */
     proc->stack_top = USER_STACK_BASE;
 
-    /* Map user stack pages (stack grows downward) */
+    /* Map user stack pages (stack grows down) */
+    uint32_t stack_pages = 0;
     for (uint64_t addr = USER_STACK_BASE - USER_STACK_SIZE + 0x1000;
          addr <= USER_STACK_BASE;
          addr += 4096) {
@@ -104,7 +102,9 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
             return -1;
         }
         vmm_map_page(addr, phys, 0x07);  /* User, R/W, Present */
+        stack_pages++;
     }
+    proc->stack_pages = stack_pages;
 
     proc->entry_point = entry;
     proc->state = PROCESS_STATE_READY;
@@ -112,17 +112,70 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     return proc->pid;
 }
 
+/* Release all user pages of a process and free its slot.
+ * Only safe for processes that are not running. */
+static void process_release_memory(process_t* proc) {
+    for (uint32_t i = 0; i < proc->code_pages; i++) {
+        uint64_t virt = proc->code_base + (uint64_t)i * 4096;
+        uint64_t phys = vmm_get_phys(virt);
+        vmm_unmap_page(virt);
+        if (phys != 0) pmm_free_page(phys);
+    }
+    for (uint32_t i = 0; i < proc->stack_pages; i++) {
+        uint64_t virt = proc->stack_top - USER_STACK_SIZE + (uint64_t)(i + 1) * 4096;
+        uint64_t phys = vmm_get_phys(virt);
+        vmm_unmap_page(virt);
+        if (phys != 0) pmm_free_page(phys);
+    }
+    proc->code_pages = 0;
+    proc->stack_pages = 0;
+}
+
+void process_reap_zombies(void) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processes[i].state == PROCESS_STATE_ZOMBIE) {
+            process_release_memory(&processes[i]);
+            processes[i].state = PROCESS_STATE_UNUSED;
+        }
+    }
+}
+
+int process_any_active(void) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_state_t s = processes[i].state;
+        if (s == PROCESS_STATE_READY || s == PROCESS_STATE_RUNNING ||
+            s == PROCESS_STATE_BLOCKED) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void process_exit(int status) {
-    (void)status;
     if (current_process < 0) return;
 
-    process_t* proc = &processes[current_process];
-    proc->state = PROCESS_STATE_ZOMBIE;
+    klog("[proc] exit syscall\n");
 
-    /* For now, just halt */
-    while (1) {
-        __asm__ volatile("hlt");
-    }
+    process_t* proc = &processes[current_process];
+
+    /* Atomic w.r.t. IRQ0: no timer tick may observe the half-updated
+     * state below and save this dying frame into tasks[0].rsp. */
+    __asm__ volatile("cli");
+
+    proc->state = PROCESS_STATE_ZOMBIE;
+    proc->exit_status = status;
+    current_process = -1;
+
+    /* From now on every scheduler tick returns the saved kernel-main
+     * frame, so the context that follows never runs again. */
+    scheduler_request_main_switch();
+
+    /* sti takes effect after the next instruction (nop), so the
+     * software IRQ0 fires with IF=1 recorded in its frame - the shell
+     * resumes with interrupts enabled. If a real timer tick lands in
+     * the nop window it takes the pending-switch path anyway. */
+    __asm__ volatile("sti; nop; int $32");
+    __builtin_unreachable();
 }
 
 process_t* process_get_current(void) {
@@ -146,6 +199,15 @@ void process_run(uint32_t pid) {
         return;
     }
 
+    klog("[proc] run pid\n");
+
+    /* No tick may fire from here until the iretq into ring 3: the moment
+     * state becomes RUNNING, scheduler_tick() would classify this ring0
+     * context as the user frame and switch away mid-setup, corrupting the
+     * switch sequence. jump_to_user forces IF=1 in the user RFLAGS, so
+     * interrupts resume on the first ring-3 instruction. */
+    __asm__ volatile("cli");
+
     /* Mark as running */
     proc->state = PROCESS_STATE_RUNNING;
     current_process = proc - processes;
@@ -153,33 +215,24 @@ void process_run(uint32_t pid) {
     /* Set TSS kernel stack for syscall returns */
     tss_set_kernel_stack(proc->kernel_stack);
 
+    /* The shell context is about to be abandoned by iretq below. Park a
+     * fresh kernel-main frame (shell_run on the scheduler stack) so that
+     * process exit lands back in a working shell instead of a stale
+     * snapshot of the boot stack. */
+    scheduler_set_main_return(shell_run);
+
     /* Jump to user mode */
     jump_to_user(proc->entry_point, proc->stack_top);
 }
 
 /* Jump to user mode using iretq
  * This function sets up the stack and uses iretq to jump to Ring 3
+ * NOTE: never returns - the caller's stack frame is abandoned. The
+ * scheduler brings the kernel back to life from its saved IRQ0 frame.
  */
 void jump_to_user(uint64_t entry, uint64_t stack) {
-    /* Set TSS kernel stack pointer - this is where CPU will jump on syscall/interrupt */
-    uint64_t kernel_stack;
-    __asm__ volatile("mov %%rsp, %0" : "=r"(kernel_stack));
-    tss_set_kernel_stack(kernel_stack);
-
-    /* Prepare for iretq on the CURRENT (kernel) stack:
-     * We push values onto kernel stack, then iretq will:
-     * 1. Pop RIP, CS, RFLAGS, RSP, SS from stack
-     * 2. Load them into registers
-     * 3. Jump to RIP in Ring 3
-     *
-     * Stack layout after pushes (grows downward):
-     * [top] SS      (user data segment + RPL 3)
-     *       RSP     (user stack pointer)
-     *       RFLAGS  (with interrupt flag set)
-     *       CS      (user code segment + RPL 3)
-     *       RIP     (entry point)
-     * [bottom - iretq pops from here]
-     */
+    /* TSS RSP0 was already set to the process kernel stack by
+     * process_run(); interrupts/syscalls from ring 3 land there. */
 
     uint64_t user_cs = USER_CS | 3;  /* 0x18 | 3 = 0x1B */
     uint64_t user_ss = USER_DS | 3;  /* 0x20 | 3 = 0x23 */
@@ -188,18 +241,6 @@ void jump_to_user(uint64_t entry, uint64_t stack) {
     /* Get current RFLAGS */
     __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
     rflags |= 0x200;  /* Set interrupt flag */
-
-    /* Debug: Print entry point and stack info */
-    vga_puts("\n[DEBUG] jump_to_user:\n");
-    vga_puts("  Entry: 0x");
-    vga_puthex(entry);
-    vga_puts("\n  Stack: 0x");
-    vga_puthex(stack);
-    vga_puts("\n  CS: 0x");
-    vga_puthex(user_cs);
-    vga_puts("  SS: 0x");
-    vga_puthex(user_ss);
-    vga_puts("\n");
 
     /* Disable interrupts and jump to user mode */
     __asm__ volatile(
@@ -262,4 +303,27 @@ int load_user_program(const char* path) {
     }
 
     return pid;
+}
+
+/* Embedded user program blobs (see Makefile: nasm .incbin) */
+extern const uint8_t user_hello_start[];
+extern const uint8_t user_hello_end[];
+
+void user_programs_install(void) {
+    fs_entry_t* bin = fs_resolve_path("/bin");
+    if (bin == NULL || bin->type != FS_TYPE_DIRECTORY) {
+        return;  /* /bin missing - fs not formatted? */
+    }
+    if (fs_resolve_path("/bin/hello.bin") != NULL) {
+        return;  /* already installed */
+    }
+
+    fs_entry_t* prev = fs_current();
+    fs_set_current(bin);
+    fs_entry_t* f = fs_create_file("hello.bin");
+    if (f != NULL) {
+        size_t size = (size_t)(user_hello_end - user_hello_start);
+        fs_write_file(f, user_hello_start, size);
+    }
+    fs_set_current(prev);
 }

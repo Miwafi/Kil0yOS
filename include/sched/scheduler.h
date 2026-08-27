@@ -22,6 +22,17 @@ uint64_t scheduler_tick(uint64_t current_rsp);
 int  task_kill(int task_id);
 void task_exit(void);
 
+/* Called by process_exit(): next scheduler_tick() must return the saved
+ * kernel-main frame instead of the dying user process frame. */
+void scheduler_request_main_switch(void);
+
+/* Arm a FRESH kernel-main entry frame on the scheduler's own stack.
+ * Must be called right before jump_to_user(): the old tasks[0].rsp frame
+ * is a snapshot of the boot stack at some earlier tick depth and has been
+ * clobbered by the shell's deeper calls (exec path), so restoring it
+ * after process exit would iretq into garbage. */
+void scheduler_set_main_return(void (*entry)(void));
+
 int task_get_count(void);
 const char* task_get_name(int idx);
 int task_get_status(int idx);

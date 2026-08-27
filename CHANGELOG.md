@@ -2,6 +2,43 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.7.0] - 2026-08-28
+This release completes the system-call and process-scheduling closed loop: user programs now run in Ring 3, issue `int 0x80` system calls, time-share the CPU with the kernel shell via IRQ0 round-robin, and exit cleanly back to the shell. `exec /bin/hello.bin` is verified end-to-end (output + exit + shell recovery) with an automated headless QEMU harness.
+
+### Added
+- **Ring 3 user program execution**: `exec /bin/hello.bin` creates a process (PID slot, user code at 256 MB, user stack), maps code/stack pages with the `VMM_USER` bit propagated through PML4/PDPT/PD/PT, sets the TSS kernel stack, and `iretq`s into Ring 3.
+- **`int 0x80` system call interface** (`isr.asm` `syscall_entry` + `syscall.c`): saves/restores all user registers, maps arguments (rax=num, rbx/rcx/rdx/r8/r9/r10=args), and writes the return value directly into the saved-rax stack slot. Dispatch table supports registration; implemented: `exit`, `read`, `write`, `getpid`, `yield`, `puts`, `getchar`, `putchar` (`open`/`close` reserved, return `-ENOSYS`).
+- **User/kernel time-slice scheduling**: while a user process is RUNNING, IRQ0 alternates between the parked user frame and the kernel main task frame (`scheduler_tick()` park/resume). `sys_yield()` gives up the remainder of a slice via a software `int $0x20`.
+- **Process exit closed loop**: `sys_exit` → `process_exit` (atomic w.r.t. IRQ0) → `scheduler_request_main_switch()` → shell resumes. Zombie processes' user pages are reclaimed by `process_reap_zombies()`; the shell reaps zombies before each `exec`.
+- **`scheduler_set_main_return()`**: before jumping to user mode, a fresh kernel-main frame (`shell_run` on the scheduler stack) is parked so process exit lands back in a working shell instead of a stale boot-stack snapshot.
+- **Embedded user program `/bin/hello.bin`**: built with freestanding `-mcmodel=small` flags, linked via `user/user.ld`, embedded into the kernel image with `incbin` (`user_blob.o`), and installed into the filesystem at boot (`user_programs_install()`).
+
+### Fixed
+- **#GP(0x244) on syscall return (CRITICAL)**: `syscall_entry` did `add rsp, 16` after `call syscall_dispatcher`, but `ret` already pops the return address — the extra 8 bytes desynchronized the stack so the final `iretq` loaded the user's RFLAGS slot as CS. Fixed to `add rsp, 8`.
+- **User/kernel syscall number mismatch**: kernel enum has `OPEN`/`CLOSE` placeholders, making `SYS_YIELD=6` and `SYS_PUTS=7`; the user program sent 6 and silently invoked `sys_yield`. `hello.c` now matches the kernel enum and documents the numbering.
+- **Triple fault on `exec`**: synthetic task frames in `setup_task_stack()` now include valid `SS:RSP` (a 5-word `iretq` pop previously loaded `RSP=0/SS=0`), and `process_run()` raises `cli` before marking the process RUNNING so no IRQ0 tick can park the half-built transition frame.
+- **Kernel heap corruption by PMM**: the heap arena is now reserved with `pmm_mark_region()` during `memory_init()`, so physical page allocation can no longer hand out heap pages and destroy heap metadata.
+- **User address-space layout**: `USER_CODE_BASE` moved to 256 MB, above the kernel heap arena, eliminating VA collisions.
+- **Syscall argument register mapping**: `xchg rcx, rdx` plus `push r10` now correctly delivers (num, arg0..arg5) to the SysV-ABI dispatcher.
+
+### Changed
+- Version strings bumped to 2.7.0 (boot banner, `version` command, GUI title bar).
+- Removed per-tick/per-syscall debug logging from scheduler, process creation, and syscall dispatcher (kept: one line per process run/exit, ENOSYS warnings).
+
+### File Changes
+- `src/kernel/core/isr.asm`: `syscall_entry` stack fix (`add rsp, 8`)
+- `src/kernel/core/syscall.c`: dispatcher without per-call logging
+- `src/kernel/core/process.c`: `cli`-guarded `process_run`, `scheduler_set_main_return(shell_run)` before `jump_to_user`, debug-log cleanup
+- `src/kernel/sched/scheduler.c`: user/main frame alternation, `main_switch_requested` exit path, debug-log cleanup
+- `src/kernel/core/main.c`: version string
+- `src/kernel/shell/shell.c`: version strings, zombie reaping before `exec`
+- `user/hello.c`: corrected syscall numbers, documented kernel enum mapping
+- `Makefile`: user program build (freestanding flags, `user_blob` embedding)
+
+### Notes
+- Verified with automated headless QEMU (QMP key injection + screendump + `-d int` trace): `exec /bin/hello.bin` prints `Hello from user mode!` in Ring 3, exits via `SYS_EXIT`, and the shell prompt returns; zero exceptions in the interrupt trace.
+- `SYS_READ`/`SYS_GETCHAR` currently block in the kernel (`hlt` polling); a blocking-with-schedule implementation is a future step.
+
 ## [2.6.0] - 2026-08-27
 This release overhauls the VGA graphics subsystem: mode 13h / GUI now work on strict hardware emulators (VMware, VirtualBox) in addition to QEMU, exiting graphics modes no longer corrupts the BIOS font, and colors are deterministic. Also includes GUI shell usability fixes and a graphics-mode regression test harness.
 

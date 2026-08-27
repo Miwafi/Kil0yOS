@@ -84,8 +84,57 @@ void isr_init() {
     syscall_init();
 }
 
+/* --- exception tracing: mirror to COM1 so the trace survives a
+ * triple-fault reset (VGA alone would be wiped) --- */
+static void ex_serial_putc(char c) {
+    while ((inb(0x3F8 + 5) & 0x20) == 0);
+    outb(0x3F8, (uint8_t)c);
+}
+
+static void ex_serial_puts(const char* s) {
+    while (*s) {
+        if (*s == '\n') ex_serial_putc('\r');
+        ex_serial_putc(*s++);
+    }
+}
+
+static void utohex(uint64_t v, char* out) {
+    out[0] = '0'; out[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        uint8_t nib = (uint8_t)(v >> (60 - i * 4)) & 0xF;
+        out[2 + i] = nib < 10 ? ('0' + nib) : ('a' + nib - 10);
+    }
+    out[18] = '\0';
+}
+
 uint64_t isr_handler(interrupt_frame_t* frame) {
-    /* Debug: Print exception info */
+    char buf[24];
+    ex_serial_puts("\n[EXCEPTION] ISR #");
+    utohex(frame->interrupt_number, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" RIP=");
+    utohex(frame->rip, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" CS=");
+    utohex(frame->cs, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" RSP=");
+    utohex(frame->rsp, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" err=");
+    utohex(frame->error_code, buf);
+    ex_serial_puts(buf);
+
+    if (frame->interrupt_number == 14) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        ex_serial_puts(" CR2=");
+        utohex(cr2, buf);
+        ex_serial_puts(buf);
+    }
+    ex_serial_puts("\n");
+
+    /* Also show on VGA for interactive debugging */
     vga_puts("\n[EXCEPTION] ISR #");
     vga_puthex(frame->interrupt_number);
     vga_puts(" at RIP: 0x");

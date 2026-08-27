@@ -26,16 +26,17 @@ static inline long syscall2(long num, long arg0, long arg1) {
     return ret;
 }
 
-/* Syscall numbers - must match kernel */
+/* Syscall numbers - must match include/core/syscall.h:
+ * EXIT=0 READ=1 WRITE=2 OPEN=3 CLOSE=4 GETPID=5 YIELD=6 PUTS=7 ... */
 #define SYS_EXIT    0
-#define SYS_PUTS    6
+#define SYS_PUTS    7
 
 /* Entry point - called by kernel after loading */
 void _start(void) {
     /* Use inline assembly to avoid absolute address references */
     __asm__ volatile(
         "lea msg(%%rip), %%rbx\n"    /* Load address of msg using RIP-relative addressing */
-        "mov $6, %%rax\n"             /* SYS_PUTS */
+        "mov $7, %%rax\n"             /* SYS_PUTS */
         "xor %%rcx, %%rcx\n"          /* arg1 = 0 */
         "int $0x80\n"
         "mov $0, %%rax\n"             /* SYS_EXIT */

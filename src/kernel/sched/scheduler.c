@@ -1,4 +1,5 @@
 #include "sched/scheduler.h"
+#include "core/process.h"
 #include "lib/string.h"
 
 static task_t tasks[MAX_TASKS];
@@ -7,6 +8,30 @@ static int current_task_idx = 0;
 
 volatile uint64_t cpu_busy_ticks = 0;
 volatile uint64_t cpu_idle_ticks = 0;
+
+static void setup_task_stack(task_t* task, void (*entry)(void));
+
+/* --- User process time slicing ---
+ * While a user process is RUNNING, IRQ0 alternates between the user
+ * process frame (parked in user_frame) and the kernel main task frame
+ * (tasks[0].rsp). Exit from user mode goes through
+ * scheduler_request_main_switch() so the dying process's frame is never
+ * resumed. */
+static uint64_t user_frame = 0;
+static int user_frame_valid = 0;
+static volatile int main_switch_requested = 0;
+
+void scheduler_request_main_switch(void) {
+    main_switch_requested = 1;
+}
+
+void scheduler_set_main_return(void (*entry)(void)) {
+    /* Rebuild tasks[0]'s synthetic frame at the top of the scheduler's
+     * dedicated stack. From this point the kernel main task runs there,
+     * so every tick's save/restore of tasks[0].rsp stays consistent. */
+    setup_task_stack(&tasks[0], entry);
+    tasks[0].status = TASK_READY;
+}
 
 void scheduler_init() {
     task_count = 1;
@@ -40,10 +65,17 @@ static void setup_task_stack(task_t* task, void (*entry)(void)) {
 
     // 16-byte align
     sp = (uint64_t*)((uint64_t)sp & ~0xFull);
+    uint64_t frame_top = (uint64_t)sp;
 
-    // Hardware frame – iretq pops RIP, CS, RFLAGS
+    // Hardware frame – iretq pops RIP, CS, RFLAGS. SS:RSP are appended so
+    // that even a 5-word iretq pop loads a VALID ring-0 stack instead of
+    // reading the zeroed BSS above the frame (RSP=0/SS=0 -> instant triple
+    // fault). A 3-word pop leaves RSP at the RSP slot (top of this stack)
+    // - equally valid.
+    *--sp = 0x10;                   // SS - kernel data
+    *--sp = frame_top;              // RSP - top of this task stack
     *--sp = 0x202;                  // RFLAGS (IF = 1)
-    *--sp = 0x08;                   // CS – kernel code segment
+    *--sp = 0x08;                   // CS - kernel code segment
     *--sp = (uint64_t)entry;        // RIP
 
     // Pushed by ISR/IRQ macro
@@ -91,6 +123,31 @@ int task_create(void (*entry)(void), const char* name) {
 }
 
 uint64_t scheduler_tick(uint64_t current_rsp) {
+    /* A user process just exited: resume the kernel main task from its
+     * last saved frame; never touch the dying process's frame. */
+    if (main_switch_requested) {
+        main_switch_requested = 0;
+        user_frame_valid = 0;
+        return tasks[0].rsp;
+    }
+
+    /* Time-share between a running user process and the kernel main task */
+    process_t* uproc = process_get_current();
+    if (uproc != NULL && uproc->state == PROCESS_STATE_RUNNING) {
+        if (user_frame_valid) {
+            /* current frame belongs to the kernel main task */
+            tasks[0].rsp = current_rsp;
+            user_frame_valid = 0;
+            return user_frame;              /* resume user process */
+        } else {
+            /* current frame belongs to the user process (or its syscall) */
+            user_frame = current_rsp;
+            user_frame_valid = 1;
+            return tasks[0].rsp;            /* run kernel main */
+        }
+    }
+    user_frame_valid = 0;  /* no user process: stale frame, drop it */
+
     tasks[current_task_idx].rsp = current_rsp;
 
     if (task_count <= 1) {

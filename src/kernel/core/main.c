@@ -4,6 +4,7 @@
 #include "core/interrupts.h"
 #include "core/smp.h"
 #include "core/tss.h"
+#include "core/process.h"
 #include "mm/memory.h"
 #include "drivers/vga.h"
 #include "drivers/keyboard.h"
@@ -66,6 +67,19 @@ void klog(const char* s) {
     serial_puts(s);
 }
 
+void klog_hex(const char* prefix, uint64_t v) {
+    char buf[19];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        uint8_t nib = (uint8_t)(v >> (60 - i * 4)) & 0xF;
+        buf[2 + i] = nib < 10 ? ('0' + nib) : ('a' + nib - 10);
+    }
+    buf[18] = '\0';
+    klog(prefix);
+    klog(buf);
+    klog("\n");
+}
+
 void kernel_main(uint64_t mb_info_phys) {
     serial_init();
     serial_puts("kernel_main entered\n");
@@ -73,7 +87,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.6.0\n");
+    klog("Kil0yOS version 2.7.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -107,6 +121,9 @@ void kernel_main(uint64_t mb_info_phys) {
 
     klog("VFS: initializing filesystem...\n");
     fs_init();
+
+    klog("user: installing built-in user programs...\n");
+    user_programs_install();
 
     klog("Shell: initializing command interpreter...\n");
     shell_init();

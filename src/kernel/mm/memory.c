@@ -21,6 +21,8 @@ typedef struct heap_block {
 
 static heap_block_t* heap_list = NULL;
 
+static void pmm_mark_region(uint64_t base, uint64_t length, int used);
+
 void memory_init(memory_map_t* map, size_t count) {
     uint8_t* default_start = (uint8_t*)0x200000;
     uint8_t* default_end   = (uint8_t*)0x10000000;
@@ -58,6 +60,13 @@ void memory_init(memory_map_t* map, size_t count) {
     heap_list->size = heap_end - heap_start - sizeof(heap_block_t);
     heap_list->next = NULL;
     heap_list->free = 1;
+
+    /* CRITICAL: the kernel heap arena lives in identity-mapped RAM that the
+     * PMM considers free (heap starts at 2 MiB, PMM reserves only the first
+     * 2 MiB). Without this reservation every pmm_alloc_page() handed out
+     * live heap memory - the first exec corrupted the heap free list and
+     * died with #GP inside kfree. */
+    pmm_mark_region((uint64_t)heap_start, (size_t)(heap_end - heap_start), 1);
 }
 
 void* kmalloc(size_t size) {
@@ -349,6 +358,15 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     }
     uint64_t* pdpt = (uint64_t*)(vmm_pml4[pml4i] & ~0xFFF);
 
+    /* User access requires the U bit on EVERY level of the walk. boot.asm
+     * builds the intermediate entries (PML4/PDPT) supervisor-only, so a
+     * user mapping must propagate the bit up or the translation stays
+     * supervisor and ring 3 faults with #PF code 0x5. */
+    if (flags & VMM_USER) {
+        vmm_pml4[pml4i] |= VMM_USER;
+        pdpt[pdpti] |= VMM_USER;
+    }
+
     if (!(pdpt[pdpti] & VMM_PRESENT)) {
         uint64_t new_pd = pmm_alloc_page();
         if (!new_pd) PANIC("vmm_map_page: out of physical memory (pd)");
@@ -362,24 +380,9 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         if (pd[pdi] & VMM_HUGE) {
             /* Huge page exists - check if we need user-mode access */
             if (flags & VMM_USER) {
-                /* Need to split this huge page into 4KB pages for user-mode access
-                 * This is a simplified approach: we'll create a new page table
-                 * and copy the huge page's identity mapping, then update permissions
-                 */
-                uint64_t pd_entry = pd[pdi];
-                vga_puts("[DEBUG] PD entry before split: 0x");
-                vga_puthex(pd_entry);
-                vga_puts("\n");
-
+                /* Split the huge identity page into 4KB pages so the user
+                 * mapping can coexist with the rest of the 2MB window. */
                 uint64_t huge_phys = pd[pdi] & ~0x1FFFFF;  /* Get physical base */
-
-                vga_puts("[DEBUG] Splitting huge page at virt 0x");
-                vga_puthex(virt);
-                vga_puts("\n  PD entry: 0x");
-                vga_puthex(pd_entry);
-                vga_puts(" -> huge_phys: 0x");
-                vga_puthex(huge_phys);
-                vga_puts("\n");
 
                 /* Allocate a new page table */
                 uint64_t new_pt = pmm_alloc_page();
@@ -393,15 +396,6 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
 
                 /* Replace the huge page with the page table */
                 pd[pdi] = vmm_make_entry(new_pt, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
-
-                vga_puts("[DEBUG] Replaced PD entry with PT at phys 0x");
-                vga_puthex(new_pt);
-                vga_puts("\n");
-
-                /* Debug: Show PT[0] before override */
-                vga_puts("[DEBUG] PT[0] before override: 0x");
-                vga_puthex(((uint64_t*)new_pt)[0]);
-                vga_puts("\n");
 
                 /* Now fall through to update the specific 4KB entry */
             } else {
@@ -417,23 +411,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     }
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
 
-    vga_puts("[DEBUG] Setting PT entry: pt=0x");
-    vga_puthex((uint64_t)pt);
-    vga_puts(" pti=0x");
-    vga_puthex(pti);
-    vga_puts("\n");
-
     pt[pti] = vmm_make_entry(phys, flags);
-
-    vga_puts("[DEBUG] Set PT[");
-    vga_puthex(pti);
-    vga_puts("] = 0x");
-    vga_puthex(pt[pti]);
-    vga_puts(" (phys=0x");
-    vga_puthex(phys);
-    vga_puts(", flags=0x");
-    vga_puthex(flags);
-    vga_puts(")\n");
 
     vmm_reload_cr3();
 }

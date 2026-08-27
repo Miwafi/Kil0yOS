@@ -415,7 +415,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.6.0\n");
+    vga_puts("Kil0yOS v2.7.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -774,7 +774,7 @@ static int cmd_gui(int argc, char** argv) {
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.6.0", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.7.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);
@@ -1059,9 +1059,16 @@ static int cmd_netstat(int argc, char** argv) {
 static int cmd_exec(int argc, char** argv) {
     if (argc < 2) {
         vga_puts("Usage: exec <program>\n");
-        vga_puts("Example: exec hello.bin\n");
+        vga_puts("Example: exec /bin/hello.bin\n");
         return 1;
     }
+
+    /* One user process at a time (single shared user address space) */
+    if (process_any_active()) {
+        vga_puts("exec: another process is still active\n");
+        return 1;
+    }
+    process_reap_zombies();
 
     const char* program_path = argv[1];
 
@@ -1141,6 +1148,7 @@ static int cmd_exec(int argc, char** argv) {
             kfree(program_data);
 
             vga_puts("Jumping to user mode...\n");
+            klog("[exec] running process\n");
 
             /* Actually run the process */
             process_run(pid);
@@ -1170,6 +1178,7 @@ static int cmd_exec(int argc, char** argv) {
             kfree(program_data);
 
             vga_puts("Jumping to user mode...\n");
+            klog("[exec] running process\n");
 
             /* Actually run the process */
             process_run(pid);
@@ -1365,6 +1374,12 @@ void shell_run() {
         
         cmd_len = 0;
         while (cmd_len < MAX_COMMAND_LENGTH - 1) {
+            /* While a user process is running (time-sliced with us),
+             * leave the keyboard buffer alone - its sys_read owns it. */
+            if (process_any_active()) {
+                __asm__ volatile("hlt");
+                continue;
+            }
             char c = keyboard_getc();
             
             if (c == '\n') {

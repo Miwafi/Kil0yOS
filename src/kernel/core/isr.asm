@@ -112,20 +112,19 @@ syscall_entry:
     push rbx
     push rax
 
-    ; System call number in rax, args in rdi, rsi, rdx, r10, r8, r9
+    ; System call number in rax, args in rbx, rcx, rdx, r8, r9, r10
+    ; Dispatcher signature: (num, a0, a1, a2, a3, a4, a5)
+    ;   rdi=num, rsi=a0, rdx=a1, rcx=a2, r8=a3, r9=a4, [stack]=a5
+    xchg rcx, rdx         ; rcx = orig rdx (a2), rdx = orig rcx (a1)
     mov rdi, rax          ; syscall number
     mov rsi, rbx          ; arg0
-    mov rdx, rcx          ; arg1
-    mov rcx, r8           ; arg2
-    mov r8, r9            ; arg3
-    mov r9, r10           ; arg4
-    mov r10, r11          ; arg5 (use stack for 6th arg)
-    push qword [rsp + 8*15]  ; arg5 from stack
+    push r10              ; arg5 (r8, r9 already hold a3, a4)
     call syscall_dispatcher
-    add rsp, 8            ; clean up arg5
+    add rsp, 8            ; pop arg5 slot (ret addr already popped by ret)
+                          ; -> rsp at the saved-rax slot
 
-    ; Store return value
-    mov r15, rax
+    ; Store return value directly into the saved-rax slot on the stack
+    mov [rsp], rax
 
     ; Restore user registers (in reverse order of push)
     pop rax
@@ -143,9 +142,6 @@ syscall_entry:
     pop r14
     pop r15
     pop rbp
-
-    ; Restore return value
-    mov rax, r15
 
     ; Return to user mode
     iretq
