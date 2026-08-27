@@ -7,6 +7,37 @@ uint8_t* vga_gfx_buffer;
 static int vga_x = 0;
 static int vga_y = 0;
 uint8_t vga_color = 0x07;
+static int vga_in_gfx_mode = 0;
+
+/* Snapshot of text-mode state destroyed by mode 13h:
+   - plane 2 holds the BIOS character generator (font). Mode 13h chained
+     addressing spreads writes across all four planes, so any full repaint
+     destroys the font -> garbage "dot matrix" screen after returning to text.
+   - the DAC palette carries BIOS text colours; reprogram it deterministically
+     for graphics and restore the original on return. */
+static uint8_t vga_font_plane[16384];
+static uint8_t vga_dac_state[256 * 3];
+/* sequencer/graphics regs we touch during plane access; restoring the exact
+   BIOS values keeps text-mode addressing (odd/even etc.) intact */
+static uint8_t vga_reg_snap[7];   /* SR2 SR4 GR3 GR5 GR6 GR4 GR8 */
+static int vga_snapshot_valid = 0;
+
+/* Wait for start of vertical retrace before large repaints (anti-tear).
+   Bounded so a non-toggling status register can never hang the caller. */
+void vga_wait_vsync(void) {
+    int guard = 200000;
+    while ((inb(0x3DA) & 0x08)) {
+        if (--guard == 0) return;
+    }
+    guard = 200000;
+    while (!(inb(0x3DA) & 0x08)) {
+        if (--guard == 0) return;
+    }
+}
+
+int vga_is_graphics(void) {
+    return vga_in_gfx_mode;
+}
 
 static void vga_write_reg(uint16_t port, uint8_t idx, uint8_t val) {
     outb(port, idx);
@@ -102,8 +133,99 @@ void vga_set_cursor(int x, int y) {
     outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
 }
 
+/* --- text-mode state snapshot (font plane 2 + DAC palette) --- */
+
+static void vga_snapshot_save(void) {
+    if (vga_snapshot_valid) return;
+
+    /* remember the registers the plane access will overwrite */
+    vga_reg_snap[0] = vga_read_reg(0x3C4, 0x02);
+    vga_reg_snap[1] = vga_read_reg(0x3C4, 0x04);
+    vga_reg_snap[2] = vga_read_reg(0x3CE, 0x03);
+    vga_reg_snap[3] = vga_read_reg(0x3CE, 0x05);
+    vga_reg_snap[4] = vga_read_reg(0x3CE, 0x06);
+    vga_reg_snap[5] = vga_read_reg(0x3CE, 0x04);
+    vga_reg_snap[6] = vga_read_reg(0x3CE, 0x08);
+
+    /* sequential access to plane 2: reset sequencer, disable odd/even,
+       map A000 64K window (text-mode GR6 points at B800!), select plane 2 */
+    outb(0x3C4, 0x00);
+    outb(0x3C5, 0x01);                 /* synchronous reset */
+    vga_write_reg(0x3C4, 0x04, 0x06);  /* odd/even off, ext. memory */
+    vga_write_reg(0x3C4, 0x02, 0x04);  /* write plane 2 only */
+    vga_write_reg(0x3CE, 0x03, 0x00);  /* no data rotate */
+    vga_write_reg(0x3CE, 0x05, 0x00);  /* read mode 0, write mode 0 */
+    vga_write_reg(0x3CE, 0x06, 0x05);  /* map A000-BFFF, graphics layout */
+    vga_write_reg(0x3CE, 0x04, 0x02);  /* read plane 2 */
+    vga_write_reg(0x3CE, 0x08, 0xFF);  /* all bitmask bits */
+    outb(0x3C4, 0x00);
+    outb(0x3C5, 0x03);                 /* restart sequencer */
+
+    {
+        volatile const uint8_t* src = (volatile const uint8_t*)VGA_GFX_ADDR;
+        for (int i = 0; i < 16384; i++) {
+            vga_font_plane[i] = src[i];
+        }
+    }
+
+    for (int i = 0; i < 256; i++) {
+        outb(0x3C7, (uint8_t)i);       /* PEL read index */
+        for (int j = 0; j < 3; j++) {
+            vga_dac_state[i * 3 + j] = inb(0x3C9);
+        }
+    }
+
+    vga_snapshot_valid = 1;
+}
+
+static void vga_snapshot_restore(void) {
+    if (!vga_snapshot_valid) return;
+
+    outb(0x3C4, 0x00);
+    outb(0x3C5, 0x01);
+    vga_write_reg(0x3C4, 0x04, 0x06);
+    vga_write_reg(0x3C4, 0x02, 0x04);
+    vga_write_reg(0x3CE, 0x03, 0x00);
+    vga_write_reg(0x3CE, 0x05, 0x00);
+    vga_write_reg(0x3CE, 0x06, 0x05);
+    vga_write_reg(0x3CE, 0x04, 0x02);
+    vga_write_reg(0x3CE, 0x08, 0xFF);
+    outb(0x3C4, 0x00);
+    outb(0x3C5, 0x03);
+
+    {
+        volatile uint8_t* dst = (volatile uint8_t*)VGA_GFX_ADDR;
+        for (int i = 0; i < 16384; i++) {
+            dst[i] = vga_font_plane[i];
+        }
+    }
+
+    /* put back exactly the register values we saved (BIOS text state) */
+    vga_write_reg(0x3C4, 0x02, vga_reg_snap[0]);
+    vga_write_reg(0x3C4, 0x04, vga_reg_snap[1]);
+    vga_write_reg(0x3CE, 0x03, vga_reg_snap[2]);
+    vga_write_reg(0x3CE, 0x05, vga_reg_snap[3]);
+    vga_write_reg(0x3CE, 0x06, vga_reg_snap[4]);
+    vga_write_reg(0x3CE, 0x04, vga_reg_snap[5]);
+    vga_write_reg(0x3CE, 0x08, vga_reg_snap[6]);
+
+    for (int i = 0; i < 256; i++) {
+        outb(0x3C8, (uint8_t)i);       /* PEL write index */
+        for (int j = 0; j < 3; j++) {
+            outb(0x3C9, vga_dac_state[i * 3 + j]);
+        }
+    }
+
+    vga_snapshot_valid = 0;
+}
+
 void vga_set_mode_13h() {
+    /* save font plane + DAC while still in text mode; mode 13h repaints
+       would otherwise destroy the character generator */
+    vga_snapshot_save();
+
     vga_gfx_buffer = (uint8_t*)VGA_GFX_ADDR;
+    vga_in_gfx_mode = 1;
 
     outb(0x3C2, 0x63);
 
@@ -157,7 +279,30 @@ void vga_set_mode_13h() {
         outb(0x3C0, i);
         outb(0x3C0, (uint8_t)i);
     }
+    /* attribute controller mode registers: real hardware (VMware/bochs)
+       requires the graphics-mode attribute path to be selected explicitly */
+    inb(0x3DA);
+    outb(0x3C0, 0x10);
+    outb(0x3C0, 0x41);                 /* AC mode: graphics mode on */
+    inb(0x3DA);
+    outb(0x3C0, 0x11);
+    outb(0x3C0, 0x00);                 /* overscan black */
+    inb(0x3DA);
+    outb(0x3C0, 0x12);
+    outb(0x3C0, 0x0F);                 /* color plane enable: all planes */
     outb(0x3C0, 0x20);
+    static const uint8_t gfx_dac[16][3] = {
+        { 0x00, 0x00, 0x00 }, { 0x00, 0x00, 0x2A }, { 0x00, 0x2A, 0x00 }, { 0x00, 0x2A, 0x2A },
+        { 0x2A, 0x00, 0x00 }, { 0x2A, 0x00, 0x2A }, { 0x2A, 0x15, 0x00 }, { 0x2A, 0x2A, 0x2A },
+        { 0x15, 0x15, 0x15 }, { 0x15, 0x15, 0x3F }, { 0x15, 0x3F, 0x15 }, { 0x15, 0x3F, 0x3F },
+        { 0x3F, 0x15, 0x15 }, { 0x3F, 0x15, 0x3F }, { 0x3F, 0x3F, 0x15 }, { 0x3F, 0x3F, 0x3F }
+    };
+    outb(0x3C8, 0);
+    for (int i = 0; i < 16; i++) {
+        outb(0x3C9, gfx_dac[i][0]);
+        outb(0x3C9, gfx_dac[i][1]);
+        outb(0x3C9, gfx_dac[i][2]);
+    }
 
     for (int i = 0; i < GFX_WIDTH * GFX_HEIGHT; i++) {
         vga_gfx_buffer[i] = 0;
@@ -166,6 +311,7 @@ void vga_set_mode_13h() {
 
 void vga_set_text_mode() {
     vga_buffer = (uint16_t*)VGA_ADDR;
+    vga_in_gfx_mode = 0;
 
     outb(0x3C2, 0x67);
 
@@ -223,17 +369,34 @@ void vga_set_text_mode() {
         outb(0x3C0, i);
         outb(0x3C0, text_palette[i]);
     }
+    /* attribute controller mode registers back to text values */
+    inb(0x3DA);
+    outb(0x3C0, 0x10);
+    outb(0x3C0, 0x0C);                 /* AC mode: text, blink on */
+    inb(0x3DA);
+    outb(0x3C0, 0x11);
+    outb(0x3C0, 0x00);                 /* overscan black */
+    inb(0x3DA);
+    outb(0x3C0, 0x12);
+    outb(0x3C0, 0x0F);                 /* color plane enable: all planes */
     outb(0x3C0, 0x20);
+
+    /* bring back the BIOS character generator (plane 2) and DAC palette
+       destroyed by the mode 13h repaints */
+    vga_snapshot_restore();
 
     vga_clear();
 }
 
 void vga_plot_pixel(int x, int y, uint8_t color) {
+    if (!vga_in_gfx_mode || !vga_gfx_buffer) return;
     if (x < 0 || x >= GFX_WIDTH || y < 0 || y >= GFX_HEIGHT) return;
     vga_gfx_buffer[y * GFX_WIDTH + x] = color;
 }
 
 void vga_draw_color_bars() {
+    if (!vga_in_gfx_mode || !vga_gfx_buffer) return;
+
     static const uint8_t bar_colors[8] = {
         0x00,
         0x01,
@@ -275,6 +438,7 @@ void vga_fill_rect(int x, int y, int w, int h, uint8_t color) {
 }
 
 void vga_draw_rect(int x, int y, int w, int h, uint8_t color) {
+    if (!vga_in_gfx_mode || !vga_gfx_buffer) return;
     if (w <= 0 || h <= 0) return;
     vga_fill_rect(x, y, w, 1, color);
     vga_fill_rect(x, y + h - 1, w, 1, color);
@@ -283,6 +447,7 @@ void vga_draw_rect(int x, int y, int w, int h, uint8_t color) {
 }
 
 void vga_draw_char(int x, int y, char c, uint8_t color) {
+    if (!vga_in_gfx_mode || !vga_gfx_buffer) return;
     if (x < 0 || x + 8 > GFX_WIDTH || y < 0 || y + 8 > GFX_HEIGHT) return;
     
     if (c < 0x20 || c > 0x7E) c = 0x20;
@@ -299,6 +464,7 @@ void vga_draw_char(int x, int y, char c, uint8_t color) {
 }
 
 void vga_draw_string(int x, int y, const char* str, uint8_t color) {
+    if (!vga_in_gfx_mode) return;
     int current_x = x;
     while (*str) {
         if (*str == '\n') {
@@ -313,6 +479,7 @@ void vga_draw_string(int x, int y, const char* str, uint8_t color) {
 }
 
 void vga_draw_window(int x, int y, int w, int h, const char* title) {
+    if (!vga_in_gfx_mode) return;
     int title_h = 8;
     int border = 1;
     int inner_x = x + border;

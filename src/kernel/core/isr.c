@@ -1,6 +1,7 @@
 #include "core/isr.h"
 #include "core/idt.h"
 #include "drivers/io.h"
+#include "drivers/vga.h"
 #include "core/interrupts.h"
 #include "sched/scheduler.h"
 #include "timer/pit.h"
@@ -85,9 +86,6 @@ void isr_init() {
 
 uint64_t isr_handler(interrupt_frame_t* frame) {
     /* Debug: Print exception info */
-    extern void vga_puts(const char*);
-    extern void vga_puthex(uint64_t);
-
     vga_puts("\n[EXCEPTION] ISR #");
     vga_puthex(frame->interrupt_number);
     vga_puts(" at RIP: 0x");

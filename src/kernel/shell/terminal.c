@@ -189,8 +189,10 @@ void term_gui_render(void) {
     if (g_current_term != &g_gui_term) return;
     gui_term_priv_t* p = &g_gui_priv;
 
-    vga_fill_rect(p->left_w + 1, p->header_h + 1,
-                  GFX_WIDTH - p->left_w - 2, p->content_h - 2, 0x00);
+    /* clear cells area only - keeps the "Shell Terminal" title above base_y intact */
+    vga_fill_rect(p->left_w + 1, p->base_y,
+                  GFX_WIDTH - p->left_w - 2,
+                  p->header_h + p->content_h + 1 - p->base_y, 0x00);
 
     for (int row = 0; row < GUI_TERM_ROWS; row++) {
         int y = p->base_y + row * 8;
@@ -211,4 +213,40 @@ int term_gui_get_cursor_y(void) {
     if (g_current_term != &g_gui_term) return 0;
     gui_term_priv_t* p = &g_gui_priv;
     return p->base_y + p->cursor_y * 8;
+}
+
+/* Echo one printable input character into the GUI terminal cells and on-screen.
+   Keeps the typed line in cells so full re-renders do not erase user input. */
+void term_gui_type_char(char c) {
+    if (g_current_term != &g_gui_term) return;
+    gui_term_priv_t* p = &g_gui_priv;
+
+    int px = p->base_x + p->cursor_x * 6;
+    int py = p->base_y + p->cursor_y * 8;
+
+    /* stay inside the content panel and the visible terminal region */
+    if (px + 6 > GFX_WIDTH - 2) return;
+    if (py >= GFX_HEIGHT - 20) return;
+
+    gui_putchar(&g_gui_term, c);          /* update cells + cursor */
+    vga_draw_char(px, py, c, p->color);   /* echo immediately */
+}
+
+/* Backspace for interactive input: clear previous cell and move cursor back. */
+void term_gui_backspace(void) {
+    if (g_current_term != &g_gui_term) return;
+    gui_term_priv_t* p = &g_gui_priv;
+
+    if (p->cursor_x == 0 && p->cursor_y == 0) return;
+
+    if (p->cursor_x > 0) {
+        p->cursor_x--;
+    } else {
+        p->cursor_y--;
+        p->cursor_x = GUI_TERM_COLS - 1;
+    }
+
+    p->cells[p->cursor_y][p->cursor_x] = ' ' | ((uint16_t)p->color << 8);
+    vga_fill_rect(p->base_x + p->cursor_x * 6,
+                  p->base_y + p->cursor_y * 8, 6, 8, 0x00);
 }

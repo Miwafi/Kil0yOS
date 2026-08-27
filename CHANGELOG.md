@@ -2,6 +2,48 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.6.0] - 2026-08-27
+This release overhauls the VGA graphics subsystem: mode 13h / GUI now work on strict hardware emulators (VMware, VirtualBox) in addition to QEMU, exiting graphics modes no longer corrupts the BIOS font, and colors are deterministic. Also includes GUI shell usability fixes and a graphics-mode regression test harness.
+
+### Fixed
+- **Full-screen garbage "dot matrix" after exiting graphics mode (CRITICAL)**: mode 13h repaints spread writes across all four VRAM planes through chain4 addressing, destroying the BIOS character generator in plane 2 and mixing character/attribute data. `vga_set_mode_13h()` now snapshots the font plane (16 KB), the DAC palette (768 B), and the sequencer/graphics registers (SR2, SR4, GR3, GR5, GR6, GR4, GR8) before switching; `vga_set_text_mode()` restores everything exactly. This also fixes text-mode addressing (odd/even) that previously had a hardcoded `SR4` value breaking char/attr plane separation.
+- **Graphics mode black screen on VMware / strict VGA implementations**: the mode switch never programmed the Attribute Controller mode registers. `vga_set_mode_13h()` now sets `AC10=0x41` (graphics attribute path), `AC11=0x00` (overscan), `AC12=0x0F` (color plane enable); `vga_set_text_mode()` restores `AC10=0x0C` plus the same registers for text.
+- **Wrong colors in graphics mode (white rendered bluish, yellow muddy)**: the DAC palette was never programmed, leaving BIOS text-mode remapped entries. Graphics mode now programs a deterministic standard EGA 16-color palette; text mode restores the snapshotted BIOS palette.
+- **GUI desktop could not be exited**: the desktop event loop is now breakable with `ESC`, restores text mode and the text terminal cleanly, and a `desktop_active` guard prevents nested `gfx`/`gui` sessions.
+- **Mouse cursor artifacts**: cursor draw/erase is bounded by `CURSOR_W/H` with unified edge clamping; the old position is erased before redrawing and all screen updates erase the cursor first, eliminating trails and trampled pixels.
+- **GUI terminal input loss**: typed characters go through the terminal cell buffer (`term_gui_type_char` / `term_gui_backspace`) instead of direct pixel drawing, so input survives screen redraws; window title is preserved across re-renders.
+- **`vga_wait_vsync()` hang risk**: retrace polling is now bounded (~200k iterations per phase) so a non-toggling 0x3DA status register can no longer hang the caller.
+- **Memory progress bar overflow in GUI sysmon**: fill width is clamped to the bar's inner width.
+- **Robustness of drawing calls**: all graphics primitives validate the graphics-mode state and bounds (`vga_is_graphics()`, `vga_plot_pixel()` clamping), preventing text-mode VRAM corruption.
+- **klog no longer writes to VRAM while in graphics mode**, avoiding stray pixels in GUI/gfx modes.
+- **Font data multiple-definition and scattered extern declarations**: the 8x8 font moved from `88front.h` to a new `font_8x8.c` translation unit; handwritten `extern` prototypes replaced with proper header includes (`isr.c`, `process.c`, `memory.c`).
+
+### Added
+- **VGA state snapshot/restore engine** in `vga.c`: saves/restores font plane 2, full DAC (256 entries), and the sequencer/graphics registers touched during plane access — the core mechanism making mode switching reversible.
+- **`gfx` command exits with `ESC`** in addition to `q`.
+- **KEY_* key codes centralized** in `keyboard.h` (ESC, arrows, etc.) instead of magic numbers in shell code.
+
+### Changed
+- Version strings bumped to 2.6.0 (boot banner, `version` command, GUI header).
+
+### File Changes
+- `src/kernel/drivers/vga.c`: snapshot/restore engine (font plane, DAC, registers), AC10/11/12 programming, EGA palette, bounded vsync, bounds-checked drawing
+- `src/kernel/drivers/font_8x8.c`: new font data translation unit (moved out of `88front.h`)
+- `include/gfx/88front.h`: font data replaced by extern declaration
+- `include/drivers/vga.h`: `vga_is_graphics()`, `vga_wait_vsync()`, `vga_puthex()` declarations
+- `include/drivers/keyboard.h`: centralized KEY_* codes
+- `src/kernel/shell/shell.c`: ESC-exitable GUI/gfx, desktop_active guard, cursor management, vsync in event loops, memory bar clamp, version strings
+- `src/kernel/shell/terminal.c`: `term_gui_type_char()` / `term_gui_backspace()` buffered input, title-preserving re-render
+- `include/shell/terminal.h`: new terminal API declarations
+- `src/kernel/drivers/mouse.c`: cursor visibility state, unified edge clamping, erase-before-redraw
+- `src/kernel/core/main.c`: klog graphics guard, version string
+- `src/kernel/core/isr.c`, `src/kernel/core/process.c`, `src/kernel/mm/memory.c`: replaced handwritten externs with header includes
+- `Makefile`: added `font_8x8.c` to driver sources
+
+### Notes
+- Verified with an automated headless QEMU harness (QMP-driven key injection + screendump) on both `std` VGA and `cirrus-vga`: color bars correct, clean text mode after exit, GUI renders with correct palette. VMware behavior addressed by the AC register fixes; report remaining differences if any.
+- `make run` uses `-nographic`, which has no visible VGA window; use a graphical QEMU/VMware session to see `gfx`/`gui`.
+
 ## [2.5.1] - 2026-08-27
  This release focuses on debugging, crash-safety, and robustness improvements: it adds a RAM-disk fallback when no ATA disk is present, halts on CPU exceptions to avoid fault loops, enables debug symbols, adds extensive boot/filesystem tracing, and configures the GRUB menu.
 

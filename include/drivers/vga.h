@@ -47,8 +47,11 @@ void vga_init();
 void vga_clear();
 void vga_putchar(char c);
 void vga_puts(const char* str);
+void vga_puthex(uint64_t value);
 void vga_set_color(uint8_t color);
 void vga_set_cursor(int x, int y);
+int  vga_is_graphics(void);
+void vga_wait_vsync(void);
 
 void vga_set_mode_13h();
 void vga_set_text_mode();

@@ -57,8 +57,11 @@ static void serial_puts(const char* s) {
 void klog(const char* s) {
     char ts[24];
     pit_format_time(ts, sizeof(ts));
-    vga_puts(ts);
-    vga_puts(s);
+    /* in graphics mode the text VRAM window is not mapped as text - keep logs serial-only */
+    if (!vga_is_graphics()) {
+        vga_puts(ts);
+        vga_puts(s);
+    }
     serial_puts(ts);
     serial_puts(s);
 }
@@ -70,7 +73,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.5.0\n");
+    klog("Kil0yOS version 2.6.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 

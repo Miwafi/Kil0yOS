@@ -366,9 +366,6 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
                  * This is a simplified approach: we'll create a new page table
                  * and copy the huge page's identity mapping, then update permissions
                  */
-                extern void vga_puts(const char*);
-                extern void vga_puthex(uint64_t);
-
                 uint64_t pd_entry = pd[pdi];
                 vga_puts("[DEBUG] PD entry before split: 0x");
                 vga_puthex(pd_entry);
@@ -419,9 +416,6 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         memset((void*)new_pt, 0, PAGE_SIZE);
     }
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
-
-    extern void vga_puts(const char*);
-    extern void vga_puthex(uint64_t);
 
     vga_puts("[DEBUG] Setting PT entry: pt=0x");
     vga_puthex((uint64_t)pt);

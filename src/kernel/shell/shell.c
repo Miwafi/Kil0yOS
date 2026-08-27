@@ -415,7 +415,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.5.0\n");
+    vga_puts("Kil0yOS v2.6.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -476,14 +476,25 @@ static int cmd_edit(int argc, char** argv) {
     return 0;
 }
 
+static int desktop_active = 0;
+
 static int cmd_gfx(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    if (desktop_active) {
+        vga_puts("gfx: not available in graphical mode\n");
+        return 1;
+    }
+
     vga_puts("Switching to graphical mode...\n");
 
     vga_set_mode_13h();
+    vga_wait_vsync();
     vga_draw_color_bars();
 
-    while (keyboard_getc() != 'q') {
-        __asm__ volatile("nop");
+    while (1) {
+        unsigned char k = (unsigned char)keyboard_getc();
+        if (k == 'q' || k == KEY_ESC) break;
     }
 
     vga_set_text_mode();
@@ -497,7 +508,6 @@ static char gui_shell_buf[GUI_SHELL_BUF_SIZE];
 static int gui_shell_len = 0;
 static int gui_shell_x = 0;
 static int gui_shell_y = 0;
-static int gui_shell_input_x = 0;
 
 static void gui_shell_draw_prompt(void) {
     vga_draw_string(gui_shell_x, gui_shell_y, "> ", 0x0F);
@@ -508,7 +518,6 @@ static void gui_shell_init(int left_w, int header_h) {
     gui_shell_buf[0] = '\0';
     gui_shell_x = left_w + 4;
     gui_shell_y = header_h + 14;
-    gui_shell_input_x = gui_shell_x + 12;
     gui_shell_draw_prompt();
 }
 
@@ -529,7 +538,6 @@ static void gui_shell_execute(int left_w, int header_h, int content_h) {
     gui_shell_len = 0;
     gui_shell_buf[0] = '\0';
     gui_shell_y = term_gui_get_cursor_y();
-    gui_shell_input_x = gui_shell_x + 12;
     gui_shell_draw_prompt();
 }
 
@@ -633,6 +641,8 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
                 int bar_w = GFX_WIDTH - left_w - 12;
                 int bar_h = 6;
                 int fill_w = (bar_w * (int)used_mb) / (int)(total_mb ? total_mb : 1);
+                if (fill_w > bar_w - 2) fill_w = bar_w - 2;   /* stay inside the border */
+                if (fill_w < 0) fill_w = 0;
 
                 vga_fill_rect(bar_x, bar_y, bar_w, bar_h, 0x00);
                 vga_draw_rect(bar_x, bar_y, bar_w, bar_h, 0x0F);
@@ -662,7 +672,7 @@ static void gui_draw_content(int left_w, int header_h, int content_h, int active
                 vga_draw_string(cx, proc_y, proc_title, 0x0E);
 
                 int row = 0;
-                for (int i = 0; i < MAX_TASKS && row < 8; i++) {
+                for (int i = 0; i < MAX_TASKS && row < 6; i++) {   /* 6 rows fit above footer */
                     int st = task_get_status(i);
                     if (st == TASK_DEAD) continue;
 
@@ -731,7 +741,15 @@ static void gui_draw_datetime(int footer_h) {
 }
 
 static int cmd_gui(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    if (desktop_active) {
+        vga_puts("gui: desktop already running\n");
+        return 1;
+    }
+
     vga_puts("Launching desktop...\n");
+    desktop_active = 1;
 
     vga_set_mode_13h();
 
@@ -739,11 +757,6 @@ static int cmd_gui(int argc, char** argv) {
     int footer_h = 10;
     int left_w = 100;
     int content_h = GFX_HEIGHT - header_h - footer_h;
-
-#define KEY_UP    0x80
-#define KEY_DOWN  0x81
-#define KEY_LEFT  0x82
-#define KEY_RIGHT 0x83
 
     /* menu state */
     const char* menu_items[] = {"Shell", "Files", "Edit", "System", "CATs"};
@@ -754,13 +767,14 @@ static int cmd_gui(int argc, char** argv) {
     int menu_start_y = header_h + 14;
     int menu_spacing = 10;
 
-    /* clear screen */
+    /* clear screen (aligned to vertical retrace to avoid tearing) */
+    vga_wait_vsync();
     vga_fill_rect(0, 0, GFX_WIDTH, GFX_HEIGHT, 0x01);
 
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.4.2", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.6.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);
@@ -787,11 +801,20 @@ static int cmd_gui(int argc, char** argv) {
 
     gui_draw_datetime(footer_h);
 
+    /* show pointer from the first frame on */
+    mouse_get_state(&prev);
+    mouse_draw_cursor(prev.x, prev.y);
+
     while (1) {
         /* update clock every second */
         rtc_time_t t;
         if (rtc_read(&t) == 0 && t.second != last_second) {
             last_second = t.second;
+
+            /* hide pointer first so repaints are not clobbered by stale restore pixels */
+            mouse_erase_cursor(prev.x, prev.y);
+
+            vga_wait_vsync();
             gui_draw_datetime(footer_h);
 
             /* auto-refresh System Monitor CPU stats */
@@ -799,10 +822,15 @@ static int cmd_gui(int argc, char** argv) {
                 smp_update_cpu_usage();
                 gui_draw_content(left_w, header_h, content_h, active_idx);
             }
+
+            /* pointer back with a fresh background snapshot */
+            mouse_draw_cursor(prev.x, prev.y);
         }
 
         if (keyboard_has_input()) {
             unsigned char c = (unsigned char)keyboard_getc();
+
+            if (c == KEY_ESC) break;   /* exit desktop */
 
             if (c == KEY_UP || c == KEY_DOWN) {
                 int old_idx = selected_idx;
@@ -814,6 +842,8 @@ static int cmd_gui(int argc, char** argv) {
                 }
 
                 if (old_idx != selected_idx) {
+                    mouse_erase_cursor(prev.x, prev.y);
+
                     /* erase old item */
                     vga_fill_rect(menu_x, menu_start_y + old_idx * menu_spacing,
                                   left_w - 8, 8, 0x00);
@@ -825,13 +855,18 @@ static int cmd_gui(int argc, char** argv) {
                                   left_w - 8, 8, 0x00);
                     vga_draw_string(menu_x, menu_start_y + selected_idx * menu_spacing,
                                     menu_items[selected_idx], 0x0E);
+
+                    mouse_draw_cursor(prev.x, prev.y);
                 }
             }
 
             if (c == '\n') {
                 if (selected_idx != active_idx) {
                     active_idx = selected_idx;
+                    mouse_erase_cursor(prev.x, prev.y);
+                    vga_wait_vsync();
                     gui_draw_content(left_w, header_h, content_h, active_idx);
+                    mouse_draw_cursor(prev.x, prev.y);
                 } else if (active_idx == 0) {
                     gui_shell_execute(left_w, header_h, content_h);
                 }
@@ -841,12 +876,10 @@ static int cmd_gui(int argc, char** argv) {
             if (active_idx == 0) {
                 if (c >= 32 && c <= 126 && gui_shell_len < GUI_SHELL_BUF_SIZE - 1) {
                     gui_shell_buf[gui_shell_len++] = c;
-                    vga_draw_char(gui_shell_input_x, gui_shell_y, c, 0x0F);
-                    gui_shell_input_x += 6;
+                    term_gui_type_char(c);          /* store in cells + echo once */
                 } else if (c == '\b' && gui_shell_len > 0) {
                     gui_shell_len--;
-                    gui_shell_input_x -= 6;
-                    vga_fill_rect(gui_shell_input_x, gui_shell_y, 6, 8, 0x00);
+                    term_gui_backspace();
                 }
             }
         }
@@ -855,16 +888,15 @@ static int cmd_gui(int argc, char** argv) {
         mouse_get_state(&state);
 
         if (state.x != prev.x || state.y != prev.y) {
-            mouse_erase_cursor(prev.x, prev.y);
+            /* draw_cursor restores the previous position itself when visible */
             mouse_draw_cursor(state.x, state.y);
             prev = state;
         }
 
-        for (volatile int i = 0; i < 5000; i++) {
-            __asm__ volatile("nop");
-        }
+        __asm__ volatile("hlt");   /* sleep until next interrupt instead of spinning */
     }
 
+    desktop_active = 0;
     mouse_erase_cursor(prev.x, prev.y);
     vga_set_text_mode();
     term_init_text();

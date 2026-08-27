@@ -25,5 +25,7 @@ void term_clear(void);
 
 void term_gui_render(void);
 int term_gui_get_cursor_y(void);
+void term_gui_type_char(char c);
+void term_gui_backspace(void);
 
 #endif

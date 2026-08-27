@@ -4,6 +4,7 @@
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "fs/fs.h"
+#include "drivers/vga.h"
 
 /* Process table */
 static process_t processes[MAX_PROCESSES];
@@ -60,9 +61,6 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     if (pages_needed == 0) pages_needed = 1;
 
     /* Allocate and map code pages */
-    extern void vga_puts(const char*);
-    extern void vga_puthex(uint64_t);
-
     for (size_t i = 0; i < pages_needed; i++) {
         uint64_t phys = pmm_alloc_page();
         if (phys == 0) {
@@ -192,9 +190,6 @@ void jump_to_user(uint64_t entry, uint64_t stack) {
     rflags |= 0x200;  /* Set interrupt flag */
 
     /* Debug: Print entry point and stack info */
-    extern void vga_puts(const char*);
-    extern void vga_puthex(uint64_t);
-
     vga_puts("\n[DEBUG] jump_to_user:\n");
     vga_puts("  Entry: 0x");
     vga_puthex(entry);

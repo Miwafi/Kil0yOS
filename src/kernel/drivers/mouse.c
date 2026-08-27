@@ -20,15 +20,19 @@ static mouse_state_t mouse = { .x = 160, .y = 100, .buttons = 0, .ready = 0 };
 static uint8_t mouse_packet[3];
 static int mouse_cycle = 0;
 
-static uint8_t cursor_pattern[3][3] = {
+#define CURSOR_W 3
+#define CURSOR_H 3
+
+static uint8_t cursor_pattern[CURSOR_H][CURSOR_W] = {
     { 0x00, 0x00, 0x00 },
     { 0x00, 0x00, 0x0F },
     { 0x00, 0x0F, 0x00 }
 };
 
-static uint8_t saved_pixels[3][3];
+static uint8_t saved_pixels[CURSOR_H][CURSOR_W];
 static int saved_x = -1;
 static int saved_y = -1;
+static int cursor_visible = 0;
 
 static void mouse_wait(uint8_t type) {
     if (type == 0) {
@@ -131,8 +135,9 @@ void mouse_handler(interrupt_frame_t* frame) {
 
             if (mouse.x < 0) mouse.x = 0;
             if (mouse.y < 0) mouse.y = 0;
-            if (mouse.x >= GFX_WIDTH - 2)  mouse.x = GFX_WIDTH - 2;
-            if (mouse.y >= GFX_HEIGHT - 2) mouse.y = GFX_HEIGHT - 2;
+            /* keep cursor fully on-screen: guard in mouse_draw_cursor uses x+CURSOR_W > GFX_WIDTH */
+            if (mouse.x > GFX_WIDTH - CURSOR_W)  mouse.x = GFX_WIDTH - CURSOR_W;
+            if (mouse.y > GFX_HEIGHT - CURSOR_H) mouse.y = GFX_HEIGHT - CURSOR_H;
 
             mouse.buttons = mouse_packet[0] & 0x07;
             mouse_cycle = 0;
@@ -155,26 +160,38 @@ void mouse_get_state(mouse_state_t* out) {
 }
 
 void mouse_draw_cursor(int x, int y) {
-    if (x < 0 || y < 0 || x + 2 >= GFX_WIDTH || y + 2 >= GFX_HEIGHT) return;
+    /* graphics mode only, avoid writing into text-mode VRAM window */
+    if (!vga_is_graphics()) return;
+
+    /* redraw while visible: restore old background first to avoid stale-pixel artifacts */
+    if (cursor_visible) {
+        mouse_erase_cursor(x, y);
+    }
+
+    if (x < 0 || y < 0 || x + CURSOR_W > GFX_WIDTH || y + CURSOR_H > GFX_HEIGHT) return;
 
     saved_x = x;
     saved_y = y;
 
-    for (int row = 0; row < 3; row++) {
-        for (int col = 0; col < 3; col++) {
+    for (int row = 0; row < CURSOR_H; row++) {
+        for (int col = 0; col < CURSOR_W; col++) {
             int px = x + col;
             int py = y + row;
             saved_pixels[row][col] = vga_gfx_buffer[py * GFX_WIDTH + px];
             vga_gfx_buffer[py * GFX_WIDTH + px] = cursor_pattern[row][col];
         }
     }
+    cursor_visible = 1;
 }
 
 void mouse_erase_cursor(int x, int y) {
-    if (saved_x < 0 || saved_y < 0) return;
+    (void)x; (void)y; /* position kept for API compat; actual pos is remembered internally */
 
-    for (int row = 0; row < 3; row++) {
-        for (int col = 0; col < 3; col++) {
+    if (!cursor_visible || saved_x < 0 || saved_y < 0) return;
+    if (!vga_is_graphics()) { cursor_visible = 0; return; }
+
+    for (int row = 0; row < CURSOR_H; row++) {
+        for (int col = 0; col < CURSOR_W; col++) {
             int px = saved_x + col;
             int py = saved_y + row;
             if (px >= 0 && py >= 0 && px < GFX_WIDTH && py < GFX_HEIGHT) {
@@ -185,4 +202,5 @@ void mouse_erase_cursor(int x, int y) {
 
     saved_x = -1;
     saved_y = -1;
+    cursor_visible = 0;
 }
