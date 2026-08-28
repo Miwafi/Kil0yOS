@@ -165,6 +165,10 @@ isr_common_stub:
 
     mov rdi, rsp
     call isr_handler
+    ; isr_handler normally returns the same frame pointer, but after a
+    ; ring3 fault kill it returns the saved kernel-main frame rsp - the
+    ; dying process's frame is abandoned (same mechanism as irq_common_stub).
+    mov rsp, rax
 
     pop r15
     pop r14

@@ -33,6 +33,10 @@ void scheduler_set_main_return(void (*entry)(void)) {
     tasks[0].status = TASK_READY;
 }
 
+uint64_t scheduler_main_return_rsp(void) {
+    return tasks[0].rsp;
+}
+
 void scheduler_init() {
     task_count = 1;
     current_task_idx = 0;

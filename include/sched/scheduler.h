@@ -33,6 +33,10 @@ void scheduler_request_main_switch(void);
  * after process exit would iretq into garbage. */
 void scheduler_set_main_return(void (*entry)(void));
 
+/* Current saved kernel-main frame rsp (the resume point used after a
+ * user process exits or is killed by a fault). */
+uint64_t scheduler_main_return_rsp(void);
+
 int task_get_count(void);
 const char* task_get_name(int idx);
 int task_get_status(int idx);

@@ -614,9 +614,6 @@ static int fs_check_entry_exists(fs_entry_t* dir, const char* name) {
     klog("[fs] check_exists dir=0x"); klog(dbg); klog(" name="); klog(name); klog("\n");
 
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        char di[8]; itoa(i, di, 10, sizeof(di));
-        char dc[16]; itoa((int)(uint64_t)dir->children[i], dc, 16, sizeof(dc));
-        klog("[fs]   i="); klog(di); klog(" child=0x"); klog(dc); klog("\n");
         if (dir->children[i] != NULL) {
             char nb[16];
             for (int j=0;j<16;j++){ nb[j] = ((char*)(dir->children[i]->name))[j]; if(nb[j]<0x20&&nb[j]!='\n')nb[j]='.'; }

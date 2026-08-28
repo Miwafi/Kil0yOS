@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "mm/memory.h"
 #include "lib/string.h"
+#include "lib/stdlib.h"
 #include "drivers/io.h"
 #include "drivers/vga.h"
 #include "core/interrupts.h"
@@ -24,8 +25,14 @@ static heap_block_t* heap_list = NULL;
 static void pmm_mark_region(uint64_t base, uint64_t length, int used);
 
 void memory_init(memory_map_t* map, size_t count) {
+    /* The kernel heap must NOT swallow all of RAM: the PMM still needs
+     * free pages for user processes, page tables, DMA buffers, etc.
+     * Cap the arena at 64 MiB - with RAM == 256 MiB the old [2 MiB,
+     * 256 MiB) arena left the PMM with zero free pages and exec died
+     * with "PMM out of pages". USER_CODE_BASE (256 MB) stays well above
+     * the capped arena in every configuration. */
     uint8_t* default_start = (uint8_t*)0x200000;
-    uint8_t* default_end   = (uint8_t*)0x10000000;
+    uint8_t* default_end   = (uint8_t*)0x4200000;   /* 2 MiB + 64 MiB */
 
     if (map != NULL && count > 0) {
         uint64_t largest_size = 0;
@@ -46,7 +53,7 @@ void memory_init(memory_map_t* map, size_t count) {
 
         if (largest_size > 0x100000) {
             heap_start = largest_start;
-            heap_end   = largest_start + (largest_size > 0x10000000 ? 0x10000000 : largest_size);
+            heap_end   = largest_start + (largest_size > 0x4000000 ? 0x4000000 : largest_size);
         } else {
             heap_start = default_start;
             heap_end   = default_end;
@@ -67,6 +74,29 @@ void memory_init(memory_map_t* map, size_t count) {
      * live heap memory - the first exec corrupted the heap free list and
      * died with #GP inside kfree. */
     pmm_mark_region((uint64_t)heap_start, (size_t)(heap_end - heap_start), 1);
+
+    /* Boot diagnostics AFTER the heap reservation: report how many pages
+     * the PMM actually has left, so environment-specific failures (small
+     * RAM, different BIOS e820 layouts) are visible immediately instead
+     * of as a later "out of pages" error. */
+    {
+        extern void klog(const char* s);
+        uint64_t total, used, free_pages;
+        pmm_get_stats(&total, &used, &free_pages);
+
+        char buf[16];
+        klog("[pmm] after heap reserve: free pages = ");
+        itoa((int)free_pages, buf, 10, sizeof(buf));
+        klog(buf);
+        klog(" / ");
+        itoa((int)total, buf, 10, sizeof(buf));
+        klog(buf);
+        klog("\n");
+
+        if (free_pages == 0) {
+            klog("[pmm] WARNING: no free pages left!\n");
+        }
+    }
 }
 
 void* kmalloc(size_t size) {

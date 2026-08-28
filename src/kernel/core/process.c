@@ -17,6 +17,8 @@ static uint32_t next_pid = 1;
 #define KERNEL_STACK_SIZE 0x4000
 static uint8_t kernel_stacks[MAX_PROCESSES][KERNEL_STACK_SIZE] __attribute__((aligned(16)));
 
+static void process_release_memory(process_t* proc);
+
 void process_init(void) {
     memset(processes, 0, sizeof(processes));
     current_process = -1;
@@ -35,13 +37,16 @@ static process_t* find_free_process(void) {
 int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t entry) {
     process_t* proc = find_free_process();
     if (proc == NULL) {
+        vga_puts("[proc] create failed: no free process slot\n");
         return -1;  /* No free process slots */
     }
 
-    /* Initialize process */
+    /* Initialize process. NOTE: state stays UNUSED (0) until every
+     * resource is allocated - a half-initialized process must never be
+     * visible as READY, or the shell's process_any_active() check will
+     * hang the input loop forever. */
     memset(proc, 0, sizeof(process_t));
     proc->pid = next_pid++;
-    proc->state = PROCESS_STATE_READY;
     strncpy(proc->name, name, sizeof(proc->name) - 1);
 
     /* Set up kernel stack for this process (used during syscalls) */
@@ -65,8 +70,9 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     for (size_t i = 0; i < pages_needed; i++) {
         uint64_t phys = pmm_alloc_page();
         if (phys == 0) {
-            /* TODO: free previously allocated pages */
-            return -1;  /* Out of memory */
+            vga_puts("[proc] create failed: PMM out of pages (code)\n");
+            proc->code_pages = (uint32_t)i;
+            goto fail;
         }
 
         uint64_t virt = USER_CODE_BASE + i * 4096;
@@ -98,8 +104,9 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
          addr += 4096) {
         uint64_t phys = pmm_alloc_page();
         if (phys == 0) {
-            /* TODO: free previously allocated pages */
-            return -1;
+            vga_puts("[proc] create failed: PMM out of pages (stack)\n");
+            proc->stack_pages = stack_pages;
+            goto fail;
         }
         vmm_map_page(addr, phys, 0x07);  /* User, R/W, Present */
         stack_pages++;
@@ -110,6 +117,13 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     proc->state = PROCESS_STATE_READY;
 
     return proc->pid;
+
+fail:
+    /* Undo partial allocation so no half-initialized process remains:
+     * unmap mapped VAs, free their physical pages, reset the slot. */
+    process_release_memory(proc);
+    memset(proc, 0, sizeof(process_t));
+    return -1;
 }
 
 /* Release all user pages of a process and free its slot.
@@ -149,6 +163,42 @@ int process_any_active(void) {
         }
     }
     return 0;
+}
+
+uint64_t process_kill_current(int status) {
+    process_t* proc = process_get_current();
+    if (proc == NULL) return 0;
+
+    /* Same IRQ0-exclusion rule as process_exit(): no tick may observe the
+     * half-updated state. isr_handler already runs with IF=0 (interrupt
+     * gate), and the stub will iretq to the frame we return. */
+    proc->state = PROCESS_STATE_ZOMBIE;
+    proc->exit_status = status;
+    current_process = -1;
+
+    scheduler_request_main_switch();
+    return scheduler_main_return_rsp();
+}
+
+int process_check_user_range(uint64_t uaddr, size_t len) {
+    process_t* proc = process_get_current();
+    if (proc == NULL) return 0;
+    if (len == 0) return 1;
+    if (uaddr + len < uaddr) return 0;  /* wrap-around */
+
+    uint64_t code_end = proc->code_base + (uint64_t)proc->code_pages * 4096;
+    uint64_t stack_lo = proc->stack_top - USER_STACK_SIZE;
+
+    /* Entirely inside the code region or the stack region */
+    int in_code  = (uaddr >= proc->code_base && uaddr + len <= code_end);
+    int in_stack = (uaddr >= stack_lo && uaddr + len <= proc->stack_top);
+    if (!in_code && !in_stack) return 0;
+
+    /* Every touched page must be present in the page tables */
+    for (uint64_t a = uaddr & ~0xFFFULL; a < uaddr + len; a += 4096) {
+        if (vmm_get_phys(a) == 0) return 0;
+    }
+    return 1;
 }
 
 void process_exit(int status) {

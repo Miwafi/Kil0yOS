@@ -86,6 +86,16 @@ void user_programs_install(void);
 /* Jump to user mode */
 void jump_to_user(uint64_t entry, uint64_t stack);
 
+/* Kill the current user process from a fault context (e.g. ring3
+ * exception in isr_handler). Marks it ZOMBIE and returns the new kernel
+ * rsp to resume on (the saved kernel-main frame), or 0 if no process. */
+uint64_t process_kill_current(int status);
+
+/* True if [uaddr, uaddr+len) lies entirely inside the current process's
+ * mapped user regions (code or stack) and every touched page is present.
+ * Used by syscalls to reject user-supplied pointers before dereference. */
+int process_check_user_range(uint64_t uaddr, size_t len);
+
 /* Load program from file system */
 int load_user_program(const char* path);
 

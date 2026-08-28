@@ -2,6 +2,41 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.7.1] - 2026-08-28
+This is a hardening and bug-fix release: it closes the user-pointer validation hole in the system-call interface, makes Ring 3 faults kill the offending process instead of hanging the whole machine, fixes a shell freeze triggered by failed `exec`, fixes a PMM exhaustion bug on 256 MiB machines (and large-RAM VMware configurations), and fixes boot-log timestamps being stuck at `[0.000000]` until SMP init.
+
+### Fixed
+- **Missing user-pointer validation in syscalls (SECURITY, ring3 → kernel)**: `sys_write`, `sys_read`, and `sys_puts` dereferenced user-supplied pointers as kernel pointers. A user program could pass any kernel address to read kernel memory (`sys_puts`), write attacker data into kernel memory (`sys_write`), or dump keyboard input over kernel structures (`sys_read`). New `process_check_user_range()` ([process.c](src/kernel/core/process.c)) validates that a buffer lies entirely inside the calling process's code or stack region, with per-page presence checks via `vmm_get_phys()`; all three syscalls now reject invalid pointers with `-EFAULT`-style `-1`, and `sys_puts` scans for NUL page-by-page instead of unbounded `strlen`.
+- **User-mode CPU exception froze the entire machine (CRITICAL)**: `isr_handler` halted unconditionally on every fault, so a bug in any user program (e.g. touching an unmapped address) dead-booted the OS. The handler now checks `frame->cs & 3 == 3` and kills the offending process: new `process_kill_current()` marks it ZOMBIE, drops it from `current_process`, and returns the scheduler's kernel-main frame RSP; `isr_common_stub` gained the same `mov rsp, rax` frame-switch hook as the IRQ stub. Kernel-mode exceptions still halt (they are kernel bugs).
+- **`exec` failure left the shell permanently frozen**: `process_create()` set `state = READY` before allocating any resources; on failure (out of PMM pages) it returned `-1` leaving a half-initialized READY process behind, so `process_any_active()` stayed true and the shell input loop sat in `hlt` forever ignoring the keyboard (required power-cycle). State is now set only after every resource succeeds, failures unwind via `process_release_memory()` (unmap mapped VAs, free physical pages) and reset the slot, and each failure point prints a specific reason (`no free process slot` / `PMM out of pages (code|stack)`) on screen.
+- **PMM exhaustion with 256 MiB RAM (also affected VMware with large RAM)**: the kernel heap arena `[2 MiB, 256 MiB)` swallowed all of RAM when the machine had exactly 256 MiB, leaving `pmm_alloc_page()` with zero free pages — `exec` failed with "PMM out of pages". The arena is now capped at 64 MiB (`[2 MiB, 66 MiB)`) in both the default and largest-region paths of `memory_init()`; `USER_CODE_BASE` (256 MB) remains well above the heap top.
+- **Boot-log timestamps stuck at `[0.000000]` until `[init] smp_init done`**: two stacked causes — `pit_init()` ran late in the init sequence, and with interrupts disabled (`sti` only at the very end) `pit_ticks` never advanced. `pit_init(100)` now runs immediately after `serial_init()`, `pic_enable_irq(0)` moved after `interrupts_init()` (which masks all IRQs on completion), and `pit_elapsed_us()` was rewritten as a pure polling timer (reads the PIT countdown register with wraparound detection, `cli/popfq`-guarded) so timestamps are monotonic and continuous across the `sti` boundary regardless of interrupt state.
+
+### Added
+- **PMM boot diagnostics**: after the heap reservation, `memory_init()` logs the real free-page count (`[pmm] after heap reserve: free pages = N / 1048576`) and a `WARNING` when no pages remain — environment-specific memory failures (small RAM, different BIOS e820 layouts) are now visible at boot instead of surfacing later as `exec` failures.
+
+### Changed
+- Kernel heap arena capped at 64 MiB (was: up to 256 MiB / the largest usable memory region).
+- Removed `[fs] i=xxx child=xxx` per-entry debug logging from directory creation (`fs.c`).
+- Version strings bumped to 2.7.1 (boot banner, `version` command, GUI title bar).
+
+### File Changes
+- `src/kernel/core/process.c`: `process_check_user_range()` (per-page user-buffer validation), `process_kill_current()` (ring3 fault kill path), failure-safe `process_create` (late READY, `goto fail` unwind + slot reset, on-screen failure reasons)
+- `include/core/process.h`: declarations for the two new process functions
+- `src/kernel/core/syscall.c`: pointer validation in `sys_write` / `sys_read` / `sys_puts`
+- `src/kernel/core/isr.asm`: `isr_common_stub` frame-switch hook (`mov rsp, rax`)
+- `src/kernel/core/isr.c`: ring3 exception handling in `isr_handler`
+- `src/kernel/mm/memory.c`: 64 MiB heap cap (both branches), post-reserve PMM statistics + zero-free WARNING
+- `src/kernel/timer/pit.c`: polling-based `pit_elapsed_us()` independent of interrupt state
+- `src/kernel/core/main.c`: early `pit_init`, `pic_enable_irq(0)` ordering, version string
+- `src/kernel/sched/scheduler.c` / `include/sched/scheduler.h`: `scheduler_main_return_rsp()` accessor used by the fault-kill path
+- `src/kernel/fs/fs.c`: debug-log cleanup
+
+### Notes
+- Regression-verified in headless QEMU at 256 MiB and 512 MiB: PMM reports ~48608 / ~114144 free pages after the heap reserve, and `exec /bin/hello.bin` completes the full lifecycle (code mapped → run → `SYS_EXIT` → shell recovery) with zero exceptions.
+- Known cosmetic limitation: log timestamps can under-count by a few ms across gaps larger than one PIT period (10 ms) — acceptable for boot logs.
+- Remaining from the security audit (future work): huge-page split marks whole 2 MiB identity window `USER|WRITABLE` (`vmm_map_page`), `load_user_program` header bounds check, page-table page reclamation on exec, `memory_init` identity-map coverage check for >2 GiB machines.
+
 ## [2.7.0] - 2026-08-28
 This release completes the system-call and process-scheduling closed loop: user programs now run in Ring 3, issue `int 0x80` system calls, time-share the CPU with the kernel shell via IRQ0 round-robin, and exit cleanly back to the shell. `exec /bin/hello.bin` is verified end-to-end (output + exit + shell recovery) with an automated headless QEMU harness.
 

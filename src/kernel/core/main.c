@@ -84,10 +84,15 @@ void kernel_main(uint64_t mb_info_phys) {
     serial_init();
     serial_puts("kernel_main entered\n");
 
+    /* Start the timestamp clock before any klog() so early boot logs get
+     * monotonic timestamps. IRQ0 delivery is unmasked separately right
+     * after the PIC remap below. */
+    pit_init(100);
+
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.7.0\n");
+    klog("Kil0yOS version 2.7.1\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -105,6 +110,10 @@ void kernel_main(uint64_t mb_info_phys) {
 
     klog("PIC: initializing 8259A...\n");
     interrupts_init();
+
+    /* pic_init() masked all IRQ lines - unmask IRQ0 now so timer ticks
+     * (and timestamps) keep flowing once interrupts are enabled. */
+    pic_enable_irq(0);
 
     klog("PMM: initializing physical memory...\n");
     pmm_init(mb_info_phys);
@@ -144,10 +153,6 @@ void kernel_main(uint64_t mb_info_phys) {
     klog("Scheduler: initializing round-robin scheduler...\n");
     scheduler_init();
     klog("[init] scheduler_init done\n");
-
-    klog("PIT: initializing timer (100 Hz)...\n");
-    pit_init(100);
-    klog("[init] pit_init done\n");
 
     klog("ACPI: initializing...\n");
     power_init();

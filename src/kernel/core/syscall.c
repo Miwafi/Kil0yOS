@@ -54,7 +54,10 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
     (void)unused3; (void)unused4; (void)unused5;
 
     if (fd == 1 || fd == 2) {  /* stdout or stderr */
-        /* Write to VGA */
+        /* Reject kernel or unmapped user pointers before dereference */
+        if (!process_check_user_range(buf, (size_t)count)) {
+            return -1;
+        }
         const char* str = (const char*)buf;
         for (uint64_t i = 0; i < count; i++) {
             vga_putchar(str[i]);
@@ -80,8 +83,23 @@ uint64_t sys_puts(uint64_t str, uint64_t unused1, uint64_t unused2,
                   uint64_t unused3, uint64_t unused4, uint64_t unused5) {
     (void)unused1; (void)unused2; (void)unused3; (void)unused4; (void)unused5;
 
-    const char* s = (const char*)str;
-    vga_puts(s);
+    /* NUL-terminated scan with per-page validation: stops as soon as the
+     * pointer leaves the process's mapped user regions, so a kernel
+     * pointer is rejected on the first byte. */
+    uint64_t p = str;
+    uint64_t checked_page = 0;
+    for (;;) {
+        if ((p & ~0xFFFULL) != checked_page) {
+            if (!process_check_user_range(p, 1)) {
+                return (uint64_t)-1;
+            }
+            checked_page = p & ~0xFFFULL;
+        }
+        char c = *(const char*)p;
+        if (c == '\0') break;
+        vga_putchar(c);
+        p++;
+    }
     return 0;
 }
 
@@ -91,6 +109,9 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count,
 
     if (fd != 0) return -1;  /* only stdin supported */
     if (buf == 0 || count == 0) return 0;
+    if (!process_check_user_range(buf, (size_t)count)) {
+        return -1;
+    }
 
     char* dst = (char*)buf;
     uint64_t n = 0;

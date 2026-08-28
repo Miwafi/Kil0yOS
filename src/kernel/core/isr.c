@@ -7,6 +7,7 @@
 #include "timer/pit.h"
 #include "core/syscall.h"
 #include "core/tss.h"
+#include "core/process.h"
 
 #define IRQ0 32
 
@@ -150,6 +151,18 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
         vga_puthex(cr2);
     }
     vga_puts("\n");
+
+    /* Fault from ring 3: kill the offending user process and resume the
+     * kernel main task (shell) instead of freezing the whole machine.
+     * The stub switches to the rsp we return. Kernel faults (CPL 0) still
+     * halt - those are kernel bugs. */
+    if ((frame->cs & 3) == 3) {
+        uint64_t new_rsp = process_kill_current(-1);
+        if (new_rsp != 0) {
+            vga_puts("[proc] killed (fault), shell resumed\n");
+            return new_rsp;
+        }
+    }
 
     /* Halt on CPU exceptions to avoid an infinite fault/print loop. */
     __asm__ volatile("hlt");

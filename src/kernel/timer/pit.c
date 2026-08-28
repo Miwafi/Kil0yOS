@@ -11,12 +11,41 @@ static uint32_t pit_divisor = 1193;
 
 volatile uint64_t pit_ticks = 0;
 
+static uint16_t pit_read_counter(void);
+
+/* Elapsed microseconds since pit_init(). Pure polling of the PIT countdown
+ * register with a soft wrap detector - works with IF=0 (before
+ * enable_interrupts()), where IRQ0 never fires and pit_ticks stays 0.
+ * Resolution: one wrap detection per call, so intervals longer than one
+ * PIT cycle (10 ms at 100 Hz) may under-count by a few ms. */
+static uint64_t pit_elapsed_us(void) {
+    static uint16_t last_progress = 0;
+    static uint64_t total_counts = 0;
+
+    uint64_t flags;
+    __asm__ volatile("pushfq\n\tpopq %0\n\tcli" : "=r"(flags));
+    uint16_t cur = pit_read_counter();
+    uint16_t progress = (uint16_t)(pit_divisor - cur);
+
+    if (progress >= last_progress) {
+        total_counts += progress - last_progress;
+    } else {
+        /* counter wrapped since the last call */
+        total_counts += progress + ((uint32_t)pit_divisor - last_progress);
+    }
+    last_progress = progress;
+    uint64_t counts = total_counts;
+    __asm__ volatile("pushq %0\n\tpopfq" :: "r"(flags));
+
+    return counts * 1000000ULL / PIT_BASE_FREQ;
+}
+
 void pit_format_time(char* buf, size_t len) {
     if (len < 24) { buf[0] = '\0'; return; }
 
-    uint64_t ticks = pit_ticks;
-    uint64_t sec = ticks / 100;
-    uint64_t usec = (ticks % 100) * 10000ULL;
+    uint64_t usec = pit_elapsed_us();
+    uint64_t sec = usec / 1000000ULL;
+    uint64_t frac = usec % 1000000ULL;
 
     /* Cap seconds to avoid buffer overflow (max ~136 years at 100Hz) */
     if (sec > 99999) sec = 99999;
@@ -40,7 +69,7 @@ void pit_format_time(char* buf, size_t len) {
 
     uint64_t div = 100000;
     while (div > 0) {
-        buf[pos++] = '0' + (usec / div) % 10;
+        buf[pos++] = '0' + (frac / div) % 10;
         div /= 10;
     }
 
@@ -62,8 +91,10 @@ void pit_init(uint32_t frequency) {
     outb(PIT_CHANNEL0, pit_divisor & 0xFF);
     outb(PIT_CHANNEL0, (pit_divisor >> 8) & 0xFF);
 
-    // Enable IRQ 0 in PIC
-    pic_enable_irq(0);
+    // NOTE: IRQ0 is unmasked separately via pic_enable_irq(0) after the
+    // PIC remap (pic_init masks all IRQ lines). pit_init itself may run
+    // before interrupts_init() to start the timestamp clock as early as
+    // possible - only the counter starts; IRQ0 delivery follows later.
 }
 
 static uint16_t pit_read_counter(void) {
