@@ -22,6 +22,7 @@
 #include "net/e1000.h"
 #include "net/arp.h"
 #include "net/udp.h"
+#include "net/dhcp.h"
 
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -92,7 +93,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.7.1\n");
+    klog("Kil0yOS version 2.8.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -168,13 +169,21 @@ void kernel_main(uint64_t mb_info_phys) {
     udp_init();
     const char* nic = netif_probe();
     if (nic) {
-        g_netif.ip      = 0x0A00020F; /* 10.0.2.15 */
-        g_netif.netmask = 0xFFFFFF00; /* 255.255.255.0 */
-        g_netif.gateway = 0x0A000202; /* 10.0.2.2 */
         klog("net: ");
         klog(nic);
         klog(" found\n");
-        klog("net: IP=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2\n");
+
+        /* Auto-configuration: try DHCP first, fall back to the classic
+         * QEMU user-network static settings when no server answers. */
+        if (dhcp_autoconfig(&g_netif) == 0) {
+            klog("net: DHCP ok\n");
+        } else {
+            g_netif.ip      = 0x0A00020F; /* 10.0.2.15 */
+            g_netif.netmask = 0xFFFFFF00; /* 255.255.255.0 */
+            g_netif.gateway = 0x0A000202; /* 10.0.2.2 */
+            klog("net: DHCP failed, using static fallback\n");
+        }
+        klog("net: configured\n");
     } else {
         klog("net: no NIC found\n");
     }

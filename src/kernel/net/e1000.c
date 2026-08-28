@@ -171,6 +171,7 @@ int e1000_send(const uint8_t* data, uint16_t len) {
 
 int e1000_init(void) {
     pci_device_t* dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID);
+    if (!dev) dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID_82545);
     if (!dev) return -1;
 
     /* Enable bus mastering and memory space access */

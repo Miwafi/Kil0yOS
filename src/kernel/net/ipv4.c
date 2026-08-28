@@ -37,7 +37,10 @@ void ipv4_receive(netif_t* iface, const uint8_t* src_mac, const uint8_t* data, u
     uint32_t src_ip = net_ntohl(hdr.src);
     arp_cache_update(src_ip, src_mac);
 
-    if (net_ntohl(hdr.dst) != iface->ip && hdr.dst != 0xFFFFFFFF) return;
+    /* During DHCP negotiation iface->ip is still 0.0.0.0 - accept
+     * everything so the OFFER/ACK (often unicast to the granted address)
+     * can reach the bound UDP socket. */
+    if (iface->ip != 0 && net_ntohl(hdr.dst) != iface->ip && hdr.dst != 0xFFFFFFFF) return;
 
     const uint8_t* payload = data + hdr_len;
     uint16_t payload_len = total_len - hdr_len;
@@ -72,7 +75,10 @@ int ipv4_transmit(netif_t* iface, uint32_t dst_ip, uint8_t proto,
     memcpy(packet + hdr_len, payload, payload_len);
 
     uint8_t dst_mac[6];
-    if (arp_resolve(iface, dst_ip, dst_mac) < 0) {
+    if (dst_ip == 0xFFFFFFFF) {
+        /* IP broadcast - no ARP lookup */
+        memset(dst_mac, 0xFF, 6);
+    } else if (arp_resolve(iface, dst_ip, dst_mac) < 0) {
         return -1;
     }
 

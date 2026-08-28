@@ -41,6 +41,37 @@ static uint16_t rx_offset = 0;
 static uint8_t* tx_buffers[TX_DESC_COUNT];
 static int tx_current = 0;
 
+/* Drain the RX ring. Called from the IRQ handler and via g_netif.poll
+ * from the socket wait loops - required before enable_interrupts()
+ * (e.g. DHCP autoconfig runs during boot with IF=0). */
+void rtl8139_rx_poll(void) {
+    if (rx_buffer == NULL || io_base == 0) return;
+
+    while ((inb(io_base + RTL8139_REG_CR) & CR_BUFE) == 0) {
+        uint16_t capr = inw(io_base + RTL8139_REG_CAPR);
+        /* CAPR holds the read pointer minus 0x10 (per RTL8139 datasheet):
+         * with RxBufPtr=0 the register reads 0xFFF0. Add the 0x10 back
+         * before converting to a ring offset. */
+        uint16_t offset = (uint16_t)(capr + 0x10) % RX_BUF_SIZE;
+
+        uint8_t* pkt = rx_buffer + offset;
+        uint32_t header = *(uint32_t*)pkt;
+        uint16_t pkt_len = header >> 16;
+        uint8_t pkt_status = header & 0xFF;
+
+        if ((pkt_status & 0x01) && pkt_len >= 4) {
+            uint16_t data_len = pkt_len - 4;
+            if (data_len > 0) {
+                netif_receive(pkt + 4, data_len);
+            }
+        }
+
+        rx_offset = (offset + pkt_len + 4 + 3) & ~3;
+        if (rx_offset >= RX_BUF_SIZE) rx_offset -= RX_BUF_SIZE;
+        outw(io_base + RTL8139_REG_CAPR, rx_offset - 0x10);
+    }
+}
+
 static void rtl8139_irq_handler(interrupt_frame_t* frame) {
     (void)frame;
 
@@ -48,26 +79,7 @@ static void rtl8139_irq_handler(interrupt_frame_t* frame) {
     outw(io_base + RTL8139_REG_ISR, status);
 
     if (status & INT_ROK) {
-        while ((inb(io_base + RTL8139_REG_CR) & CR_BUFE) == 0) {
-            uint16_t capr = inw(io_base + RTL8139_REG_CAPR);
-            uint16_t offset = capr % RX_BUF_SIZE;
-
-            uint8_t* pkt = rx_buffer + offset;
-            uint32_t header = *(uint32_t*)pkt;
-            uint16_t pkt_len = header >> 16;
-            uint8_t pkt_status = header & 0xFF;
-
-            if ((pkt_status & 0x01) && pkt_len >= 4) {
-                uint16_t data_len = pkt_len - 4;
-                if (data_len > 0) {
-                    netif_receive(pkt + 4, data_len);
-                }
-            }
-
-            rx_offset = (offset + pkt_len + 4 + 3) & ~3;
-            if (rx_offset >= RX_BUF_SIZE) rx_offset -= RX_BUF_SIZE;
-            outw(io_base + RTL8139_REG_CAPR, rx_offset - 0x10);
-        }
+        rtl8139_rx_poll();
     }
 
     if (rtl_irq != 0) {
@@ -104,6 +116,16 @@ int rtl8139_init(void) {
 
     io_base = (uint16_t)(dev->bar0 & ~0x3);
     if (io_base == 0) return -1;
+
+    /* Enable I/O space access AND bus mastering: with the PCI Command
+     * Bus Master bit clear, the device's DMA address space is unmapped
+     * (QEMU pci_set_master(false)) and every TX descriptor fetch reads
+     * zeros - the NIC transmitted correctly-shaped all-zero frames. */
+    {
+        uint16_t cmd = pci_read_word(dev->bus, dev->device, dev->function, PCI_COMMAND_OFFSET);
+        cmd |= 0x0005; /* IO Space + Bus Master */
+        pci_write_word(dev->bus, dev->device, dev->function, PCI_COMMAND_OFFSET, cmd);
+    }
 
     /* Software reset with timeout */
     outb(io_base + RTL8139_REG_CR, CR_RST);
@@ -158,6 +180,7 @@ int rtl8139_init(void) {
     }
 
     g_netif.send = rtl8139_send;
+    g_netif.poll = rtl8139_rx_poll;
     g_netif.flags = 1;
     return 0;
 }

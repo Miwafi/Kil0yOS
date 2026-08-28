@@ -50,7 +50,8 @@ const char* netif_probe(void) {
         if (dev->class_code == 0x02 && dev->subclass_code == 0x00) {
             if (dev->vendor_id == 0x10EC && dev->device_id == 0x8139) {
                 if (rtl8139_init() == 0) return "RTL8139";
-            } else if (dev->vendor_id == 0x8086 && dev->device_id == 0x100E) {
+            } else if (dev->vendor_id == 0x8086 &&
+                       (dev->device_id == 0x100E || dev->device_id == 0x100F)) {
                 if (e1000_init() == 0) return "E1000";
             }
         }

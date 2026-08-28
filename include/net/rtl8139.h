@@ -9,5 +9,6 @@
 int rtl8139_init(void);
 int rtl8139_send(const uint8_t* data, uint16_t len);
 void rtl8139_get_mac(uint8_t* out_mac);
+void rtl8139_rx_poll(void);
 
 #endif

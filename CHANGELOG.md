@@ -2,6 +2,42 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.8.0] - 2026-08-29
+This release makes network configuration self-adaptive: the kernel now runs a DHCP client at boot (DISCOVER → OFFER → REQUEST → ACK) instead of hardcoding the QEMU slirp static address, with a static fallback when no server answers. Along the way it fixes three RTL8139 driver bugs that made the NIC transmit all-zero frames and never receive, adds VMware's e1000 (82545EM) device ID, and hardens every port-I/O accessor with compiler ordering barriers.
+
+### Added
+- **DHCP auto-configuration client** (`dhcp.c` / `dhcp.h`): full DISCOVER → OFFER → REQUEST → ACK handshake over a UDP socket (port 68), transaction ID derived from the NIC MAC, timeouts driven by the validated polling clock `pit_uptime_us()` (reliable with interrupts disabled during boot). On success it fills `iface->ip` / `netmask` / `gateway`; on failure the caller falls back to the classic static QEMU user-network settings (10.0.2.15/24, gw 10.0.2.2) and logs `DHCP failed, using static fallback`. Works with both QEMU slirp (10.0.2.x) and VMware NAT (192.168.x.x) subnets.
+- **`net` shell command**: registered in `commands[]` and visible in `help`. Bare `net` prints an aggregate overview (interface + ARP cache + UDP socket summary); `net ping <ip>` / `net ifconfig` / `net netstat` forward to the existing implementations; unknown subcommands print usage.
+- **e1000 82545EM support (0x100F)**: VMware's default virtual NIC (82545EM) reports device ID 0x100F, which `e1000_init()` and `netif_probe()` did not match. Both now accept 0x100E (82540EM, QEMU default) and 0x100F.
+- **`pit_uptime_us()`**: public uptime accessor on top of the interrupt-independent polling clock used by the boot-log timestamps; used by the DHCP wait loops.
+- **`tools/pcap_dump.py`**: QEMU `-object filter-dump` pcap decoding helper used to debug the DHCP/RTL8139 bring-up (frame hex dumps, DHCP option breakdown).
+
+### Fixed
+- **RTL8139 transmitted correctly-shaped but all-zero frames (CRITICAL)**: the PCI Command register was left with the Bus Master bit clear, so QEMU kept `pci_set_master(false)` and the device's DMA address space was unmapped — every TX descriptor fetch read zeros. `rtl8139_init()` now sets `IO Space + Bus Master` (`cmd |= 0x0005`) before configuring the NIC.
+- **RTL8139 never received packets — CAPR register misread**: the RX read pointer is `CAPR + 0x10` (with `RxBufPtr=0` the register reads 0xFFF0, per datasheet); the code used the raw register value as the ring offset, so headers decoded as garbage. Ring offset now computed as `(CAPR + 0x10) % RX_BUF_SIZE`.
+- **DHCP deadlocked before interrupts were enabled**: boot-time DHCP runs with IF=0, so the RX IRQ handler never fired and the OFFER/ACK sat unread in the RX ring. The ring-drain logic was extracted into `rtl8139_rx_poll()` (also exported via `g_netif.poll`) and is invoked from the UDP socket wait loops, making packet reception work regardless of interrupt state.
+- **Compiler reordered `memcpy` below the device kick under `-O2` (DMA corruption)**: the port-I/O accessors in `io.h` carried no `"memory"` clobber, so GCC was free to sink ordinary stores (e.g. copying a packet into the DMA TX buffer) below the `outb`/`outl` that triggers the transfer — the hardware DMA'd half-written or zeroed buffers. All `inb`/`inw`/`ind`/`outb`/`outw`/`outd` now carry the clobber as an explicit ordering barrier.
+- **IPv4 receive dropped DHCP replies**: during negotiation `iface->ip` is still 0.0.0.0, but `ipv4_receive()` filtered on destination address and discarded the OFFER/ACK (often unicast to the granted address). The filter is now skipped while the interface has no address. `ipv4_transmit()` also sends IP broadcast (255.255.255.255) straight to `ff:ff:ff:ff:ff:ff` instead of attempting an ARP lookup for it.
+
+### Changed
+- Version strings bumped to 2.8.0 (boot banner, `version` command, GUI title bar).
+
+### File Changes
+- `include/net/dhcp.h`, `src/kernel/net/dhcp.c`: new DHCP client (`dhcp_autoconfig()`)
+- `src/kernel/net/rtl8139.c`, `include/net/rtl8139.h`: PCI Bus Master enable, CAPR +0x10 fix, `rtl8139_rx_poll()` extraction + `g_netif.poll` registration
+- `src/kernel/net/e1000.c`, `include/net/e1000.h`: 82545EM (0x100F) probe
+- `src/kernel/net/netif.c`: probe matches 0x100E / 0x100F
+- `src/kernel/net/ipv4.c`: DHCP-phase destination filter, IP broadcast MAC shortcut
+- `src/kernel/core/main.c`: DHCP-first auto-configuration with static fallback, version bump
+- `include/drivers/io.h`: `"memory"` clobbers on all port-I/O accessors
+- `src/kernel/shell/shell.c`: `net` command + registration, version bump
+- `src/kernel/timer/pit.c`, `include/timer/pit.h`: `pit_uptime_us()`
+- `Makefile`: build `dhcp.c`
+- `tools/pcap_dump.py`: pcap decoding helper (new)
+
+### Notes
+- Regression-verified in headless QEMU (RTL8139, slirp): `net: DHCP ok` / `net: configured` appear ~0.7 s into boot with the offered 10.0.2.15/24, gateway 10.0.2.2; `exec /bin/hello.bin` still completes the full Ring 3 lifecycle (output + exit + shell recovery); `net` and `net ifconfig` show the DHCP-leased configuration and a valid ARP cache.
+
 ## [2.7.1] - 2026-08-28
 This is a hardening and bug-fix release: it closes the user-pointer validation hole in the system-call interface, makes Ring 3 faults kill the offending process instead of hanging the whole machine, fixes a shell freeze triggered by failed `exec`, fixes a PMM exhaustion bug on 256 MiB machines (and large-RAM VMware configurations), and fixes boot-log timestamps being stuck at `[0.000000]` until SMP init.
 

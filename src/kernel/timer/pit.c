@@ -12,6 +12,14 @@ static uint32_t pit_divisor = 1193;
 volatile uint64_t pit_ticks = 0;
 
 static uint16_t pit_read_counter(void);
+static uint64_t pit_elapsed_us(void);
+
+/* Uptime in microseconds (same polling clock that drives the boot-log
+ * timestamps). Reliable regardless of IRQ0 delivery - unlike the
+ * countdown-register deltas, this path is validated by klog timing. */
+uint64_t pit_uptime_us(void) {
+    return pit_elapsed_us();
+}
 
 /* Elapsed microseconds since pit_init(). Pure polling of the PIT countdown
  * register with a soft wrap detector - works with IF=0 (before

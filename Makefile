@@ -63,6 +63,7 @@ NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
            $(SRCDIR)/kernel/net/ipv4.c \
            $(SRCDIR)/kernel/net/icmp.c \
            $(SRCDIR)/kernel/net/udp.c \
+           $(SRCDIR)/kernel/net/dhcp.c \
            $(SRCDIR)/kernel/net/rtl8139.c \
            $(SRCDIR)/kernel/net/e1000.c
 

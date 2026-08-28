@@ -50,6 +50,7 @@ static int cmd_gui(int argc, char** argv);
 static int cmd_ping(int argc, char** argv);
 static int cmd_ifconfig(int argc, char** argv);
 static int cmd_netstat(int argc, char** argv);
+static int cmd_net(int argc, char** argv);
 static int cmd_exec(int argc, char** argv);
 
 static shell_command_t commands[] = {
@@ -70,6 +71,7 @@ static shell_command_t commands[] = {
     {"ping", "Ping a host", cmd_ping},
     {"ifconfig", "Show network configuration", cmd_ifconfig},
     {"netstat", "Show network status", cmd_netstat},
+    {"net", "Network info / subcommand (ping|ifconfig|netstat)", cmd_net},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
     {"exec", "Execute a user program", cmd_exec},
@@ -415,7 +417,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.7.1\n");
+    vga_puts("Kil0yOS v2.8.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -774,7 +776,7 @@ static int cmd_gui(int argc, char** argv) {
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.7.1", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.8.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);
@@ -1054,6 +1056,22 @@ static int cmd_netstat(int argc, char** argv) {
     }
     if (!any) vga_puts("  (none)\n");
     return 0;
+}
+
+static int cmd_net(int argc, char** argv) {
+    if (argc < 2) {
+        /* No subcommand: aggregate overview (interface + ARP + sockets) */
+        cmd_ifconfig(0, NULL);
+        cmd_netstat(0, NULL);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "ping") == 0)  return cmd_ping(argc - 1, argv + 1);
+    if (strcmp(argv[1], "ifconfig") == 0) return cmd_ifconfig(argc - 1, argv + 1);
+    if (strcmp(argv[1], "netstat") == 0)  return cmd_netstat(argc - 1, argv + 1);
+
+    vga_puts("Usage: net [ping <ip> | ifconfig | netstat]\n");
+    return 1;
 }
 
 static int cmd_exec(int argc, char** argv) {
