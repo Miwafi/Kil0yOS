@@ -2,6 +2,40 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.9.0] - 2026-08-29
+This release adds the first Ring 3 game: a built-in Pong with an AI opponent, backed by new graphics/keyboard system calls and an automated headless-QEMU regression harness. Along the way it fixes a boot crash under QEMU's default e1000 NIC (BAR composition), and a user-program entry-point mislink that made any raw binary whose `_start` was not the first linked function jump to garbage.
+
+### Added
+- **Pong game** (`user/pong.c` → `/bin/pong.bin`): ring 3 game with AI opponent, W/S paddle control, 5-point match, banner/winner screens, ESC returns to the shell. Renders through the new graphics syscalls with **incremental (flicker-free) updates** — each frame erases only the ball's old square and moved paddles, and redraws the dashed center line / score only when actually covered or changed; the full scene is drawn once per match via `draw_static()`. Installed into the filesystem at boot next to `hello.bin`.
+- **Graphics & keyboard syscalls** (`SYS_GFX_MODE` / `SYS_GFX_CLEAR` / `SYS_GFX_RECT` / `SYS_GFX_TEXT` / `SYS_KEY_POLL`): ring 3 programs never touch the 0xA0000 framebuffer directly (identity map is kernel-only) — mode 13h switching, rectangle fill, string drawing, and non-blocking key polling are exposed through the syscall interface. `keyboard_getc()` values feed `SYS_KEY_POLL`; the VGA drawing primitives are no-ops while the display is in text mode.
+- **Multi-user-program build**: `Makefile` now builds `USER_PROGRAMS = hello pong`, links each raw binary with `user/user.ld`, embeds them as `.incbin` blobs (`user_blob_*.o`), and `user_programs_install()` writes both into `/bin` at boot.
+- **`tools/pong_qemu_test.py`**: headless QEMU regression that boots the ISO, types `exec /bin/pong.bin` into the shell via the monitor, sends W/S/ESC keystrokes, and screendumps/serial-checks each stage (text-mode shell → mode 13h banner → game field → ESC restores text mode, no kernel exceptions).
+
+### Fixed
+- **Boot #GP with QEMU's default e1000 NIC (CRITICAL)**: `e1000_init()` unconditionally composed the MMIO base as `bar0 | (bar1 << 32)`, but the 82540EM (0x100E, QEMU default) has a *32-bit memory BAR0 plus an I/O-port BAR1* (0x0000c001) — the composition produced the non-canonical address `0xc001feb80000` and the first MMIO read raised #GP (err=0, kernel mode) at `e1000_init+0x275`, dead-booting before the shell. The BAR is now composed only when BAR0's type bits declare a 64-bit memory BAR; I/O-space BARs and all-ones reads are rejected. VMware's 82545EM (0x100F, a real 64-bit BAR) is unaffected but now handled correctly too.
+- **Raw-binary user programs entered at the wrong address (CRITICAL for pong)**: `OUTPUT_FORMAT(binary)` in `user/user.ld` drops the ELF header, so the kernel's raw exec enters at the image base — but the linker had placed `fmt_int.part.0` at offset 0 and `_start` at 0x430, so pong executed garbage that jumped to RIP=0 (#PF err=5, user mode) and then cascaded into a kernel #GP inside `irq_common_stub`'s IRET path. `user/user.ld` now links a `.text.entry` section first, and both user programs' `_start` carry `__attribute__((section(".text.entry")))` (`hello.bin` only worked by luck of link order).
+- **Pong never entered mode 13h**: `_start` only called `SYS_GFX_MODE(0)` on exit; every drawing syscall silently no-oped in text mode so the game appeared to run "invisible". `_start` now enters mode 13h before drawing the banner.
+
+### Changed
+- Version strings bumped to 2.9.0 (boot banner, `version` command, GUI title bar).
+- README (EN/zh): documented Ring 3 user programs, the Pong game, and the previously missing `exec` command.
+
+### File Changes
+- `user/pong.c`: Pong game (new)
+- `user/hello.c`: `_start` moved to `.text.entry`
+- `user/user.ld`: `.text.entry` ordered first
+- `Makefile`: multi-user-program build + blob embedding
+- `src/kernel/core/process.c`: pong blob install into `/bin`
+- `src/kernel/core/syscall.c`: GFX/KEY syscall handlers
+- `include/core/syscall.h`: syscall numbers 10-14
+- `src/kernel/net/e1000.c`: type-safe BAR composition
+- `src/kernel/core/main.c`, `src/kernel/shell/shell.c`: version bump
+- `tools/pong_qemu_test.py`: headless regression harness (new)
+- `README.md`, `README.zh.md`, `CHANGELOG.md`: documentation
+
+### Notes
+- Regression-verified with `tools/pong_qemu_test.py` on the default QEMU e1000 NIC: DHCP completes, shell boots, `exec /bin/pong.bin` enters mode 13h (screendump 640x400 doubled), W/S move the paddles, ESC restores text mode for the shell, and the serial log shows a clean `[proc] exit syscall` with no exceptions.
+
 ## [2.8.0] - 2026-08-29
 This release makes network configuration self-adaptive: the kernel now runs a DHCP client at boot (DISCOVER → OFFER → REQUEST → ACK) instead of hardcoding the QEMU slirp static address, with a static fallback when no server answers. Along the way it fixes three RTL8139 driver bugs that made the NIC transmit all-zero frames and never receive, adds VMware's e1000 (82545EM) device ID, and hardens every port-I/O accessor with compiler ordering barriers.
 

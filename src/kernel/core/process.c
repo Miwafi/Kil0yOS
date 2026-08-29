@@ -358,22 +358,32 @@ int load_user_program(const char* path) {
 /* Embedded user program blobs (see Makefile: nasm .incbin) */
 extern const uint8_t user_hello_start[];
 extern const uint8_t user_hello_end[];
+extern const uint8_t user_pong_start[];
+extern const uint8_t user_pong_end[];
 
 void user_programs_install(void) {
     fs_entry_t* bin = fs_resolve_path("/bin");
     if (bin == NULL || bin->type != FS_TYPE_DIRECTORY) {
         return;  /* /bin missing - fs not formatted? */
     }
-    if (fs_resolve_path("/bin/hello.bin") != NULL) {
-        return;  /* already installed */
-    }
 
     fs_entry_t* prev = fs_current();
     fs_set_current(bin);
-    fs_entry_t* f = fs_create_file("hello.bin");
-    if (f != NULL) {
-        size_t size = (size_t)(user_hello_end - user_hello_start);
-        fs_write_file(f, user_hello_start, size);
+
+    if (fs_resolve_path("/bin/hello.bin") == NULL) {
+        fs_entry_t* f = fs_create_file("hello.bin");
+        if (f != NULL) {
+            size_t size = (size_t)(user_hello_end - user_hello_start);
+            fs_write_file(f, user_hello_start, size);
+        }
     }
+    if (fs_resolve_path("/bin/pong.bin") == NULL) {
+        fs_entry_t* f = fs_create_file("pong.bin");
+        if (f != NULL) {
+            size_t size = (size_t)(user_pong_end - user_pong_start);
+            fs_write_file(f, user_pong_start, size);
+        }
+    }
+
     fs_set_current(prev);
 }

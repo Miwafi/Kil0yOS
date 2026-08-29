@@ -39,7 +39,10 @@
 - Command-line shell with built-in commands
 - File read/write/edit operations
 - Round-robin task scheduler with 64-bit context switching
+- **Ring 3 user programs** loaded from `/bin` with a graphics + keyboard syscall interface
+- Built-in **Pong game** (`exec /bin/pong.bin`) with AI opponent, flicker-free incremental rendering
 - Network stack with Intel E1000 and RTL8139 driver support
+- DHCP auto-configuration with static fallback
 
 ## Prerequisites
 
@@ -81,6 +84,7 @@ make run
 - shutdown - Shut down the system (ACPI S5)
 - net - Network management (wire, chknic, status)
 - ping - Send ICMP echo requests
+- exec - Run a user program from `/bin` (e.g. `exec /bin/hello.bin`, `exec /bin/pong.bin`)
 
 ## GUI Desktop
 
@@ -103,6 +107,10 @@ Because every OS needs a cat.
 Wanna check the system status?
 
 ![System GUI](assets/systemgui.png)
+
+### Pong Game
+
+Run `exec /bin/pong.bin` for a game of Pong against the AI (first to 5 wins). Move with **W/S**, press **ESC** to return to the shell. Rendered through ring 3 graphics syscalls with incremental (flicker-free) updates.
 
 ## Project Structure
 

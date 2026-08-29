@@ -15,6 +15,14 @@ typedef enum {
     SYS_PUTS,       /* Debug: print string */
     SYS_GETCHAR,
     SYS_PUTCHAR,
+    /* Graphics framebuffer access for ring3 (mode 13h, 320x200):
+     * user programs never touch 0xA0000 directly (identity map is
+     * kernel-only) - they render through these calls. */
+    SYS_GFX_MODE,   /* arg0: 1 = enter mode 13h, 0 = restore text mode */
+    SYS_GFX_CLEAR,  /* fill framebuffer black */
+    SYS_GFX_RECT,   /* arg0..3 = x,y,w,h, arg4 = color (filled) */
+    SYS_GFX_TEXT,   /* arg0..1 = x,y, arg2 = user string, arg3 = color */
+    SYS_KEY_POLL,   /* non-blocking: 0 = no key, else key code */
     SYS_MAX
 } syscall_num_t;
 
@@ -54,5 +62,15 @@ uint64_t sys_getchar(uint64_t unused1, uint64_t unused2, uint64_t unused3,
                      uint64_t unused4, uint64_t unused5, uint64_t unused6);
 uint64_t sys_putchar(uint64_t ch, uint64_t unused1, uint64_t unused2,
                      uint64_t unused3, uint64_t unused4, uint64_t unused5);
+uint64_t sys_gfx_mode(uint64_t mode, uint64_t unused1, uint64_t unused2,
+                      uint64_t unused3, uint64_t unused4, uint64_t unused5);
+uint64_t sys_gfx_clear(uint64_t unused1, uint64_t unused2, uint64_t unused3,
+                       uint64_t unused4, uint64_t unused5, uint64_t unused6);
+uint64_t sys_gfx_rect(uint64_t x, uint64_t y, uint64_t w,
+                      uint64_t h, uint64_t color, uint64_t unused5);
+uint64_t sys_gfx_text(uint64_t x, uint64_t y, uint64_t str,
+                      uint64_t color, uint64_t unused4, uint64_t unused5);
+uint64_t sys_key_poll(uint64_t unused1, uint64_t unused2, uint64_t unused3,
+                      uint64_t unused4, uint64_t unused5, uint64_t unused6);
 
 #endif

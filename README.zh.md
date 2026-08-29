@@ -39,7 +39,10 @@
 - 命令行 Shell，内置常用命令
 - 文件读/写/编辑操作
 - 时间片轮转任务调度器，支持 64 位上下文切换
+- **Ring 3 用户程序**，从 `/bin` 加载，提供图形 + 键盘系统调用接口
+- 内置 **乒乓球游戏**（`exec /bin/pong.bin`），AI 对手，增量渲染无闪烁
 - 网络协议栈，支持 Intel E1000 和 RTL8139 驱动
+- DHCP 自适应配置，静态地址回退
 
 ## 前置要求
 
@@ -81,6 +84,7 @@ make run
 - shutdown - 关机（ACPI S5）
 - net - 网络管理（wire, chknic, status）
 - ping - 发送 ICMP 回显请求
+- exec - 运行 `/bin` 下的用户程序（如 `exec /bin/hello.bin`、`exec /bin/pong.bin`）
 
 ## GUI 桌面
 
@@ -103,6 +107,10 @@ make run
 想查看系统状态吗？
 
 ![System GUI](assets/systemgui.png)
+
+### 乒乓球游戏
+
+运行 `exec /bin/pong.bin` 与 AI 对打一局乒乓球（先得 5 分者胜）。**W/S** 移动挡板，**ESC** 返回 Shell。通过 Ring 3 图形系统调用渲染，采用增量刷新（无闪烁）。
 
 ## 项目结构
 

@@ -10,6 +10,9 @@ SECTIONS
     . = 0x10000000;
     
     .text : {
+        /* _start must be first: OUTPUT_FORMAT(binary) drops the ELF
+         * header, so the kernel's raw-binary exec enters at offset 0. */
+        *(.text.entry)
         *(.text)
         *(.text.*)
     }

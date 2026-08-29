@@ -182,8 +182,35 @@ int e1000_init(void) {
     /* Read 64-bit BAR properly */
     uint32_t bar0_raw = pci_read_dword(dev->bus, dev->device, dev->function, PCI_BAR0_OFFSET);
     uint32_t bar1 = pci_read_dword(dev->bus, dev->device, dev->function, PCI_BAR1_OFFSET);
-    uint64_t bar = (bar0_raw & ~0xF) | ((uint64_t)bar1 << 32);
-    if (bar == 0) return -1;
+    /* TEMP DEBUG */
+    {
+        char buf[96]; int p = 0;
+        const char hex[] = "0123456789abcdef";
+        const char* s = "[e1000] match bdf=";
+        while (*s) buf[p++] = *s++;
+        buf[p++] = '0' + dev->bus; buf[p++] = ':';
+        buf[p++] = '0' + dev->device; buf[p++] = ':';
+        buf[p++] = '0' + dev->function; buf[p++] = ' ';
+        s = "bar0="; while (*s) buf[p++] = *s++;
+        for (int i = 7; i >= 0; i--) buf[p++] = hex[(bar0_raw >> (i * 4)) & 0xF];
+        s = " bar1="; while (*s) buf[p++] = *s++;
+        for (int i = 7; i >= 0; i--) buf[p++] = hex[(bar1 >> (i * 4)) & 0xF];
+        buf[p++] = '\n'; buf[p] = 0;
+        klog(buf);
+    }
+    /* BAR0 layout: bit0 = 0 (memory) / 1 (I/O), bits 2:1 = mem type
+     * (00 = 32-bit, 10 = 64-bit). Only a 64-bit memory BAR uses BAR1
+     * as the upper half - composing it blindly turns e.g. QEMU's
+     * 82540EM I/O BAR (0x0000c001) into a non-canonical pointer and
+     * #GPs on the first MMIO read. */
+    if (bar0_raw == 0 || bar0_raw == 0xFFFFFFFF) return -1;
+    if (bar0_raw & 0x1) return -1; /* I/O-space BAR: no MMIO access */
+
+    uint64_t bar = bar0_raw & ~0xFULL;
+    if ((bar0_raw & 0x6) == 0x4) { /* 64-bit memory BAR */
+        if (bar1 == 0xFFFFFFFF) return -1;
+        bar |= ((uint64_t)(bar1 & ~0xFULL)) << 32;
+    }
 
     mmio_base = (volatile uint32_t*)bar;
 

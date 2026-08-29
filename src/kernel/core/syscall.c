@@ -20,6 +20,11 @@ void syscall_init(void) {
     syscall_register(SYS_PUTS, sys_puts);
     syscall_register(SYS_GETCHAR, sys_getchar);
     syscall_register(SYS_PUTCHAR, sys_putchar);
+    syscall_register(SYS_GFX_MODE, sys_gfx_mode);
+    syscall_register(SYS_GFX_CLEAR, sys_gfx_clear);
+    syscall_register(SYS_GFX_RECT, sys_gfx_rect);
+    syscall_register(SYS_GFX_TEXT, sys_gfx_text);
+    syscall_register(SYS_KEY_POLL, sys_key_poll);
 }
 
 void syscall_register(syscall_num_t num, syscall_handler_t handler) {
@@ -150,4 +155,77 @@ uint64_t sys_yield(uint64_t unused1, uint64_t unused2, uint64_t unused3,
      * to the IRQ0 gate is legal. */
     __asm__ volatile("int $32");
     return 0;
+}
+
+/* --- Ring3 graphics / game support ---------------------------------
+ * User programs render through the kernel's mode-13h framebuffer
+ * instead of touching 0xA0000 directly (identity-map pages are
+ * kernel-only). All vga_* drawing primitives are no-ops when the
+ * display is not in graphics mode, so stray calls are harmless. */
+
+uint64_t sys_gfx_mode(uint64_t mode, uint64_t unused1, uint64_t unused2,
+                      uint64_t unused3, uint64_t unused4, uint64_t unused5) {
+    (void)unused1; (void)unused2; (void)unused3;
+    (void)unused4; (void)unused5;
+
+    if (mode) {
+        vga_set_mode_13h();
+    } else {
+        vga_set_text_mode();
+    }
+    return 0;
+}
+
+uint64_t sys_gfx_clear(uint64_t unused1, uint64_t unused2, uint64_t unused3,
+                       uint64_t unused4, uint64_t unused5, uint64_t unused6) {
+    (void)unused1; (void)unused2; (void)unused3;
+    (void)unused4; (void)unused5; (void)unused6;
+
+    vga_fill_rect(0, 0, GFX_WIDTH, GFX_HEIGHT, COLOR_BLACK);
+    return 0;
+}
+
+uint64_t sys_gfx_rect(uint64_t x, uint64_t y, uint64_t w,
+                      uint64_t h, uint64_t color, uint64_t unused5) {
+    (void)unused5;
+
+    vga_fill_rect((int)x, (int)y, (int)w, (int)h, (uint8_t)color);
+    return 0;
+}
+
+uint64_t sys_gfx_text(uint64_t x, uint64_t y, uint64_t str,
+                      uint64_t color, uint64_t unused4, uint64_t unused5) {
+    (void)unused4; (void)unused5;
+
+    /* Validate the user string page-by-page while copying into a bounded
+     * kernel buffer (same discipline as sys_puts), then draw with the
+     * kernel's 8x8 font. */
+    char tmp[64];
+    uint64_t p = str;
+    uint64_t checked_page = 0;
+    size_t n = 0;
+    for (;;) {
+        if ((p & ~0xFFFULL) != checked_page) {
+            if (!process_check_user_range(p, 1)) {
+                return (uint64_t)-1;
+            }
+            checked_page = p & ~0xFFFULL;
+        }
+        char c = *(const char*)p;
+        if (c == '\0') break;
+        if (n < sizeof(tmp) - 1) tmp[n++] = c;
+        p++;
+    }
+    tmp[n] = '\0';
+    vga_draw_string((int)x, (int)y, tmp, (uint8_t)color);
+    return 0;
+}
+
+uint64_t sys_key_poll(uint64_t unused1, uint64_t unused2, uint64_t unused3,
+                      uint64_t unused4, uint64_t unused5, uint64_t unused6) {
+    (void)unused1; (void)unused2; (void)unused3;
+    (void)unused4; (void)unused5; (void)unused6;
+
+    if (!keyboard_has_input()) return 0;
+    return (uint64_t)(unsigned char)keyboard_getc();
 }

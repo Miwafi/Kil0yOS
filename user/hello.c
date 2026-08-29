@@ -31,7 +31,10 @@ static inline long syscall2(long num, long arg0, long arg1) {
 #define SYS_EXIT    0
 #define SYS_PUTS    7
 
-/* Entry point - called by kernel after loading */
+/* Entry point - called by kernel after loading.
+ * .text.entry: linked first in the raw binary - the kernel's raw exec
+ * enters at image base (OUTPUT_FORMAT(binary) drops ELF entry info). */
+__attribute__((section(".text.entry"), used))
 void _start(void) {
     /* Use inline assembly to avoid absolute address references */
     __asm__ volatile(

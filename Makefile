@@ -86,8 +86,10 @@ BOOT_OBJ = $(BUILDDIR)/boot/boot.o
 USER_CCFLAGS = -std=c11 -ffreestanding -O2 -fno-stack-protector -m64 -mno-red-zone \
                -fno-pie -fno-pic -mcmodel=small -mno-sse -mno-sse2 -mno-mmx \
                -I$(INCDIR) -D__USER__
-USER_BIN = $(BUILDDIR)/user/hello.bin
-USER_BLOB_OBJ = $(BUILDDIR)/user_blob.o
+USER_PROGRAMS = hello pong
+USER_BINS = $(patsubst %, $(BUILDDIR)/user/%.bin, $(USER_PROGRAMS))
+USER_BLOB_OBJS = $(patsubst %, $(BUILDDIR)/user_blob_%.o, $(USER_PROGRAMS))
+.SECONDARY: $(USER_BINS) $(BUILDDIR)/user/hello.o $(BUILDDIR)/user/pong.o
 
 .PHONY: all clean run iso
 
@@ -97,13 +99,17 @@ $(BUILDDIR)/user/hello.o: user/hello.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CCFLAGS) -c $< -o $@
 
-$(USER_BIN): $(BUILDDIR)/user/hello.o user/user.ld
+$(BUILDDIR)/user/pong.o: user/pong.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CCFLAGS) -c $< -o $@
+
+$(BUILDDIR)/user/%.bin: $(BUILDDIR)/user/%.o user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) -T user/user.ld -nostdlib -m elf_x86_64 $< -o $@
 
-$(USER_BLOB_OBJ): $(USER_BIN)
-	printf 'section .rodata\nglobal user_hello_start\nuser_hello_start:\nincbin "%s"\nglobal user_hello_end\nuser_hello_end:\n' '$<' > $(BUILDDIR)/user_blob.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob.s -o $@
+$(BUILDDIR)/user_blob_%.o: $(BUILDDIR)/user/%.bin
+	printf 'section .rodata\nglobal user_$*_start\nuser_$*_start:\nincbin "%s"\nglobal user_$*_end\nuser_$*_end:\n' '$<' > $(BUILDDIR)/user_blob_$*.s
+	$(AS) -f elf64 $(BUILDDIR)/user_blob_$*.s -o $@
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(dir $@)
@@ -125,8 +131,8 @@ $(BUILDDIR)/kernel/core/ap_trampoline.o: $(BUILDDIR)/ap_trampoline.bin | $(BUILD
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -I binary -O elf64-x86-64 $< $@
 
-$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJ)
-	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJ) -o $@
+$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS)
+	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) -o $@
 
 $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 	@mkdir -p $(BUILDDIR)/iso/boot/grub
