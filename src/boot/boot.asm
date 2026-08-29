@@ -132,9 +132,12 @@ _start:
     add edi, 8
     loop .pd3_loop
 
-    ; --- Enable PAE ---
+    ; --- Enable PAE + SSE for user mode ---
+    ; OSFXSR (bit 9): without it every ring-3 SSE instruction raises #UD
+    ; (musl __init_tls uses movq/punpcklqdq). OSXMMEXCPT (bit 10): route
+    ; SIMD FP exceptions to #XM instead of #UD.
     mov eax, cr4
-    or eax, 1 << 5
+    or eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
 
     ; --- Load CR3 with PML4 ---

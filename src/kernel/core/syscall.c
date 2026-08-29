@@ -1,4 +1,5 @@
 #include "core/syscall.h"
+#include "core/syscall_lnx.h"
 #include "core/process.h"
 #include "drivers/vga.h"
 #include "drivers/keyboard.h"
@@ -25,6 +26,9 @@ void syscall_init(void) {
     syscall_register(SYS_GFX_RECT, sys_gfx_rect);
     syscall_register(SYS_GFX_TEXT, sys_gfx_text);
     syscall_register(SYS_KEY_POLL, sys_key_poll);
+
+    /* Enable the Linux-ABI `syscall` instruction path (Phase 0) */
+    syscall_lnx_init();
 }
 
 void syscall_register(syscall_num_t num, syscall_handler_t handler) {

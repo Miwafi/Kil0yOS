@@ -213,10 +213,12 @@ int rtl8139_init(void) {
     outb(io_base + RTL8139_REG_CR, CR_RE | CR_TE);
 
     /* Register IRQ handler */
-    if (dev->irq != 0 && dev->irq != 0xFF) {
+    if (dev->irq != 0 && dev->irq < 16) {
         rtl_irq = dev->irq;
         register_irq_handler(dev->irq, rtl8139_irq_handler);
         pic_enable_irq(dev->irq);
+    } else {
+        rtl_irq = 0; /* unknown line: polling mode via g_netif.poll */
     }
 
     g_netif.send = rtl8139_send;

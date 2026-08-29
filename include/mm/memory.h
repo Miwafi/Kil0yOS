@@ -49,6 +49,7 @@ void vmm_init(void);
 void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 void vmm_unmap_page(uint64_t virt);
 uint64_t vmm_get_phys(uint64_t virt);
+uint64_t vmm_get_pte(uint64_t virt);
 void vmm_reload_cr3(void);
 
 /* --- Panic / Assert --- */

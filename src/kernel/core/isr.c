@@ -14,6 +14,10 @@
 void (*irq_handlers[16])(interrupt_frame_t*) = {0};
 
 void register_irq_handler(uint8_t irq, void (*handler)(interrupt_frame_t*)) {
+    /* PCI interrupt lines on bridges / UEFI-firmware machines can be
+     * programmed with values outside 0-15 - refuse them instead of
+     * writing past this array (delayed memory corruption). */
+    if (irq >= 16) return;
     irq_handlers[irq] = handler;
 }
 
@@ -133,6 +137,27 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
         utohex(cr2, buf);
         ex_serial_puts(buf);
     }
+
+    /* Ring-3 fault: dump the user stack (kernel shares the address space)
+     * so the return address pushed by a wild `call` is visible. */
+    if ((frame->cs & 3) == 3) {
+        ex_serial_puts("\n[USTACK] rsp");
+        const uint64_t* sp = (const uint64_t*)(frame->rsp & ~7ULL);
+        for (int i = 0; i < 8; i++) {
+            ex_serial_puts(i == 0 ? "=" : " ");
+            utohex(sp[i], buf);
+            ex_serial_puts(buf);
+        }
+        /* TEMPORARY Phase 0 debug: verify loaded text vs file bytes.
+         * Expected at 0x10003950 (hello-lnx): e8 24 fe ff ff */
+        const uint8_t* probe = (const uint8_t*)0x10003940ULL;
+        ex_serial_puts("\n[TEXT@10003940]");
+        for (int i = 0; i < 24; i++) {
+            static const char hx[] = "0123456789abcdef";
+            ex_serial_putc(hx[probe[i] >> 4]);
+            ex_serial_putc(hx[probe[i] & 0xF]);
+        }
+    }
     ex_serial_puts("\n");
 
     /* Also show on VGA for interactive debugging */
@@ -151,6 +176,32 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
         vga_puthex(cr2);
     }
     vga_puts("\n");
+
+    /* TEMPORARY Phase 0 debug: hardware single-step tracer for ring 3.
+     * jump_to_user() sets TF; each #DB logs the user RIP to serial and
+     * re-arms TF until the step budget is exhausted. */
+    if (frame->interrupt_number == 1) {
+        if ((frame->cs & 3) == 3) {
+            static int dbcnt = 0;
+            if (dbcnt++ < 100000) {
+                char b[19];
+                ex_serial_puts("[db ");
+                utohex(frame->rip, b);
+                ex_serial_puts(b);
+                utohex(frame->rsp, b);
+                ex_serial_puts(" ");
+                ex_serial_puts(b);
+                ex_serial_puts("]\n");
+                frame->rflags |= 0x100;
+            } else {
+                frame->rflags &= ~0x100ULL;
+            }
+            return (uint64_t)frame;
+        }
+        /* TF leaked into ring 0: clear it and carry on */
+        frame->rflags &= ~0x100ULL;
+        return (uint64_t)frame;
+    }
 
     /* Fault from ring 3: kill the offending user process and resume the
      * kernel main task (shell) instead of freezing the whole machine.

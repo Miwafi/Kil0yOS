@@ -2,6 +2,61 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.10.0] - 2026-08-30
+This release completes **Phase 0 of the Linux compatibility roadmap** (M0 milestone): Kil0yOS can now load and run static Linux x86-64 ELF binaries — a `musl-gcc -static` hello world runs end-to-end, performing the full musl runtime initialization (`arch_prctl(SET_FS)`, `set_tid_address`, `mmap`, `brk`, ...) and exiting cleanly via `exit_group` back to the shell. This required an ELF64 loader, a per-process user VM manager, a native `syscall`-instruction ABI with a Linux-compatible handler table, and three deep CPU/virtual-memory fixes (EFER.NXE, huge-page split attribute, CR4.OSFXSR). Also includes the previously uncommitted network/timer hardening from the ping-debugging sessions: unified PIT clock, e1000/E1000E flash-NVM support, VID:DID-only NIC matching, and 1-second ping pacing.
+
+### Added
+- **ELF64 loader** (`elf.c` / `elf.h`): parses ELF header + program headers, maps `PT_LOAD` segments into the user address space, zeroes `p_memsz > p_filesz` (BSS), honors `PT_TLS` layout, and returns the entry point plus `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ` auxv data. The legacy KIL0-header and raw-binary paths remain and are auto-detected by magic.
+- **User VM manager** (`uvm.c` / `uvm.h`): per-process region bookkeeping (`vm_region_t` in the PCB) over the shared kernel page tables. Provides `uvm_map_range` (allocates fresh frames, NX by default for non-exec pages, merges overlapping USER mappings), `uvm_unmap_range`, `uvm_change_prot`, an anonymous `mmap` bump arena (`UVM_MMAP_BASE`), and the `brk` heap anchored at the page-aligned end of the ELF image.
+- **Linux-ABI syscall layer** (`syscall_lnx.c` / `syscall_lnx.h`): native `syscall`-instruction entry (MSR `EFER.SCE`, `STAR`, `LSTAR`, `FMASK`; kernel-stack switch via `syscall_kernel_rsp` because `syscall` does not use the TSS) plus a dispatch table implementing `write`/`writev` (VGA + COM1 console), `read`, `mmap`/`munmap`/`mprotect`, `brk`, `getpid`/`gettid`, `uname`, `getuid`/`getgid`/`geteuid`/`getegid`, `clock_gettime`, `arch_prctl(ARCH_SET_FS)` (FS_BASE MSR), `set_tid_address`, `getrandom`, `ioctl` (TTY defaults), `exit`/`exit_group`, and stubs for `rt_sigaction`/`rt_sigprocmask`/`set_robust_list`/`futex` — enough for musl's full single-threaded runtime init with no `ENOSYS`.
+- **Unified exec path (Phase 0.6)** (`exec_load_program`): one code path for ELF64 / KIL0-header / raw binaries; lays out `argc/argv/envp/auxv` on the user stack Linux-style and supports `exec <prog> [args...]` from the shell. The old inline exec logic in `shell.c` (~120 lines) was replaced by a call into it.
+- **Test probes embedded in the image**: `/bin/mini` (freestanding write/exit_group probe) and `/bin/mmt` (brk 1 MiB grow/roundtrip/shrink + 64 KiB anonymous mmap + mprotect RO↔RW + munmap — the Phase 0.2/0.3/0.4 acceptance checks). Both built with `-nostdlib -fno-builtin` and `.incbin`-embedded; `/bin/hello-lnx` (musl static) is added when `musl-gcc` is available.
+- **`tools/lnx_qemu_test.py`**: headless QEMU regression — boots the ISO, types `exec /bin/<prog>` sequences via the monitor, and prints serial + qemu `-d int` logs (used to verify mini/mmt/hello-lnx with zero exceptions and three clean exits). Plus `tools/elf_qemu_test.py` and the ping diagnostic helpers (`ping_qemu_test.py`, `run_ping_diag*.sh`) from the network sessions.
+- **`ROADMAP_LINUX_COMPAT.md`**: the full Linux-compatibility plan (Phase 0–4, from ELF loader to `apt install`); Phase 0 is now complete.
+- **e1000/E1000E (82574L/82574LA) support**: device IDs `0x10D3`/`0x10F6` accepted; flash-backed NVM parts get their MAC word-by-word through `EERD` when RAL/RAH are empty, an `EE_RST` kick after global reset, and the driver waits for `EECD.AUTO_RD` (warn-and-continue on VMs that never set it).
+- **PCI tree boot log**: one line per device (`[pci] 000:03.0 8086:100e 0200`) so the whole PCI topology is visible on any machine.
+
+### Fixed
+- **User pages mapped to nonexistent physical memory (CRITICAL, killed ELF exec)**: `vmm_map_page()` split 2 MB identity huge pages into 4 KB entries marked `VMM_USER`, so `uvm_map_range()` mistook the identity aliases for legitimate user mappings and reused their physical addresses — the user stack at VA `0x7fffe000` aliased PA `0x7fffe000`, which does not exist in a 512 MB guest (writes vanished, auxv read as zeros, musl returned into RIP=0). Identity-alias entries are now supervisor-only, so user mappings always get fresh frames.
+- **Reserved-bit #PF on every non-exec user page (CRITICAL)**: `uvm` sets the NX bit (PTE bit 63) on non-executable user pages, but `EFER.NXE` was never enabled — with NXE=0 the CPU treats that bit as reserved and raises #PF err=0xa on first access. `vmm_init()` now sets `EFER.NXE` and reloads CR3.
+- **Ring-3 SSE raised #UD (CRITICAL for musl)**: `__init_tls` uses SSE (`movq rax,xmm0` / `punpcklqdq`), but `CR4.OSFXSR`/`OSXMMEXCPT` were never set, so the first SSE instruction in user mode faulted with #UD. Both boot.asm and the AP trampoline now enable bits 9+10 of CR4.
+- **Kernel clock ran slow / dual-clock inconsistency**: `pit_uptime_us()` polled the PIT countdown register with wrap-detection that under-counted (10x slow clock), and interrupt context saw the polling clock while mainline saw the tick clock — ARP entries appeared to expire instantly. After boot, one clock source is used everywhere: the IRQ0 tick clock, anchored once to the polling clock at `kernel_main` so uptime never jumps backwards; sub-tick resolution comes from the countdown register.
+- **`ping` fired requests as fast as the NIC allowed**: replies are now awaited against a `pit_uptime_us()` deadline with NIC polling, and each request is paced to a 1-second period like real ping.
+- **VMware e1000 (82545EM) rejected by class filter**: `netif_probe()` matched NICs by PCI class (`0200`), but VMware's e1000 reports subclass `0x10`. Matching is now VID:DID-only (RTL8139 0x10EC:0x8139; e1000 0x8086:0x100E/0x100F/0x10D3/0x10F6), and unsupported network-class devices are logged with their identity (e.g. vmxnet3) instead of being skipped silently.
+- **NIC IRQ handlers registered for invalid lines**: `register_irq_handler`/`pic_enable_irq` guarded to `< 16`; unknown PCI interrupt lines (0/0xFF) fall back to pure RX polling via `g_netif.poll`.
+- **e1000 diagnostics**: failed BAR composition and reset timeouts now log a reason instead of silently returning -1.
+
+### Changed
+- Version strings bumped to 2.10.0 (boot banner, `version` command, GUI title bar).
+- `pcap_dump.py` decodes ARP/ICMP/UDP flows with relative timestamps.
+- `.gitignore` adds `LinuxSample/`.
+- Scheduler samples the user-mode RIP/RSP once every 64 ticks to serial (temporary bring-up aid).
+
+### File Changes
+- `include/core/elf.h`, `src/kernel/core/elf.c`: ELF64 loader (new)
+- `include/core/uvm.h`, `src/kernel/core/uvm.c`: user VM manager (new)
+- `include/core/syscall_lnx.h`, `src/kernel/core/syscall_lnx.c`: Linux-ABI syscall layer (new)
+- `src/kernel/core/isr.asm`: `syscall_lnx_entry` — native `syscall` entry stub
+- `src/kernel/core/process.c`, `include/core/process.h`: PCB VM regions, unified `exec_load_program`, argv/envp/auxv layout, `/bin/mini` + `/bin/mmt` install
+- `src/kernel/core/syscall.c`: hook `syscall_lnx_init()`
+- `src/kernel/mm/memory.c`, `include/mm/memory.h`: EFER.NXE, supervisor-only huge-page split, `vmm_get_pte()`
+- `src/boot/boot.asm`, `src/kernel/core/ap_trampoline.asm`: CR4 OSFXSR/OSXMMEXCPT
+- `src/kernel/timer/pit.c`, `src/kernel/core/main.c`: unified uptime clock
+- `src/kernel/net/icmp.c`: ping deadline + 1 s pacing
+- `src/kernel/net/e1000.c`, `include/net/e1000.h`: E1000E support, EERD MAC, diagnostics
+- `src/kernel/net/netif.c`, `src/kernel/net/rtl8139.c`, `src/kernel/core/interrupts.c`: VID:DID matching, IRQ guards, polling fallback
+- `src/kernel/drivers/pci.c`: PCI tree boot log
+- `src/kernel/shell/shell.c`: `exec` via unified path with args, version bump
+- `src/kernel/sched/scheduler.c`: user RIP sampling (temporary)
+- `user/elf/mini.c`, `user/elf/mmt.c`, `user/elf/hello.c`: test probes + musl hello (new)
+- `Makefile`: ELF probe builds (musl + freestanding), blob embedding
+- `tools/lnx_qemu_test.py`, `tools/elf_qemu_test.py`, `tools/ping_qemu_test.py`, `tools/run_ping_diag.sh`, `tools/run_ping_diag2.sh`, `tools/pcap_dump.py`: test/diagnostic tooling
+- `ROADMAP_LINUX_COMPAT.md`: Linux compatibility roadmap (new)
+- `CHANGELOG.md`: this entry
+
+### Notes
+- Regression (`tools/lnx_qemu_test.py /bin/mini /bin/mmt /bin/hello-lnx`, QEMU headless): `MINI OK`, `MM OK`, `hello from musl static ELF on Kil0yOS!` + `argc=1 argv0=/bin/hello-lnx` + `write(2) works`, **zero CPU exceptions**, three clean `exit_group`s with the shell recovered after each — the Phase 0 M0 milestone.
+
 ## [2.9.0] - 2026-08-29
 This release adds the first Ring 3 game: a built-in Pong with an AI opponent, backed by new graphics/keyboard system calls and an automated headless-QEMU regression harness. Along the way it fixes a boot crash under QEMU's default e1000 NIC (BAR composition), and a user-program entry-point mislink that made any raw binary whose `_start` was not the first linked function jump to garbage.
 

@@ -360,6 +360,23 @@ void vmm_init(void) {
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     vmm_pml4 = (uint64_t*)(cr3 & ~0xFFF);
+
+    /* Enable EFER.NXE: user mappings set NX (PTE bit 63) on non-executable
+     * pages via uvm prot_to_pte(). With NXE=0 the CPU treats that bit as
+     * RESERVED and every access to such a page raises #PF with err=0xa
+     * (reserved-bit violation) instead of honoring the mapping. */
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080ULL));
+        uint64_t efer = ((uint64_t)hi << 32) | lo;
+        if (!(efer & (1ULL << 11))) {
+            efer |= 1ULL << 11;
+            lo = (uint32_t)efer;
+            hi = (uint32_t)(efer >> 32);
+            __asm__ volatile("wrmsr" :: "c"(0xC0000080ULL), "a"(lo), "d"(hi));
+            vmm_reload_cr3();
+        }
+    }
 }
 
 void vmm_reload_cr3(void) {
@@ -369,7 +386,8 @@ void vmm_reload_cr3(void) {
 }
 
 static inline uint64_t vmm_make_entry(uint64_t phys, uint64_t flags) {
-    return (phys & ~0xFFF) | (flags & 0xFFF) | VMM_PRESENT;
+    /* NX lives on bit 63, outside the 12-bit attribute window */
+    return (phys & ~0xFFF) | (flags & 0xFFF) | (flags & VMM_NX) | VMM_PRESENT;
 }
 
 void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
@@ -418,10 +436,16 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
                 uint64_t new_pt = pmm_alloc_page();
                 if (!new_pt) PANIC("vmm_map_page: out of memory splitting huge page");
 
-                /* Fill the page table with 4KB entries mapping the same physical memory */
+                /* Fill the page table with 4KB entries mapping the same
+                 * physical memory. These stay SUPERVISOR-only: they are the
+                 * identity-map aliases, not user mappings. Marking them USER
+                 * made uvm_map_range() mistake them for legitimate user
+                 * pages and hand out identity physical addresses (e.g. VA
+                 * 0x7fffe000 -> PA 0x7fffe000, which does not even exist)
+                 * as user stack memory. */
                 uint64_t* pt_entries = (uint64_t*)new_pt;
                 for (int i = 0; i < 512; i++) {
-                    pt_entries[i] = vmm_make_entry(huge_phys + i * PAGE_SIZE, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+                    pt_entries[i] = vmm_make_entry(huge_phys + i * PAGE_SIZE, VMM_PRESENT | VMM_WRITABLE);
                 }
 
                 /* Replace the huge page with the page table */
@@ -470,6 +494,27 @@ void vmm_unmap_page(uint64_t virt) {
     uint64_t pti = (virt >> 12) & 0x1FF;
     pt[pti] = 0;
     vmm_reload_cr3();
+}
+
+/* Raw PTE of a 4KB mapping (0 if any walk level is absent). Used by the
+ * user VM manager to merge protection bits across overlapping PT_LOADs. */
+uint64_t vmm_get_pte(uint64_t virt) {
+    if (!vmm_pml4) return 0;
+
+    uint64_t pml4i = (virt >> 39) & 0x1FF;
+    if (!(vmm_pml4[pml4i] & VMM_PRESENT)) return 0;
+
+    uint64_t* pdpt = (uint64_t*)(vmm_pml4[pml4i] & ~0xFFF);
+    uint64_t pdpti = (virt >> 30) & 0x1FF;
+    if (!(pdpt[pdpti] & VMM_PRESENT)) return 0;
+
+    uint64_t* pd = (uint64_t*)(pdpt[pdpti] & ~0xFFF);
+    uint64_t pdi = (virt >> 21) & 0x1FF;
+    if (!(pd[pdi] & VMM_PRESENT)) return 0;
+    if (pd[pdi] & VMM_HUGE) return pd[pdi];
+
+    uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
+    return pt[(virt >> 12) & 0x1FF];
 }
 
 uint64_t vmm_get_phys(uint64_t virt) {

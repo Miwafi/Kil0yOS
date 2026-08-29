@@ -54,9 +54,9 @@ ap_pmode:
     mov es, ax
     mov ss, ax
 
-    ; Enable PAE
+    ; Enable PAE + SSE (OSFXSR/OSXMMEXCPT, matches boot.asm)
     mov eax, cr4
-    or eax, 0x20
+    or eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
 
     ; Load PML4

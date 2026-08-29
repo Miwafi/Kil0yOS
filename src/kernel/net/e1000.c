@@ -2,6 +2,7 @@
 #include "net/netif.h"
 #include "drivers/pci.h"
 #include "drivers/io.h"
+#include "drivers/vga.h"
 #include "mm/memory.h"
 #include "core/interrupts.h"
 #include "core/isr.h"
@@ -9,7 +10,9 @@
 
 #define E1000_CTRL      0x00000
 #define E1000_STATUS    0x00008
+#define E1000_EECD      0x00010
 #define E1000_EERD      0x00014
+#define E1000_CTRL_EXT  0x00018
 #define E1000_ICR       0x000C0
 #define E1000_IMS       0x000D0
 #define E1000_RCTL      0x00100
@@ -30,6 +33,9 @@
 
 #define CTRL_RST        (1 << 26)
 #define CTRL_SLU        (1 << 6)
+
+#define EECD_AUTO_RD    0x00000200 /* NVM auto-read done (MAC in RAL/RAH) */
+#define CTRL_EXT_EE_RST 0x00002000 /* Reinitialize from EEPROM/flash */
 
 #define RCTL_EN         (1 << 1)
 #define RCTL_SBP        (1 << 2)
@@ -99,6 +105,25 @@ static inline void e1000_write(uint32_t reg, uint32_t val) {
 }
 
 static void e1000_get_mac_internal(uint8_t* mac);
+
+static void e1000_get_mac_eerd(uint8_t* mac) {
+    /* 82574L (E1000E) leaves RA empty after reset - the MAC lives in
+     * flash and must be fetched word-by-word through EERD:
+     * bit0=start, bits15:8=word index, bit1=done, bits31:16=data */
+    for (int i = 0; i < 3; i++) {
+        e1000_write(E1000_EERD, 0x1 | (i << 8));
+        int t = 100000;
+        /* done bit differs by generation: 8257x = bit1, 8254x = bit4 */
+        while (!(e1000_read(E1000_EERD) & 0x12)) {
+            if (--t <= 0) break;
+            __asm__ volatile("pause");
+        }
+        uint32_t v = e1000_read(E1000_EERD) >> 16;
+        mac[i * 2] = v & 0xFF;
+        mac[i * 2 + 1] = (v >> 8) & 0xFF;
+    }
+}
+
 void e1000_rx_poll(void);
 
 static void e1000_get_mac_internal(uint8_t* mac) {
@@ -110,6 +135,10 @@ static void e1000_get_mac_internal(uint8_t* mac) {
     mac[3] = (ral >> 24) & 0xFF;
     mac[4] = rah & 0xFF;
     mac[5] = (rah >> 8) & 0xFF;
+    if ((ral | rah) == 0) {
+        /* Empty RA: 82574L loads its MAC from flash via EERD instead */
+        e1000_get_mac_eerd(mac);
+    }
 }
 
 static void e1000_irq_handler(interrupt_frame_t* frame) {
@@ -195,6 +224,8 @@ int e1000_send(const uint8_t* data, uint16_t len) {
 int e1000_init(void) {
     pci_device_t* dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID);
     if (!dev) dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID_82545);
+    if (!dev) dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID_82574);
+    if (!dev) dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID_82574LA);
     if (!dev) return -1;
 
     /* Enable bus mastering and memory space access */
@@ -210,12 +241,21 @@ int e1000_init(void) {
      * as the upper half - composing it blindly turns e.g. QEMU's
      * 82540EM I/O BAR (0x0000c001) into a non-canonical pointer and
      * #GPs on the first MMIO read. */
-    if (bar0_raw == 0 || bar0_raw == 0xFFFFFFFF) return -1;
-    if (bar0_raw & 0x1) return -1; /* I/O-space BAR: no MMIO access */
+    if (bar0_raw == 0 || bar0_raw == 0xFFFFFFFF) {
+        klog("[e1000] bad BAR0\n");
+        return -1;
+    }
+    if (bar0_raw & 0x1) {
+        klog("[e1000] BAR0 is I/O space, no MMIO access\n");
+        return -1;
+    }
 
     uint64_t bar = bar0_raw & ~0xFULL;
     if ((bar0_raw & 0x6) == 0x4) { /* 64-bit memory BAR */
-        if (bar1 == 0xFFFFFFFF) return -1;
+        if (bar1 == 0xFFFFFFFF) {
+            klog("[e1000] bad BAR1\n");
+            return -1;
+        }
         bar |= ((uint64_t)(bar1 & ~0xFULL)) << 32;
     }
 
@@ -223,10 +263,28 @@ int e1000_init(void) {
 
     /* Software reset */
     e1000_write(E1000_CTRL, e1000_read(E1000_CTRL) | CTRL_RST);
+    /* flash-backed NVM parts (82574 "E1000E") also need the EEPROM
+     * reinit kick after the global reset (Linux e1000e: EE_RST) */
+    e1000_write(E1000_CTRL_EXT, e1000_read(E1000_CTRL_EXT) | CTRL_EXT_EE_RST);
     int timeout = 100000;
     while (e1000_read(E1000_CTRL) & CTRL_RST) {
-        if (--timeout <= 0) return -1;
+        if (--timeout <= 0) {
+            klog("[e1000] reset timeout\n");
+            return -1;
+        }
         __asm__ volatile("pause");
+    }
+
+    /* Wait for the NVM auto-read that loads the MAC into RAL/RAH
+     * (Linux e1000e: e1000e_get_auto_rd_done). Virtual machines may
+     * never set the bit - warn and continue rather than fail. */
+    timeout = 50000; /* ~50ms via io_wait() */
+    while (!(e1000_read(E1000_EECD) & EECD_AUTO_RD)) {
+        if (--timeout <= 0) {
+            klog("[e1000] NVM auto-read not done (continuing)\n");
+            break;
+        }
+        io_wait();
     }
 
     /* Set link up */
@@ -244,6 +302,33 @@ int e1000_init(void) {
     /* Read MAC and write back to RA with AV=1 */
     uint8_t mac[6];
     e1000_get_mac_internal(mac);
+    {
+        char buf[80];
+        static const char hex[] = "0123456789abcdef";
+        char* p = buf;
+        const char* s = "[e1000] 8086:";
+        while (*s) *p++ = *s++;
+        uint16_t did = (uint16_t)(dev->device_id & 0xFFFF);
+        for (int i = 3; i >= 0; i--) *p++ = hex[(did >> (i * 4)) & 0xF];
+        s = " at 0:";
+        while (*s) *p++ = *s++;
+        *p++ = '0' + dev->bus; *p++ = ':';
+        *p++ = '0' + dev->device; *p++ = ':';
+        *p++ = '0' + dev->function;
+        s = " mac=";
+        while (*s) *p++ = *s++;
+        for (int i = 0; i < 6; i++) {
+            *p++ = hex[(mac[i] >> 4) & 0xF];
+            *p++ = hex[mac[i] & 0xF];
+            if (i < 5) *p++ = ':';
+        }
+        s = " irq=0x";
+        while (*s) *p++ = *s++;
+        *p++ = hex[(dev->irq >> 4) & 0xF];
+        *p++ = hex[dev->irq & 0xF];
+        *p++ = '\n'; *p = 0;
+        klog(buf);
+    }
     for (int i = 0; i < 6; i++) {
         g_netif.mac[i] = mac[i];
     }
@@ -316,10 +401,14 @@ int e1000_init(void) {
     e1000_write(E1000_RDTR, 0);
     e1000_write(E1000_IMS, (1 << 6)); /* RXT0 */
 
-    if (dev->irq != 0 && dev->irq != 0xFF) {
+    if (dev->irq != 0 && dev->irq < 16) {
         e1000_irq = dev->irq;
         register_irq_handler(dev->irq, e1000_irq_handler);
         pic_enable_irq(dev->irq);
+    } else {
+        /* Line unknown (e.g. 0xFF) or out of PIC range: run in pure
+         * polling mode - the RX poll in the socket wait loops covers it. */
+        e1000_irq = 0;
     }
 
     g_netif.send = e1000_send;

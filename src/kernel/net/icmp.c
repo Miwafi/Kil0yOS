@@ -64,16 +64,28 @@ int icmp_ping(netif_t* iface, uint32_t target_ip, uint16_t seq, uint32_t timeout
     ping_seq = seq;
     ping_peer = target_ip;
 
+    uint64_t start = pit_uptime_us();
+    uint64_t deadline = start + (uint64_t)timeout_ms * 1000ULL;
+
     if (ipv4_transmit(iface, target_ip, IP_PROTO_ICMP, buf, total_len) < 0) {
         return -1;
     }
 
-    uint32_t waited = 0;
-    while (waited < timeout_ms) {
-        if (ping_reply) return 0;
+    /* Wait for the reply, polling the NIC (works with and without a
+     * working interrupt line). */
+    while (pit_uptime_us() < deadline) {
+        if (ping_reply) break;
         netif_poll();
         pit_delay_ms(10);
-        waited += 10;
     }
-    return -1;
+
+    /* Real ping paces one request per second: pad a fast reply so the
+     * next request goes out ~1s after this one was sent. */
+    uint64_t min_period = 1000000ULL; /* 1s */
+    while (pit_uptime_us() - start < min_period) {
+        netif_poll();
+        pit_delay_ms(10);
+    }
+
+    return ping_reply ? 0 : -1;
 }

@@ -29,6 +29,18 @@ typedef enum {
 /* User program header format */
 #define USER_MAGIC       0x4B494C30      /* "KIL0" */
 
+/* Per-process user VM regions (ELF segments, brk heap, mmap arena, stack).
+ * The whole user address space lives in the shared kernel page tables, so
+ * regions exist only to track ownership for syscalls and teardown. */
+#define MAX_VM_REGIONS 24
+
+typedef struct {
+    int used;
+    uint64_t start;   /* first mapped byte */
+    uint64_t end;     /* one past last mapped byte */
+    uint32_t prot;    /* UVM_PROT_* */
+} vm_region_t;
+
 typedef struct user_program_header {
     uint32_t magic;           /* Must be USER_MAGIC */
     uint32_t entry_offset;    /* Entry point offset from code base */
@@ -48,11 +60,19 @@ typedef struct process {
     uint64_t code_base;
     uint64_t data_base;
     uint64_t stack_top;
-    uint32_t code_pages;      /* mapped code page count */
+    uint32_t code_pages;      /* mapped code page count (raw binary path) */
     uint32_t stack_pages;     /* mapped stack page count */
+
+    /* User VM (ELF / mmap / brk bookkeeping) */
+    vm_region_t regions[MAX_VM_REGIONS];
+    uint64_t brk_start;       /* heap base = page-aligned end of ELF image */
+    uint64_t brk_cur;         /* current program break */
+    uint64_t mmap_top;        /* bump allocator top of the mmap arena */
+    uint64_t fs_base;         /* ARCH_SET_FS value (TLS pointer) */
 
     /* Execution context */
     uint64_t entry_point;
+    uint64_t user_rsp;        /* initial user RSP (ELF path: argc/auxv block) */
     uint64_t kernel_stack;    /* Kernel stack for syscalls */
 
     /* Scheduling */
@@ -98,5 +118,15 @@ int process_check_user_range(uint64_t uaddr, size_t len);
 
 /* Load program from file system */
 int load_user_program(const char* path);
+
+/* Unified exec path (Phase 0.6): detects ELF64 / KIL0 / raw binary,
+ * builds the process, and lays out argc/argv/envp/auxv on the user stack.
+ * argv points to kernel strings. Returns the new pid or -1. */
+int exec_load_program(const char* path, char* const* argv, int argc);
+
+/* Top of the current process's kernel stack; the Linux-ABI `syscall`
+ * entry switches to it because the syscall instruction does not load
+ * RSP0 from the TSS the way an interrupt does. */
+extern uint64_t syscall_kernel_rsp;
 
 #endif

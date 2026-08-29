@@ -86,6 +86,40 @@ void pci_init() {
                     dev->next = pci_devices;
                     pci_devices = dev;
 
+                    /* One line per device: lets the boot log reveal the
+                     * whole PCI tree on any machine (VMware/QEMU/hw). */
+                    {
+                        char buf[64];
+                        static const char hex[] = "0123456789abcdef";
+                        char* p = buf;
+                        const char* s = "[pci] ";
+                        while (*s) *p++ = *s++;
+                        *p++ = '0' + (bus / 100);
+                        *p++ = '0' + ((bus / 10) % 10);
+                        *p++ = '0' + (bus % 10);
+                        *p++ = ':';
+                        *p++ = hex[(device >> 4) & 0xF];
+                        *p++ = hex[device & 0xF];
+                        *p++ = '.';
+                        *p++ = '0' + function;
+                        *p++ = ' ';
+                        *p++ = hex[(vendor_id >> 12) & 0xF];
+                        *p++ = hex[(vendor_id >> 8) & 0xF];
+                        *p++ = hex[(vendor_id >> 4) & 0xF];
+                        *p++ = hex[vendor_id & 0xF];
+                        *p++ = ':';
+                        *p++ = hex[(device_id >> 12) & 0xF];
+                        *p++ = hex[(device_id >> 8) & 0xF];
+                        *p++ = hex[(device_id >> 4) & 0xF];
+                        *p++ = hex[device_id & 0xF];
+                        *p++ = ' ';
+                        *p++ = hex[(class_code >> 4) & 0xF];
+                        *p++ = hex[class_code & 0xF];
+                        *p++ = hex[(subclass_code >> 4) & 0xF];
+                        *p++ = hex[subclass_code & 0xF];
+                        *p = 0;
+                        klog(buf);
+                    }
                 }
             }
         }

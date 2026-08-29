@@ -44,13 +44,32 @@ uint32_t netif_get_ip(void) {
 const char* netif_probe(void) {
     pci_device_t* dev = pci_get_device_list();
     while (dev) {
-        if (dev->class_code == 0x02 && dev->subclass_code == 0x00) {
-            if (dev->vendor_id == 0x10EC && dev->device_id == 0x8139) {
-                if (rtl8139_init() == 0) return "RTL8139";
-            } else if (dev->vendor_id == 0x8086 &&
-                       (dev->device_id == 0x100E || dev->device_id == 0x100F)) {
-                if (e1000_init() == 0) return "E1000";
-            }
+        const char* drv = NULL;
+        /* Match by VID:DID only - never by class. VMware's e1000 (82545EM)
+         * reports class 0210 (subclass 0x10), not 0200, so a class filter
+         * silently rejects a NIC we fully support. */
+        if (dev->vendor_id == 0x10EC && dev->device_id == 0x8139) {
+            if (rtl8139_init() == 0) drv = "RTL8139";
+        } else if (dev->vendor_id == 0x8086 &&
+                   (dev->device_id == 0x100E || dev->device_id == 0x100F ||
+                    dev->device_id == 0x10D3 || dev->device_id == 0x10F6)) {
+            if (e1000_init() == 0) drv = "E1000";
+        }
+        if (drv) return drv;
+
+        /* Network-class device we could not drive: report its identity
+         * so the user knows what is missing (e.g. vmxnet3). */
+        if (dev->class_code == 0x02) {
+            char buf[40];
+            const char hex[] = "0123456789abcdef";
+            char* p = buf;
+            const char* s = "[net] unsupported NIC ";
+            while (*s) *p++ = *s++;
+            for (int i = 0; i < 4; i++) *p++ = hex[(dev->vendor_id >> (12 - i * 4)) & 0xF];
+            *p++ = ':';
+            for (int i = 0; i < 4; i++) *p++ = hex[(dev->device_id >> (12 - i * 4)) & 0xF];
+            *p++ = '\n'; *p = 0;
+            klog(buf);
         }
         dev = dev->next;
     }

@@ -21,7 +21,10 @@ CORE_SRCS = $(SRCDIR)/kernel/core/main.c \
             $(SRCDIR)/kernel/core/smp.c \
             $(SRCDIR)/kernel/core/tss.c \
             $(SRCDIR)/kernel/core/process.c \
-            $(SRCDIR)/kernel/core/syscall.c
+            $(SRCDIR)/kernel/core/uvm.c \
+            $(SRCDIR)/kernel/core/elf.c \
+            $(SRCDIR)/kernel/core/syscall.c \
+            $(SRCDIR)/kernel/core/syscall_lnx.c
 
 # --- Memory Management ---
 MM_SRCS = $(SRCDIR)/kernel/mm/memory.c
@@ -95,6 +98,51 @@ USER_BLOB_OBJS = $(patsubst %, $(BUILDDIR)/user_blob_%.o, $(USER_PROGRAMS))
 
 all: iso
 
+# --- Linux-ABI ELF programs (musl static, Phase 0 acceptance test) ---
+# Built only when musl-gcc is available (PATH or ~/musl/bin, WSL);
+# embedded as /bin/hello-lnx. Must stay AFTER the 'all' target.
+MUSL_GCC := $(shell command -v musl-gcc 2>/dev/null)
+ifeq ($(MUSL_GCC),)
+  ifneq ($(wildcard $(HOME)/musl/bin/musl-gcc),)
+    MUSL_GCC := $(HOME)/musl/bin/musl-gcc
+  endif
+endif
+LNX_USER_PROGRAMS := $(if $(MUSL_GCC),hello-lnx,)
+LNX_BLOB_OBJS := $(patsubst %, $(BUILDDIR)/user_blob_%.o, $(LNX_USER_PROGRAMS))
+.SECONDARY: $(BUILDDIR)/user/hello-lnx
+
+$(BUILDDIR)/user/hello-lnx: user/elf/hello.c
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) -static -no-pie -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
+
+$(BUILDDIR)/user_blob_hello-lnx.o: $(BUILDDIR)/user/hello-lnx
+	printf 'section .rodata\nglobal user_hello_lnx_start\nuser_hello_lnx_start:\nincbin "%s"\nglobal user_hello_lnx_end\nuser_hello_lnx_end:\n' '$<' > $(BUILDDIR)/user_blob_hello-lnx.s
+	$(AS) -f elf64 $(BUILDDIR)/user_blob_hello-lnx.s -o $@
+
+# --- mini: freestanding Linux-ABI syscall probe (no libc needed) ---
+.SECONDARY: $(BUILDDIR)/user/mini
+MINI_BLOB_OBJ := $(BUILDDIR)/user_blob_mini.o
+
+$(BUILDDIR)/user/mini: user/elf/mini.c
+	@mkdir -p $(dir $@)
+	$(CC) -static -no-pie -nostdlib -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
+
+$(BUILDDIR)/user_blob_mini.o: $(BUILDDIR)/user/mini
+	printf 'section .rodata\nglobal user_mini_start\nuser_mini_start:\nincbin "%s"\nglobal user_mini_end\nuser_mini_end:\n' '$<' > $(BUILDDIR)/user_blob_mini.s
+	$(AS) -f elf64 $(BUILDDIR)/user_blob_mini.s -o $@
+
+# --- mmt: freestanding brk/mmap/mprotect acceptance probe (no libc) ---
+.SECONDARY: $(BUILDDIR)/user/mmt
+MMT_BLOB_OBJ := $(BUILDDIR)/user_blob_mmt.o
+
+$(BUILDDIR)/user/mmt: user/elf/mmt.c
+	@mkdir -p $(dir $@)
+	$(CC) -static -no-pie -nostdlib -fno-builtin -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
+
+$(BUILDDIR)/user_blob_mmt.o: $(BUILDDIR)/user/mmt
+	printf 'section .rodata\nglobal user_mmt_start\nuser_mmt_start:\nincbin "%s"\nglobal user_mmt_end\nuser_mmt_end:\n' '$<' > $(BUILDDIR)/user_blob_mmt.s
+	$(AS) -f elf64 $(BUILDDIR)/user_blob_mmt.s -o $@
+
 $(BUILDDIR)/user/hello.o: user/hello.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CCFLAGS) -c $< -o $@
@@ -131,8 +179,8 @@ $(BUILDDIR)/kernel/core/ap_trampoline.o: $(BUILDDIR)/ap_trampoline.bin | $(BUILD
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -I binary -O elf64-x86-64 $< $@
 
-$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS)
-	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) -o $@
+$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(LNX_BLOB_OBJS)
+	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(LNX_BLOB_OBJS) -o $@
 
 $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 	@mkdir -p $(BUILDDIR)/iso/boot/grub

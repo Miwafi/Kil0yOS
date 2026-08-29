@@ -1,25 +1,40 @@
+#!/usr/bin/env python3
+"""Dump a pcap produced by QEMU filter-dump: one line per packet."""
 import struct
 import sys
 
-data = open(sys.argv[1] if len(sys.argv) > 1 else '/tmp/net8.pcap', 'rb').read()
+path = sys.argv[1] if len(sys.argv) > 1 else '/tmp/ping_dump.pcap'
+with open(path, 'rb') as f:
+    d = f.read()
 off = 24
-n = 0
-while off + 16 <= len(data):
-    ts, tu, incl, orig = struct.unpack('<IIII', data[off:off+16])
+base = None
+while off + 16 <= len(d):
+    ts, tus, caplen, ol = struct.unpack('<IIII', d[off:off + 16])
     off += 16
-    pkt = data[off:off+incl]
-    off += incl
-    n += 1
-    print('frame %d: len=%d dst=%s src=%s type=%s' % (
-        n, incl, pkt[0:6].hex(), pkt[6:12].hex(), pkt[12:14].hex()))
-    if pkt[12:14] == b'\x08\x00':
-        iplen = (pkt[14] & 0xf) * 4
-        proto = pkt[23]
-        if proto == 17:
-            sp, dp = struct.unpack('>HH', pkt[14+iplen:18+iplen])
-            ulen = struct.unpack('>H', pkt[14+iplen+4:16+iplen+4])[0]
-            print('   UDP %d->%d len=%d' % (sp, dp, ulen))
-            # DHCP cookie check
-            payload = pkt[14+iplen+8:]
-            if len(payload) >= 240:
-                print('   DHCP magic=%s op=%d' % (payload[236:240].hex(), payload[0]))
+    pkt = d[off:off + caplen]
+    off += caplen
+    t = ts + tus / 1e6
+    if base is None:
+        base = t
+    info = 'len=%d' % caplen
+    if len(pkt) >= 14:
+        et = struct.unpack('>H', pkt[12:14])[0]
+        if et == 0x0806 and len(pkt) >= 42:
+            op = struct.unpack('>H', pkt[20:22])[0]
+            spa = '.'.join(str(b) for b in pkt[28:32])
+            tpa = '.'.join(str(b) for b in pkt[38:42])
+            info += ' ARP %s %s->%s' % ('req' if op == 1 else 'rep', spa, tpa)
+        elif et == 0x0800 and len(pkt) >= 34:
+            ip = pkt[14:]
+            ihl = (ip[0] & 0xF) * 4
+            proto = ip[9]
+            src = '.'.join(str(b) for b in ip[12:16])
+            dst = '.'.join(str(b) for b in ip[16:20])
+            if proto == 1 and len(ip) >= ihl + 8:
+                it = ip[ihl]
+                info += ' ICMP %s %s->%s' % ('req' if it == 8 else 'rep', src, dst)
+            elif proto == 17:
+                info += ' UDP %s->%s' % (src, dst)
+            else:
+                info += ' IP proto=%d %s->%s' % (proto, src, dst)
+    print('%9.3f %s' % (t - base, info))

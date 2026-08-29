@@ -12,13 +12,35 @@ static uint32_t pit_divisor = 1193;
 volatile uint64_t pit_ticks = 0;
 
 static uint16_t pit_read_counter(void);
-static uint64_t pit_elapsed_us(void);
+static uint64_t pit_poll_elapsed_us(void);
 
-/* Uptime in microseconds (same polling clock that drives the boot-log
- * timestamps). Reliable regardless of IRQ0 delivery - unlike the
- * countdown-register deltas, this path is validated by klog timing. */
+/* Uptime in microseconds. Two regimes:
+ *  - Once IRQ0 has ticked at least once (pit_ticks != 0), the tick clock
+ *    is used everywhere - including interrupt context, where pushfq would
+ *    report IF=0 and a dual-clock design would hand out a different time
+ *    than mainline code (breaks ARP timestamps, deadlines...). One clock
+ *    source after the switch point, always.
+ *  - Before the first tick (boot/DHCP with IF=0), pure polling of the
+ *    countdown register - accurate while sampled more often than a tick. */
 uint64_t pit_uptime_us(void) {
-    return pit_elapsed_us();
+    uint64_t tick_us = ((uint64_t)pit_divisor * 1000000ULL) / PIT_BASE_FREQ;
+
+    if (pit_ticks != 0) {
+        /* First tick-mode call: anchor the tick clock to the polling clock
+         * so uptime does not jump backwards when the regime switches
+         * (pit_ticks only starts counting once IRQ0 is delivered). */
+        static uint64_t base_offset = 0;
+        static int base_valid = 0;
+        if (base_valid == 0) {
+            base_valid = 1; /* reentrancy guard: set before reading */
+            base_offset = pit_poll_elapsed_us() - pit_ticks * tick_us;
+        }
+        uint16_t cur = pit_read_counter();
+        uint64_t sub = ((uint64_t)(pit_divisor - cur)) * 1000000ULL / PIT_BASE_FREQ;
+        return pit_ticks * tick_us + base_offset + sub;
+    }
+
+    return pit_poll_elapsed_us();
 }
 
 /* Elapsed microseconds since pit_init(). Pure polling of the PIT countdown
@@ -26,7 +48,7 @@ uint64_t pit_uptime_us(void) {
  * enable_interrupts()), where IRQ0 never fires and pit_ticks stays 0.
  * Resolution: one wrap detection per call, so intervals longer than one
  * PIT cycle (10 ms at 100 Hz) may under-count by a few ms. */
-static uint64_t pit_elapsed_us(void) {
+static uint64_t pit_poll_elapsed_us(void) {
     static uint16_t last_progress = 0;
     static uint64_t total_counts = 0;
 
@@ -51,7 +73,7 @@ static uint64_t pit_elapsed_us(void) {
 void pit_format_time(char* buf, size_t len) {
     if (len < 24) { buf[0] = '\0'; return; }
 
-    uint64_t usec = pit_elapsed_us();
+    uint64_t usec = pit_uptime_us();
     uint64_t sec = usec / 1000000ULL;
     uint64_t frac = usec % 1000000ULL;
 

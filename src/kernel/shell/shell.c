@@ -417,7 +417,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.9.0\n");
+    vga_puts("Kil0yOS v2.10.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -776,7 +776,7 @@ static int cmd_gui(int argc, char** argv) {
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.9.0", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.10.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);
@@ -1076,7 +1076,7 @@ static int cmd_net(int argc, char** argv) {
 
 static int cmd_exec(int argc, char** argv) {
     if (argc < 2) {
-        vga_puts("Usage: exec <program>\n");
+        vga_puts("Usage: exec <program> [args...]\n");
         vga_puts("Example: exec /bin/hello.bin\n");
         return 1;
     }
@@ -1088,126 +1088,27 @@ static int cmd_exec(int argc, char** argv) {
     }
     process_reap_zombies();
 
-    const char* program_path = argv[1];
-
-    /* Check if file exists */
-    fs_entry_t* entry = fs_resolve_path(program_path);
-    if (entry == NULL) {
-        vga_puts("exec: program not found: ");
-        vga_puts(program_path);
+    /* Unified exec path (Phase 0.6): detects ELF64 / KIL0 / raw binary,
+     * builds the process and lays out argv/envp/auxv. */
+    int pid = exec_load_program(argv[1], argv + 1, argc - 1);
+    if (pid < 0) {
+        vga_puts("exec: failed to load: ");
+        vga_puts(argv[1]);
         vga_puts("\n");
         return 1;
     }
 
-    if (entry->type != FS_TYPE_FILE) {
-        vga_puts("exec: not a file: ");
-        vga_puts(program_path);
-        vga_puts("\n");
-        return 1;
-    }
+    char pid_buf[16];
+    itoa(pid, pid_buf, 10, 4);
+    vga_puts("Process created with PID: ");
+    vga_puts(pid_buf);
+    vga_puts("\n");
 
-    vga_puts("Loading program: ");
-    vga_puts(program_path);
-    vga_puts(" (");
-    char size_buf[16];
-    itoa(entry->size, size_buf, 10, 10);
-    vga_puts(size_buf);
-    vga_puts(" bytes)\n");
+    /* Actually run the process */
+    process_run(pid);
 
-    /* Read the program file */
-    uint8_t* program_data = (uint8_t*)kmalloc(entry->size);
-    if (program_data == NULL) {
-        vga_puts("exec: out of memory\n");
-        return 1;
-    }
-
-    int bytes_read = fs_read_file(entry, program_data, entry->size);
-    if (bytes_read != (int)entry->size) {
-        vga_puts("exec: failed to read program\n");
-        kfree(program_data);
-        return 1;
-    }
-
-    /* Check for user program magic header */
-    if (entry->size >= 4) {
-        uint32_t magic = *(uint32_t*)program_data;
-        if (magic == USER_MAGIC) {
-            /* This is a Kil0yOS user program with header */
-            user_program_header_t* header = (user_program_header_t*)program_data;
-            vga_puts("Program header found:\n");
-            vga_puts("  Entry offset: ");
-            itoa(header->entry_offset, size_buf, 10, 8);
-            vga_puts(size_buf);
-            vga_puts("\n  Code size: ");
-            itoa(header->code_size, size_buf, 10, 8);
-            vga_puts(size_buf);
-            vga_puts("\n");
-
-            uint64_t entry_point = USER_CODE_BASE + header->entry_offset;
-
-            /* Create user process */
-            int pid = process_create(program_path,
-                                     program_data + sizeof(user_program_header_t),
-                                     header->code_size,
-                                     entry_point);
-
-            if (pid < 0) {
-                vga_puts("exec: failed to create process\n");
-                kfree(program_data);
-                return 1;
-            }
-
-            vga_puts("Process created with PID: ");
-            itoa(pid, size_buf, 10, 4);
-            vga_puts(size_buf);
-            vga_puts("\n");
-
-            /* Free program data before jumping to user mode */
-            kfree(program_data);
-
-            vga_puts("Jumping to user mode...\n");
-            klog("[exec] running process\n");
-
-            /* Actually run the process */
-            process_run(pid);
-
-            /* If we return here, the process exited */
-            vga_puts("Process exited.\n");
-            return 0;
-        } else {
-            /* Raw binary - try to execute directly */
-            vga_puts("Raw binary detected (no KIL0 header).\n");
-            vga_puts("Attempting direct execution at 0x400000...\n");
-
-            /* Create process with raw binary */
-            int pid = process_create(program_path, program_data, entry->size, USER_CODE_BASE);
-            if (pid < 0) {
-                vga_puts("exec: failed to create process\n");
-                kfree(program_data);
-                return 1;
-            }
-
-            vga_puts("Process created with PID: ");
-            itoa(pid, size_buf, 10, 4);
-            vga_puts(size_buf);
-            vga_puts("\n");
-
-            /* Free program data before jumping to user mode */
-            kfree(program_data);
-
-            vga_puts("Jumping to user mode...\n");
-            klog("[exec] running process\n");
-
-            /* Actually run the process */
-            process_run(pid);
-
-            /* If we return here, the process exited */
-            vga_puts("Process exited.\n");
-            return 0;
-        }
-    }
-
-    kfree(program_data);
+    /* If we return here, the process exited */
+    vga_puts("Process exited.\n");
     return 0;
 }
 

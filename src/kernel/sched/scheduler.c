@@ -1,5 +1,6 @@
 #include "sched/scheduler.h"
 #include "core/process.h"
+#include "core/isr.h"
 #include "lib/string.h"
 
 static task_t tasks[MAX_TASKS];
@@ -147,6 +148,23 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
             /* current frame belongs to the user process (or its syscall) */
             user_frame = current_rsp;
             user_frame_valid = 1;
+            /* TEMPORARY Phase 0 debug: sample the user RIP periodically */
+            {
+                static int ucnt = 0;
+                if ((++ucnt & 0x3F) == 1) {
+                    const interrupt_frame_t* f =
+                        (const interrupt_frame_t*)current_rsp;
+                    char b[46];
+                    b[0] = 'u'; b[1] = ' '; b[2] = 'r'; b[3] = 'i'; b[4] = 'p'; b[5] = '=';
+                    for (int i = 0; i < 16; i++)
+                        b[6 + i] = "0123456789abcdef"[(f->rip >> (60 - i * 4)) & 0xF];
+                    b[22] = ' '; b[23] = 'r'; b[24] = 's'; b[25] = 'p'; b[26] = '=';
+                    for (int i = 0; i < 16; i++)
+                        b[27 + i] = "0123456789abcdef"[(f->rsp >> (60 - i * 4)) & 0xF];
+                    b[43] = '\n'; b[44] = 0;
+                    klog(b);
+                }
+            }
             return tasks[0].rsp;            /* run kernel main */
         }
     }

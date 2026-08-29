@@ -1,11 +1,14 @@
 #include "core/process.h"
 #include "core/gdt.h"
 #include "core/tss.h"
+#include "core/uvm.h"
+#include "core/elf.h"
 #include "sched/scheduler.h"
 #include "shell/shell.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "fs/fs.h"
+#include "timer/pit.h"
 #include "drivers/vga.h"
 
 /* Process table */
@@ -13,11 +16,23 @@ static process_t processes[MAX_PROCESSES];
 static int current_process = -1;
 static uint32_t next_pid = 1;
 
+/* Top of the current process's kernel stack. The Linux-ABI `syscall`
+ * entry cannot use the TSS (the instruction does not switch stacks), so
+ * it loads its kernel RSP from here. Set in process_run(). */
+uint64_t syscall_kernel_rsp = 0;
+
 /* Kernel stack for user mode transitions (16 KB) */
 #define KERNEL_STACK_SIZE 0x4000
 static uint8_t kernel_stacks[MAX_PROCESSES][KERNEL_STACK_SIZE] __attribute__((aligned(16)));
 
 static void process_release_memory(process_t* proc);
+
+static inline void wrmsr(uint32_t msr, uint64_t val) {
+    uint32_t lo = (uint32_t)val, hi = (uint32_t)(val >> 32);
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
+}
+
+#define MSR_FS_BASE 0xC0000100
 
 void process_init(void) {
     memset(processes, 0, sizeof(processes));
@@ -53,75 +68,39 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     int proc_index = proc - processes;
     proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
 
-    /* Allocate code area at USER_CODE_BASE (0x10000000 = 256 MB, above
-     * the kernel heap arena so we never rewrite heap PTEs):
-     * 1. Allocate physical pages
-     * 2. Map them into the shared page tables at the user VA
-     * 3. Copy code through the user VA
-     */
-
+    /* Legacy raw-binary layout: one RWX code image at USER_CODE_BASE
+     * (above the kernel heap arena) plus the user stack, tracked as
+     * ordinary uvm regions so teardown/exit works for every format. */
     proc->code_base = USER_CODE_BASE;
-
-    /* Calculate number of pages needed */
-    size_t pages_needed = (code_size + 4095) / 4096;
-    if (pages_needed == 0) pages_needed = 1;
-
-    /* Allocate and map code pages */
-    for (size_t i = 0; i < pages_needed; i++) {
-        uint64_t phys = pmm_alloc_page();
-        if (phys == 0) {
-            vga_puts("[proc] create failed: PMM out of pages (code)\n");
-            proc->code_pages = (uint32_t)i;
-            goto fail;
-        }
-
-        uint64_t virt = USER_CODE_BASE + i * 4096;
-
-        /* Map user virtual address to physical page */
-        /* Flags: Present (1), Writable (2), User (4) = 0x07 */
-        vmm_map_page(virt, phys, 0x07);
-
-        /* Copy code through the freshly mapped user VA (ring0 may write
-         * user pages). Copying via the physical address relied on the
-         * identity map, which we may have just re-pointed above. */
-        size_t offset = i * 4096;
-        size_t copy_size = (code_size > offset + 4096) ? 4096 : code_size - offset;
-        if (copy_size > 0 && offset < code_size) {
-            memcpy((void*)virt, code + offset, copy_size);
-        }
-    }
-    proc->code_pages = (uint32_t)pages_needed;
-
-    klog("[create] code mapped\n");
-
-    /* Set up stack */
     proc->stack_top = USER_STACK_BASE;
 
-    /* Map user stack pages (stack grows down) */
-    uint32_t stack_pages = 0;
-    for (uint64_t addr = USER_STACK_BASE - USER_STACK_SIZE + 0x1000;
-         addr <= USER_STACK_BASE;
-         addr += 4096) {
-        uint64_t phys = pmm_alloc_page();
-        if (phys == 0) {
-            vga_puts("[proc] create failed: PMM out of pages (stack)\n");
-            proc->stack_pages = stack_pages;
-            goto fail;
-        }
-        vmm_map_page(addr, phys, 0x07);  /* User, R/W, Present */
-        stack_pages++;
+    if (uvm_map_range(proc, USER_CODE_BASE, USER_CODE_BASE + code_size,
+                      UVM_PROT_READ | UVM_PROT_WRITE | UVM_PROT_EXEC) != 0) {
+        vga_puts("[proc] create failed: PMM out of pages (code)\n");
+        goto fail;
     }
-    proc->stack_pages = stack_pages;
+    proc->code_pages = (uint32_t)((code_size + 4095) / 4096);
+    memcpy((void*)USER_CODE_BASE, code, code_size);
+
+    if (uvm_map_range(proc, USER_STACK_BASE - USER_STACK_SIZE, USER_STACK_BASE,
+                      UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
+        vga_puts("[proc] create failed: PMM out of pages (stack)\n");
+        goto fail;
+    }
+    proc->stack_pages = USER_STACK_SIZE / 4096;
+
+    proc->brk_start = proc->brk_cur = (USER_CODE_BASE + code_size + 4095) & ~4095ULL;
+    proc->mmap_top = UVM_MMAP_BASE;
 
     proc->entry_point = entry;
     proc->state = PROCESS_STATE_READY;
 
+    klog("[create] code mapped\n");
     return proc->pid;
 
 fail:
-    /* Undo partial allocation so no half-initialized process remains:
-     * unmap mapped VAs, free their physical pages, reset the slot. */
-    process_release_memory(proc);
+    /* Undo partial allocation so no half-initialized process remains */
+    uvm_release_all(proc);
     memset(proc, 0, sizeof(process_t));
     return -1;
 }
@@ -129,18 +108,7 @@ fail:
 /* Release all user pages of a process and free its slot.
  * Only safe for processes that are not running. */
 static void process_release_memory(process_t* proc) {
-    for (uint32_t i = 0; i < proc->code_pages; i++) {
-        uint64_t virt = proc->code_base + (uint64_t)i * 4096;
-        uint64_t phys = vmm_get_phys(virt);
-        vmm_unmap_page(virt);
-        if (phys != 0) pmm_free_page(phys);
-    }
-    for (uint32_t i = 0; i < proc->stack_pages; i++) {
-        uint64_t virt = proc->stack_top - USER_STACK_SIZE + (uint64_t)(i + 1) * 4096;
-        uint64_t phys = vmm_get_phys(virt);
-        vmm_unmap_page(virt);
-        if (phys != 0) pmm_free_page(phys);
-    }
+    uvm_release_all(proc);
     proc->code_pages = 0;
     proc->stack_pages = 0;
 }
@@ -181,24 +149,9 @@ uint64_t process_kill_current(int status) {
 }
 
 int process_check_user_range(uint64_t uaddr, size_t len) {
-    process_t* proc = process_get_current();
-    if (proc == NULL) return 0;
-    if (len == 0) return 1;
-    if (uaddr + len < uaddr) return 0;  /* wrap-around */
-
-    uint64_t code_end = proc->code_base + (uint64_t)proc->code_pages * 4096;
-    uint64_t stack_lo = proc->stack_top - USER_STACK_SIZE;
-
-    /* Entirely inside the code region or the stack region */
-    int in_code  = (uaddr >= proc->code_base && uaddr + len <= code_end);
-    int in_stack = (uaddr >= stack_lo && uaddr + len <= proc->stack_top);
-    if (!in_code && !in_stack) return 0;
-
-    /* Every touched page must be present in the page tables */
-    for (uint64_t a = uaddr & ~0xFFFULL; a < uaddr + len; a += 4096) {
-        if (vmm_get_phys(a) == 0) return 0;
-    }
-    return 1;
+    /* Generic region-based check: covers ELF segments, brk heap, mmap
+     * arena and the stack alike. */
+    return uvm_check_range(process_get_current(), uaddr, len);
 }
 
 void process_exit(int status) {
@@ -262,8 +215,15 @@ void process_run(uint32_t pid) {
     proc->state = PROCESS_STATE_RUNNING;
     current_process = proc - processes;
 
-    /* Set TSS kernel stack for syscall returns */
+    /* Set TSS kernel stack for interrupt/syscall returns, and the global
+     * copy used by the Linux-ABI `syscall` entry (which does not switch
+     * stacks by itself). */
     tss_set_kernel_stack(proc->kernel_stack);
+    syscall_kernel_rsp = proc->kernel_stack;
+
+    /* Fresh TLS state: the previous process's FS base must not leak */
+    wrmsr(MSR_FS_BASE, 0);
+    proc->fs_base = 0;
 
     /* The shell context is about to be abandoned by iretq below. Park a
      * fresh kernel-main frame (shell_run on the scheduler stack) so that
@@ -271,8 +231,9 @@ void process_run(uint32_t pid) {
      * snapshot of the boot stack. */
     scheduler_set_main_return(shell_run);
 
-    /* Jump to user mode */
-    jump_to_user(proc->entry_point, proc->stack_top);
+    /* Jump to user mode (ELF path uses the auxv block RSP) */
+    jump_to_user(proc->entry_point,
+                 proc->user_rsp ? proc->user_rsp : proc->stack_top);
 }
 
 /* Jump to user mode using iretq
@@ -307,52 +268,227 @@ void jump_to_user(uint64_t entry, uint64_t stack) {
     );
 }
 
-/* Load a user program from the file system */
-int load_user_program(const char* path) {
-    /* Find the file */
+/* --- Linux-ABI process stack layout (Phase 0.6, auxv from roadmap 1.1)
+ *
+ * At the ELF entry point the user stack holds, from RSP upward:
+ *   argc, argv[] (NULL-terminated), envp[] (NULL-terminated), auxv pairs.
+ * Above those live the argv/env strings and the 16 AT_RANDOM bytes. ---- */
+
+#define AT_NULL     0
+#define AT_PHDR     3
+#define AT_PHENT    4
+#define AT_PHNUM    5
+#define AT_PAGESZ   6
+#define AT_HWCAP    16
+#define AT_CLKTCK   17
+#define AT_ENTRY    9
+#define AT_UID      11
+#define AT_EUID     12
+#define AT_GID      13
+#define AT_EGID     14
+#define AT_SECURE   23
+#define AT_RANDOM   25
+
+#define AUXV_PAIRS  14
+
+static uint64_t rand_seed = 0;
+
+static void rand_fill16(uint8_t* dst) {
+    if (rand_seed == 0) rand_seed = pit_uptime_us() | 1;
+    for (int i = 0; i < 2; i++) {
+        rand_seed ^= rand_seed << 13;
+        rand_seed ^= rand_seed >> 7;
+        rand_seed ^= rand_seed << 17;
+        for (int b = 0; b < 8; b++) dst[i * 8 + b] = (uint8_t)(rand_seed >> (b * 8));
+    }
+}
+
+/* Build argc/argv/envp/auxv at the top of the user stack.
+ * Returns the RSP to hand to jump_to_user. */
+static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* res,
+                                    char* const* argv, int argc) {
+    uint64_t sp = proc->stack_top;
+
+    int n = (argc < 8) ? argc : 8;   /* argv[0] = program path anyway */
+    uint64_t ustr[8];
+
+    const char* env = "PATH=/bin";
+    size_t env_len = strlen(env) + 1;
+    sp -= env_len;
+    uint64_t uenv = sp;
+    memcpy((void*)sp, env, env_len);
+
+    for (int i = 0; i < n; i++) {
+        const char* s = argv[i] ? argv[i] : "";
+        size_t l = strlen(s) + 1;
+        sp -= l;
+        ustr[i] = sp;
+        memcpy((void*)sp, s, l);
+    }
+
+    uint8_t rnd[16];
+    rand_fill16(rnd);
+    sp -= 16;
+    uint64_t urandom = sp;
+    memcpy((void*)sp, rnd, 16);
+
+    /* Final block: argc + argv[] + NULL + envp[] + NULL + auxv.
+     * RSP must be 16-byte aligned at the entry point per the ABI. */
+    size_t block = 8 + 8 * ((size_t)n + 1) + 8 * 2 + 8 * (2 * AUXV_PAIRS);
+    sp = (sp - block) & ~0xFULL;
+
+    uint64_t* u = (uint64_t*)sp;
+    *u++ = (uint64_t)n;
+    for (int i = 0; i < n; i++) *u++ = ustr[i];
+    *u++ = 0;                 /* argv end */
+    *u++ = uenv;              /* envp[0] */
+    *u++ = 0;                 /* envp end */
+
+    struct { uint64_t k, v; } aux[AUXV_PAIRS] = {
+        {AT_PHDR,   res->phdr},
+        {AT_PHENT,  56},
+        {AT_PHNUM,  res->phnum},
+        {AT_PAGESZ, 4096},
+        {AT_CLKTCK, 100},
+        {AT_HWCAP,  0},
+        {AT_UID,    0},
+        {AT_EUID,   0},
+        {AT_GID,    0},
+        {AT_EGID,   0},
+        {AT_SECURE, 0},
+        {AT_RANDOM, urandom},
+        {AT_ENTRY,  res->entry},
+        {AT_NULL,   0},
+    };
+    for (int i = 0; i < AUXV_PAIRS; i++) {
+        *u++ = aux[i].k;
+        *u++ = aux[i].v;
+    }
+    return sp;
+}
+
+/* Allocate and initialize a bare process slot (no user memory yet). */
+static process_t* process_alloc_slot(const char* name) {
+    process_t* proc = find_free_process();
+    if (proc == NULL) return NULL;
+    memset(proc, 0, sizeof(process_t));
+    proc->pid = next_pid++;
+    strncpy(proc->name, name, sizeof(proc->name) - 1);
+    int proc_index = proc - processes;
+    proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
+    return proc;
+}
+
+/* Unified exec path: ELF64 / KIL0 header / raw binary. */
+int exec_load_program(const char* path, char* const* argv, int argc) {
     fs_entry_t* entry = fs_resolve_path(path);
     if (entry == NULL || entry->type != FS_TYPE_FILE) {
         return -1;  /* File not found */
     }
 
-    /* Read file into memory */
     uint8_t* buffer = (uint8_t*)kmalloc(entry->size);
-    if (buffer == NULL) {
-        return -1;
-    }
-
-    int bytes_read = fs_read_file(entry, buffer, entry->size);
-    if (bytes_read != (int)entry->size) {
+    if (buffer == NULL) return -1;
+    if (fs_read_file(entry, buffer, entry->size) != (int)entry->size) {
         kfree(buffer);
         return -1;
     }
 
-    /* Parse header */
-    if (entry->size < sizeof(user_program_header_t)) {
-        kfree(buffer);
-        return -1;
+    const char* base = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+    if (argc > 0 && argv && argv[0]) {
+        const char* a0 = argv[0];
+        const char* b = a0;
+        for (const char* p = a0; *p; p++) {
+            if (*p == '/') b = p + 1;
+        }
+        base = b;
     }
 
-    user_program_header_t* header = (user_program_header_t*)buffer;
-    if (header->magic != USER_MAGIC) {
+    if (elf_is_elf64(buffer, entry->size)) {
+        process_t* proc = process_alloc_slot(base);
+        if (proc == NULL) {
+            kfree(buffer);
+            return -1;
+        }
+
+        elf_load_result_t res;
+        int rc = elf_load(proc, buffer, entry->size, &res);
+        if (rc != 0) {
+            const char* why = "invalid ELF";
+            if (rc == ELF_ERR_DYNAMIC) why = "dynamic ELF (PT_INTERP) not supported yet";
+            else if (rc == ELF_ERR_LAYOUT) why = "linked below 0x10000000 (kernel heap); relink with -Wl,-Ttext-segment=0x10000000";
+            else if (rc == ELF_ERR_MAP) why = "out of memory mapping segments";
+            else if (rc == ELF_ERR_PHDRS) why = "program headers outside PT_LOAD";
+            klog("[exec] ELF rejected: ");
+            klog(why);
+            klog("\n");
+            uvm_release_all(proc);
+            memset(proc, 0, sizeof(process_t));
+            kfree(buffer);
+            return -1;
+        }
+
+        /* Map the user stack and lay out argc/argv/envp/auxv */
+        proc->stack_top = USER_STACK_BASE;
+        if (uvm_map_range(proc, USER_STACK_BASE - USER_STACK_SIZE, USER_STACK_BASE,
+                          UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
+            klog("[exec] out of memory for user stack\n");
+            uvm_release_all(proc);
+            memset(proc, 0, sizeof(process_t));
+            kfree(buffer);
+            return -1;
+        }
+        proc->stack_pages = USER_STACK_SIZE / 4096;
+
+        proc->entry_point = res.entry;
+        proc->brk_start = proc->brk_cur = res.brk_start;
+        proc->mmap_top = UVM_MMAP_BASE;
+
+        klog("[exec] ELF64 loaded: entry=");
+        char b[19];
+        b[0] = '0'; b[1] = 'x';
+        for (int i = 0; i < 16; i++) b[2 + i] = "0123456789abcdef"[(res.entry >> (60 - i * 4)) & 0xF];
+        b[18] = 0;
+        klog(b);
+        klog(" brk=");
+        b[0] = '0'; b[1] = 'x';
+        for (int i = 0; i < 16; i++) b[2 + i] = "0123456789abcdef"[(res.brk_start >> (60 - i * 4)) & 0xF];
+        klog(b);
+        klog("\n");
+
+        proc->entry_point = res.entry;
+        proc->user_rsp = process_build_stack(proc, &res, argv, argc);
+        proc->state = PROCESS_STATE_READY;
         kfree(buffer);
-        return -1;  /* Invalid magic */
+        return proc->pid;
     }
 
-    /* Create process */
-    uint64_t entry_point = USER_CODE_BASE + header->entry_offset;
-    int pid = process_create(path,
-                              buffer + sizeof(user_program_header_t),
-                              header->code_size,
-                              entry_point);
+    /* Legacy KIL0-header or raw binary path */
+    uint64_t entry_point = USER_CODE_BASE;
+    const uint8_t* code = buffer;
+    size_t code_size = entry->size;
 
+    if (entry->size >= sizeof(user_program_header_t)) {
+        user_program_header_t* h = (user_program_header_t*)buffer;
+        if (h->magic == USER_MAGIC) {
+            entry_point = USER_CODE_BASE + h->entry_offset;
+            code = buffer + sizeof(user_program_header_t);
+            code_size = h->code_size;
+        }
+    }
+
+    int pid = process_create(base, (uint8_t*)code, code_size, entry_point);
     kfree(buffer);
-
-    if (pid < 0) {
-        return -1;
-    }
-
     return pid;
+}
+
+/* Load a user program from the file system */
+int load_user_program(const char* path) {
+    char* argv0[1];
+    argv0[0] = (char*)path;
+    return exec_load_program(path, argv0, 1);
 }
 
 /* Embedded user program blobs (see Makefile: nasm .incbin) */
@@ -360,6 +496,18 @@ extern const uint8_t user_hello_start[];
 extern const uint8_t user_hello_end[];
 extern const uint8_t user_pong_start[];
 extern const uint8_t user_pong_end[];
+
+/* Optional musl static ELF (embedded only when musl-gcc is available) */
+extern const uint8_t user_hello_lnx_start[] __attribute__((weak));
+extern const uint8_t user_hello_lnx_end[] __attribute__((weak));
+
+/* Freestanding Linux-ABI syscall probe (always embedded) */
+extern const uint8_t user_mini_start[];
+extern const uint8_t user_mini_end[];
+
+/* Freestanding brk/mmap/mprotect acceptance probe (always embedded) */
+extern const uint8_t user_mmt_start[];
+extern const uint8_t user_mmt_end[];
 
 void user_programs_install(void) {
     fs_entry_t* bin = fs_resolve_path("/bin");
@@ -382,6 +530,34 @@ void user_programs_install(void) {
         if (f != NULL) {
             size_t size = (size_t)(user_pong_end - user_pong_start);
             fs_write_file(f, user_pong_start, size);
+        }
+    }
+    if (&user_hello_lnx_start != NULL &&
+        &user_hello_lnx_end > &user_hello_lnx_start &&
+        fs_resolve_path("/bin/hello-lnx") == NULL) {
+        fs_entry_t* f = fs_create_file("hello-lnx");
+        if (f != NULL) {
+            size_t size = (size_t)(user_hello_lnx_end - user_hello_lnx_start);
+            fs_write_file(f, user_hello_lnx_start, size);
+            klog("[user] /bin/hello-lnx installed (musl static ELF)\n");
+        }
+    }
+
+    if (fs_resolve_path("/bin/mini") == NULL) {
+        fs_entry_t* f = fs_create_file("mini");
+        if (f != NULL) {
+            size_t size = (size_t)(user_mini_end - user_mini_start);
+            fs_write_file(f, user_mini_start, size);
+            klog("[user] /bin/mini installed (syscall probe)\n");
+        }
+    }
+
+    if (fs_resolve_path("/bin/mmt") == NULL) {
+        fs_entry_t* f = fs_create_file("mmt");
+        if (f != NULL) {
+            size_t size = (size_t)(user_mmt_end - user_mmt_start);
+            fs_write_file(f, user_mmt_start, size);
+            klog("[user] /bin/mmt installed (brk/mmap/mprotect probe)\n");
         }
     }
 

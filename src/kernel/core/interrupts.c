@@ -30,6 +30,7 @@ void pic_enable_irq(uint8_t irq) {
     uint16_t port;
     uint8_t value;
 
+    if (irq >= 16) return; /* invalid/unknown PCI line: leave masked */
     if (irq < 8) {
         port = PIC1_DATA;
     } else {

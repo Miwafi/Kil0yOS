@@ -146,6 +146,83 @@ syscall_entry:
     ; Return to user mode
     iretq
 
+; --- Linux-ABI syscall entry (the `syscall` instruction, LSTAR) -----
+; Calling convention: number in RAX, args in RDI, RSI, RDX, R10, R8, R9.
+; On entry the CPU has loaded CS from STAR[47:32] and SS from CS+8, put
+; the user RIP in RCX and user RFLAGS in R11, and - because FMASK clears
+; IF - interrupts are already off. RSP still points at the user stack,
+; so we save it and switch to the process kernel stack first.
+extern syscall_lnx_dispatch
+extern syscall_kernel_rsp
+
+global syscall_lnx_entry
+syscall_lnx_entry:
+    mov [lnx_user_rsp_tmp], rsp      ; remember the user stack pointer
+    mov rsp, [syscall_kernel_rsp]    ; switch to the process kernel stack
+
+    ; Hardware frame for the iretq back to ring 3
+    push qword 0x23                  ; user SS (USER_DS | 3)
+    push qword [lnx_user_rsp_tmp]    ; user RSP
+    push r11                         ; user RFLAGS
+    push qword 0x1B                  ; user CS (USER_CS | 3)
+    push rcx                         ; user RIP
+
+    ; Save GP registers (same order as irq_common_stub)
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Saved-frame offsets: r15+0 r14+8 r13+16 r12+24 r11+32 r10+40
+    ; r9+48 r8+56 rbp+64 rdi+72 rsi+80 rdx+88 rcx+96 rbx+104 rax+112
+    mov rdi, [rsp + 112]             ; syscall number (rax)
+    mov rsi, [rsp + 72]              ; a0 (rdi)
+    mov rdx, [rsp + 80]              ; a1 (rsi)
+    mov rcx, [rsp + 88]              ; a2 (rdx)
+    mov r8,  [rsp + 40]              ; a3 (r10)
+    mov r9,  [rsp + 48]              ; a4 (r8)
+    mov rax, [rsp + 56]              ; a5 (r9)
+    push rax                         ; 7th argument on the stack
+    call syscall_lnx_dispatch
+    add rsp, 8
+
+    ; Store the return value into the saved-rax slot
+    mov [rsp + 112], rax
+
+    ; Restore user registers and return to ring 3
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    iretq
+
+section .data
+lnx_user_rsp_tmp: dq 0
+
+section .text
 isr_common_stub:
     push rax
     push rbx
