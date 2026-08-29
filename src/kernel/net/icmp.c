@@ -5,8 +5,11 @@
 
 static volatile int ping_reply = 0;
 static volatile uint16_t ping_seq = 0;
+static volatile uint32_t ping_peer = 0;
+#define PING_ID 0x1234
 
 void icmp_receive(netif_t* iface, uint32_t src_ip, const uint8_t* data, uint16_t len) {
+    (void)iface;
     if (len < sizeof(icmp_header_t)) return;
 
     icmp_header_t hdr;
@@ -21,7 +24,12 @@ void icmp_receive(netif_t* iface, uint32_t src_ip, const uint8_t* data, uint16_t
         reply->checksum = 0;
         reply->id = hdr.id;
         reply->seq = hdr.seq;
+        /* Belt and braces: len is already capped by netif_receive, but the
+         * copy below writes into a fixed stack buffer - never trust it. */
         uint16_t payload_len = len - sizeof(icmp_header_t);
+        if (payload_len > NET_MAX_PACKET - sizeof(icmp_header_t)) {
+            payload_len = NET_MAX_PACKET - sizeof(icmp_header_t);
+        }
         memcpy(reply_buf + sizeof(icmp_header_t),
                data + sizeof(icmp_header_t), payload_len);
         uint16_t cs_len = sizeof(icmp_header_t) + payload_len;
@@ -29,7 +37,9 @@ void icmp_receive(netif_t* iface, uint32_t src_ip, const uint8_t* data, uint16_t
         ipv4_transmit(iface, src_ip, IP_PROTO_ICMP, reply_buf, cs_len);
     } else if (type == ICMP_TYPE_ECHO_REPLY) {
         uint16_t seq = net_ntohs(hdr.seq);
-        if (seq == ping_seq) {
+        uint16_t id  = net_ntohs(hdr.id);
+        /* Match our own outstanding ping only: id, sequence AND peer. */
+        if (seq == ping_seq && id == PING_ID && src_ip == ping_peer) {
             ping_reply = 1;
         }
     }
@@ -41,7 +51,7 @@ int icmp_ping(netif_t* iface, uint32_t target_ip, uint16_t seq, uint32_t timeout
     hdr->type = ICMP_TYPE_ECHO_REQUEST;
     hdr->code = 0;
     hdr->checksum = 0;
-    hdr->id = net_htons(0x1234);
+    hdr->id = net_htons(PING_ID);
     hdr->seq = net_htons(seq);
 
     const char* payload = "Kil0yOS";
@@ -52,6 +62,7 @@ int icmp_ping(netif_t* iface, uint32_t target_ip, uint16_t seq, uint32_t timeout
 
     ping_reply = 0;
     ping_seq = seq;
+    ping_peer = target_ip;
 
     if (ipv4_transmit(iface, target_ip, IP_PROTO_ICMP, buf, total_len) < 0) {
         return -1;

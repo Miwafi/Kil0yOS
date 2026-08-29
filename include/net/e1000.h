@@ -9,6 +9,5 @@
 
 int  e1000_init(void);
 int  e1000_send(const uint8_t* data, uint16_t len);
-void e1000_get_mac(uint8_t* out_mac);
 
 #endif

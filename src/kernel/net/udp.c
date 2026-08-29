@@ -1,5 +1,6 @@
 #include "net/udp.h"
 #include "net/ipv4.h"
+#include "core/interrupts.h"
 #include "timer/pit.h"
 #include "lib/string.h"
 
@@ -23,18 +24,30 @@ void udp_receive(netif_t* iface, uint32_t src_ip, const uint8_t* data, uint16_t 
     uint16_t src_port = (hdr.src_port >> 8) | ((hdr.src_port & 0xFF) << 8);
     uint16_t udp_len  = (hdr.len >> 8) | ((hdr.len & 0xFF) << 8);
     if (udp_len > len) udp_len = len;
+    /* Header length field smaller than the fixed header would underflow
+     * payload_len and make the copy below read past the received frame. */
+    if (udp_len < sizeof(udp_header_t)) return;
     uint16_t payload_len = udp_len - sizeof(udp_header_t);
     const uint8_t* payload = data + sizeof(udp_header_t);
 
     for (int i = 0; i < UDP_MAX_SOCKETS; i++) {
         if (sockets[i].used && sockets[i].bound && sockets[i].local_port == dst_port) {
-            if (sockets[i].rx_count != 0) return; /* drop if buffer full */
+            /* udp_receive runs in IRQ context while udp_recvfrom copies out
+             * in poll context - the write-in must not interleave with the
+             * read-out or the reader gets a torn frame. */
+            int enabled = irq_save();
+            disable_interrupts();
+            if (sockets[i].rx_count != 0) {
+                irq_restore(enabled);
+                return; /* drop if buffer full */
+            }
             sockets[i].remote_ip = src_ip;
             sockets[i].remote_port = src_port;
             uint16_t copy_len = payload_len;
             if (copy_len > UDP_RX_BUFSZ) copy_len = UDP_RX_BUFSZ;
             memcpy(sockets[i].rx_buf, payload, copy_len);
             sockets[i].rx_count = copy_len;
+            irq_restore(enabled);
             return;
         }
     }
@@ -68,9 +81,14 @@ int udp_sendto(udp_socket_t* sock, uint32_t dst_ip, uint16_t dst_port,
                const uint8_t* data, uint16_t len) {
     if (!sock || !sock->used) return -1;
 
+    /* Fail up front: the IP+UDP headers must fit under the Ethernet MTU,
+     * otherwise the oversized packet would only be rejected deep inside
+     * eth_transmit. */
+    uint16_t max_payload = NET_MTU - sizeof(ipv4_header_t) - sizeof(udp_header_t);
+    if (len > max_payload) return -1;
+
     uint8_t packet[NET_MAX_PACKET];
     uint16_t total = sizeof(udp_header_t) + len;
-    if (total > NET_MAX_PACKET) return -1;
 
     udp_header_t* hdr = (udp_header_t*)packet;
     hdr->src_port = (sock->local_port >> 8) | ((sock->local_port & 0xFF) << 8);
@@ -89,6 +107,8 @@ int udp_recvfrom(udp_socket_t* sock, uint8_t* buf, uint16_t maxlen,
 
     uint32_t waited = 0;
     while (waited < timeout_ms) {
+        int enabled = irq_save();
+        disable_interrupts();
         if (sock->rx_count > 0) {
             uint16_t copy_len = sock->rx_count;
             if (copy_len > maxlen) copy_len = maxlen;
@@ -96,8 +116,10 @@ int udp_recvfrom(udp_socket_t* sock, uint8_t* buf, uint16_t maxlen,
             if (out_src_ip) *out_src_ip = sock->remote_ip;
             if (out_src_port) *out_src_port = sock->remote_port;
             sock->rx_count = 0;
+            irq_restore(enabled);
             return (int)copy_len;
         }
+        irq_restore(enabled);
         pit_delay_ms(10);
         waited += 10;
     }

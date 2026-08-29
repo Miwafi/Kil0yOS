@@ -82,7 +82,7 @@ make run
 - version - 显示操作系统版本
 - help - 显示帮助信息
 - shutdown - 关机（ACPI S5）
-- net - 网络管理（wire, chknic, status）
+- net - 网络信息/子命令（ping|ifconfig|netstat）
 - ping - 发送 ICMP 回显请求
 - exec - 运行 `/bin` 下的用户程序（如 `exec /bin/hello.bin`、`exec /bin/pong.bin`）
 

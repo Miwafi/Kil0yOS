@@ -123,8 +123,17 @@ static void e1000_irq_handler(interrupt_frame_t* frame) {
     }
 }
 
-/* Poll RX descriptors — called from ISR and also from send path as fallback */
+/* Poll RX descriptors — called from ISR and also from the socket wait
+ * loops via g_netif.poll. */
 void e1000_rx_poll(void) {
+    if (mmio_base == NULL) return;
+
+    /* rx_head/rx_tail and the descriptor status bytes are shared between
+     * the ISR and poll-context callers - an interrupt landing mid-drain
+     * would replay the same descriptor and double-advance the ring. */
+    int enabled = irq_save();
+    disable_interrupts();
+
     while (1) {
         int idx = rx_head;
         if ((rx_descs[idx].status & 0x01) == 0) break;
@@ -137,16 +146,23 @@ void e1000_rx_poll(void) {
         rx_tail = (rx_tail + 1) % NUM_RX;
         e1000_write(E1000_RDT, rx_tail);
     }
+
+    irq_restore(enabled);
 }
 
 int e1000_send(const uint8_t* data, uint16_t len) {
     if (len > 2048 || mmio_base == NULL) return -1;
 
-    /* Poll for received packets before sending (interrupt fallback) */
-    e1000_rx_poll();
+    /* Sends run from both the ISR (ICMP echo replies) and poll context -
+     * keep descriptor state atomic and avoid re-entering the RX poll. */
+    int enabled = irq_save();
+    disable_interrupts();
 
     int idx = tx_tail;
-    if ((tx_descs[idx].status & 0x01) == 0) return -1;
+    if ((tx_descs[idx].status & 0x01) == 0) {
+        irq_restore(enabled);
+        return -1;
+    }
     memcpy(tx_bufs[idx], data, len);
     tx_descs[idx].addr = tx_phys[idx];
     tx_descs[idx].length = len;
@@ -156,16 +172,23 @@ int e1000_send(const uint8_t* data, uint16_t len) {
     /* Memory barrier: ensure descriptor writes are visible before NIC reads them */
     __asm__ volatile("mfence" ::: "memory");
 
+    int submitted = idx;
     tx_tail = (tx_tail + 1) % NUM_TX;
     e1000_write(E1000_TDT, tx_tail);
 
-    /* Wait briefly for TX completion (poll TDH advancing) */
-    uint32_t target_tdh = (uint32_t)tx_tail;
-    int32_t tx_timeout = 50000;
-    while (tx_timeout-- > 0) {
-        if (e1000_read(E1000_TDH) == target_tdh) break;
+    /* Wait for TX completion via the descriptor DD bit (RS was requested):
+     * TDH only proves the NIC fetched the descriptor, not that the frame
+     * left the wire. Bounded wait - a hung TX is reported as failure. */
+    int timeout = 1000000;
+    while ((tx_descs[submitted].status & 0x01) == 0) {
+        if (--timeout <= 0) {
+            irq_restore(enabled);
+            return -1;
+        }
         __asm__ volatile("pause");
     }
+
+    irq_restore(enabled);
     return 0;
 }
 
@@ -182,22 +205,6 @@ int e1000_init(void) {
     /* Read 64-bit BAR properly */
     uint32_t bar0_raw = pci_read_dword(dev->bus, dev->device, dev->function, PCI_BAR0_OFFSET);
     uint32_t bar1 = pci_read_dword(dev->bus, dev->device, dev->function, PCI_BAR1_OFFSET);
-    /* TEMP DEBUG */
-    {
-        char buf[96]; int p = 0;
-        const char hex[] = "0123456789abcdef";
-        const char* s = "[e1000] match bdf=";
-        while (*s) buf[p++] = *s++;
-        buf[p++] = '0' + dev->bus; buf[p++] = ':';
-        buf[p++] = '0' + dev->device; buf[p++] = ':';
-        buf[p++] = '0' + dev->function; buf[p++] = ' ';
-        s = "bar0="; while (*s) buf[p++] = *s++;
-        for (int i = 7; i >= 0; i--) buf[p++] = hex[(bar0_raw >> (i * 4)) & 0xF];
-        s = " bar1="; while (*s) buf[p++] = *s++;
-        for (int i = 7; i >= 0; i--) buf[p++] = hex[(bar1 >> (i * 4)) & 0xF];
-        buf[p++] = '\n'; buf[p] = 0;
-        klog(buf);
-    }
     /* BAR0 layout: bit0 = 0 (memory) / 1 (I/O), bits 2:1 = mem type
      * (00 = 32-bit, 10 = 64-bit). Only a 64-bit memory BAR uses BAR1
      * as the upper half - composing it blindly turns e.g. QEMU's

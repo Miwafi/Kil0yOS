@@ -82,7 +82,7 @@ make run
 - version - Show OS version
 - help - Show help information
 - shutdown - Shut down the system (ACPI S5)
-- net - Network management (wire, chknic, status)
+- net - Network info / subcommand (ping|ifconfig|netstat)
 - ping - Send ICMP echo requests
 - exec - Run a user program from `/bin` (e.g. `exec /bin/hello.bin`, `exec /bin/pong.bin`)
 

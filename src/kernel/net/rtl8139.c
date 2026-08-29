@@ -34,18 +34,28 @@
 #define TX_BUF_SIZE 1792
 #define TX_DESC_COUNT 4
 
+#define TSD_TOK 0x00008000 /* transmit OK, set by hardware on completion */
+#define TSD_OWN 0x00002000 /* set while the controller owns the buffer */
+
 static uint16_t io_base = 0;
 static uint8_t rtl_irq = 0;
 static uint8_t* rx_buffer = NULL;
 static uint16_t rx_offset = 0;
 static uint8_t* tx_buffers[TX_DESC_COUNT];
 static int tx_current = 0;
+static uint8_t tx_pending_mask = 0;
 
 /* Drain the RX ring. Called from the IRQ handler and via g_netif.poll
  * from the socket wait loops - required before enable_interrupts()
  * (e.g. DHCP autoconfig runs during boot with IF=0). */
 void rtl8139_rx_poll(void) {
     if (rx_buffer == NULL || io_base == 0) return;
+
+    /* rx_offset and CAPR are shared between the ISR and poll-context
+     * callers - an interrupt landing mid-drain would replay the same
+     * descriptor and could write CAPR backwards. */
+    int enabled = irq_save();
+    disable_interrupts();
 
     while ((inb(io_base + RTL8139_REG_CR) & CR_BUFE) == 0) {
         uint16_t capr = inw(io_base + RTL8139_REG_CAPR);
@@ -59,17 +69,23 @@ void rtl8139_rx_poll(void) {
         uint16_t pkt_len = header >> 16;
         uint8_t pkt_status = header & 0xFF;
 
-        if ((pkt_status & 0x01) && pkt_len >= 4) {
-            uint16_t data_len = pkt_len - 4;
-            if (data_len > 0) {
-                netif_receive(pkt + 4, data_len);
-            }
+        if (pkt_len < 4 || pkt_len > RX_BUF_SIZE) {
+            /* pkt_len comes straight from DMA: a bogus value would push
+             * CAPR past the hardware write pointer and desync the ring
+             * forever. Skip the 4-byte header and resync on the next pass. */
+            pkt_len = 0;
+        }
+
+        if ((pkt_status & 0x01) && pkt_len > 4) {
+            netif_receive(pkt + 4, pkt_len - 4);
         }
 
         rx_offset = (offset + pkt_len + 4 + 3) & ~3;
-        if (rx_offset >= RX_BUF_SIZE) rx_offset -= RX_BUF_SIZE;
+        while (rx_offset >= RX_BUF_SIZE) rx_offset -= RX_BUF_SIZE;
         outw(io_base + RTL8139_REG_CAPR, rx_offset - 0x10);
     }
+
+    irq_restore(enabled);
 }
 
 static void rtl8139_irq_handler(interrupt_frame_t* frame) {
@@ -97,16 +113,40 @@ int rtl8139_send(const uint8_t* data, uint16_t len) {
     if (len > TX_BUF_SIZE) return -1;
     if (io_base == 0) return -1;
 
+    /* Sends run from both the ISR (ICMP echo replies) and poll context -
+     * keep the descriptor index and buffer copy atomic. */
+    int enabled = irq_save();
+    disable_interrupts();
+
     int idx = tx_current;
+
+    /* The 4 TX buffers are reused round-robin: never overwrite one the
+     * controller may still be DMA-reading. TOK means the transfer
+     * finished; OWN still set means it is in flight. */
+    if (tx_pending_mask & (1u << idx)) {
+        uint32_t tsd = ind(io_base + RTL8139_REG_TSD0 + idx * 4);
+        int timeout = 1000000;
+        while ((tsd & TSD_TOK) == 0 && (tsd & TSD_OWN) != 0 && --timeout > 0) {
+            __asm__ volatile("pause");
+            tsd = ind(io_base + RTL8139_REG_TSD0 + idx * 4);
+        }
+    }
+    tx_pending_mask &= (uint8_t)~(1u << idx);
+
     memcpy(tx_buffers[idx], data, len);
 
     uint32_t phys = (uint32_t)vmm_get_phys((uint64_t)tx_buffers[idx]);
-    if (phys == 0) return -1;
+    if (phys == 0) {
+        irq_restore(enabled);
+        return -1;
+    }
 
     outd(io_base + RTL8139_REG_TSAD0 + idx * 4, phys);
     outd(io_base + RTL8139_REG_TSD0 + idx * 4, len);
+    tx_pending_mask |= (uint8_t)(1u << idx);
 
     tx_current = (tx_current + 1) % TX_DESC_COUNT;
+    irq_restore(enabled);
     return 0;
 }
 

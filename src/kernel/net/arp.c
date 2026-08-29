@@ -5,18 +5,29 @@
 #include "lib/string.h"
 
 static arp_entry_t arp_cache[ARP_CACHE_SIZE];
-static int arp_cache_count = 0;
+static uint8_t arp_next_victim = 0;
+
+static uint32_t arp_now_ms(void) {
+    return (uint32_t)(pit_uptime_us() / 1000ULL);
+}
 
 void arp_init(void) {
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         arp_cache[i].valid = 0;
     }
-    arp_cache_count = 0;
+    arp_next_victim = 0;
 }
 
 static arp_entry_t* arp_find(uint32_t ip) {
+    uint32_t now = arp_now_ms();
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (arp_cache[i].valid && arp_cache[i].ip == ip) {
+        if (!arp_cache[i].valid) continue;
+        /* Lazy aging: unsigned subtraction is wrap-safe. */
+        if (now - arp_cache[i].timestamp > ARP_TIMEOUT_MS) {
+            arp_cache[i].valid = 0;
+            continue;
+        }
+        if (arp_cache[i].ip == ip) {
             return &arp_cache[i];
         }
     }
@@ -27,22 +38,25 @@ void arp_cache_update(uint32_t ip, const uint8_t* mac) {
     arp_entry_t* entry = arp_find(ip);
     if (entry) {
         for (int i = 0; i < 6; i++) entry->mac[i] = mac[i];
-        entry->timestamp = 0; /* simplified */
+        entry->timestamp = arp_now_ms();
         return;
     }
+    int slot = -1;
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (!arp_cache[i].valid) {
-            arp_cache[i].ip = ip;
-            for (int j = 0; j < 6; j++) arp_cache[i].mac[j] = mac[j];
-            arp_cache[i].valid = 1;
-            arp_cache[i].timestamp = 0;
-            return;
+            slot = i;
+            break;
         }
     }
-    /* evict first entry if full */
-    arp_cache[0].ip = ip;
-    for (int j = 0; j < 6; j++) arp_cache[0].mac[j] = mac[j];
-    arp_cache[0].timestamp = 0;
+    if (slot < 0) {
+        /* Table full: rotate instead of always evicting slot 0. */
+        slot = arp_next_victim;
+        arp_next_victim = (uint8_t)((arp_next_victim + 1) % ARP_CACHE_SIZE);
+    }
+    arp_cache[slot].ip = ip;
+    for (int j = 0; j < 6; j++) arp_cache[slot].mac[j] = mac[j];
+    arp_cache[slot].valid = 1;
+    arp_cache[slot].timestamp = arp_now_ms();
 }
 
 void arp_receive(netif_t* iface, const uint8_t* data, uint16_t len) {
@@ -55,7 +69,13 @@ void arp_receive(netif_t* iface, const uint8_t* data, uint16_t len) {
 
     if (htype != ARP_HTYPE_ETH || ptype != ARP_PTYPE_IP) return;
 
-    arp_cache_update(net_ntohl(arp->spa), arp->sha);
+    /* Only learn a mapping from a reply, or from a request that targets us
+     * (the requester is provably a live host on this segment). Accepting
+     * every frame's spa/sha pair makes one-frame cache poisoning trivial. */
+    if (oper == ARP_OP_REPLY ||
+        (oper == ARP_OP_REQUEST && net_ntohl(arp->tpa) == iface->ip)) {
+        arp_cache_update(net_ntohl(arp->spa), arp->sha);
+    }
 
     if (oper == ARP_OP_REQUEST && net_ntohl(arp->tpa) == iface->ip) {
         arp_packet_t reply;

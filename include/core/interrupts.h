@@ -29,4 +29,18 @@ void pic_send_eoi(uint8_t irq);
 void enable_interrupts();
 void disable_interrupts();
 
+/* Short critical sections shared between ISR and poll contexts must save
+ * and restore the IF flag instead of blindly sti()-ing: the same code
+ * runs with interrupts already disabled when entered from an ISR. */
+static inline int irq_save(void) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+    return (int)((rflags >> 9) & 1);
+}
+
+static inline void irq_restore(int enabled) {
+    if (enabled) __asm__ volatile("sti" ::: "memory");
+    else         __asm__ volatile("cli" ::: "memory");
+}
+
 #endif

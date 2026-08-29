@@ -32,5 +32,13 @@ int eth_transmit(netif_t* iface, const uint8_t* dst_mac, uint16_t type,
     eth->type = (type >> 8) | ((type & 0xFF) << 8);
 
     memcpy(packet + ETH_HDR_LEN, payload, payload_len);
-    return netif_send(packet, ETH_HDR_LEN + payload_len);
+
+    /* Ethernet requires 60 bytes on the wire (excluding FCS): pad short
+     * payloads (e.g. a 28-byte ARP packet) up to the legal minimum. */
+    uint16_t frame_len = ETH_HDR_LEN + payload_len;
+    if (frame_len < 60) {
+        memset(packet + frame_len, 0, 60 - frame_len);
+        frame_len = 60;
+    }
+    return netif_send(packet, frame_len);
 }

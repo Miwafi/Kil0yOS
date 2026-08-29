@@ -47,14 +47,11 @@ typedef struct dhcp_header {
 
 static uint32_t dhcp_xid;
 
-/* All multi-byte header fields are kept in host order and byte-swapped
+/* Send one DHCP message on the caller-owned, already-bound socket.
+ * All multi-byte header fields are kept in host order and byte-swapped
  * on the way out (mirrors udp.c's approach). */
-static int dhcp_send(netif_t* iface, uint8_t msg_type,
+static int dhcp_send(netif_t* iface, udp_socket_t* sock, uint8_t msg_type,
                      uint32_t req_ip, uint32_t server_id) {
-    udp_socket_t* sock = udp_socket_create();
-    if (!sock) return -1;
-    udp_bind(sock, DHCP_CLIENT_PORT);
-
     uint8_t buf[sizeof(dhcp_header_t)];
     memset(buf, 0, sizeof(buf));
 
@@ -90,20 +87,15 @@ static int dhcp_send(netif_t* iface, uint8_t msg_type,
     }
 
     uint16_t len = (uint16_t)(sizeof(dhcp_header_t) - sizeof(d->options) + (o - d->options));
-    int rc = udp_sendto(sock, 0xFFFFFFFF, DHCP_SERVER_PORT, buf, len);
-    udp_socket_close(sock);
-    return rc;
+    return udp_sendto(sock, 0xFFFFFFFF, DHCP_SERVER_PORT, buf, len);
 }
 
 /* Wait for a DHCP reply with matching xid. Returns payload length or -1.
  * On success fills out_msg / yiaddr / subnet / router / server_id. */
-static int dhcp_wait(netif_t* iface, uint8_t expect_type, uint32_t timeout_ms,
+static int dhcp_wait(netif_t* iface, udp_socket_t* sock, uint8_t expect_type,
+                     uint32_t timeout_ms,
                      uint32_t* yiaddr, uint32_t* subnet, uint32_t* router,
                      uint32_t* server_id) {
-    udp_socket_t* sock = udp_socket_create();
-    if (!sock) return -1;
-    udp_bind(sock, DHCP_CLIENT_PORT);
-
     uint8_t buf[NET_MAX_PACKET];
     int found = -1;
 
@@ -121,6 +113,8 @@ static int dhcp_wait(netif_t* iface, uint8_t expect_type, uint32_t timeout_ms,
             dhcp_header_t* d = (dhcp_header_t*)buf;
             if (d->op != DHCP_BOOT_REPLY) goto check_deadline;
             if (net_ntohl(d->xid) != dhcp_xid) goto check_deadline;
+            if (d->magic != net_htonl(DHCP_MAGIC)) goto check_deadline;
+            if (memcmp(d->chaddr, iface->mac, NET_MAC_LEN) != 0) goto check_deadline;
 
             uint32_t offer_yiaddr = net_ntohl(d->yiaddr);
 
@@ -160,39 +154,61 @@ check_deadline:
         if (pit_uptime_us() >= deadline) break;
     }
 
-    udp_socket_close(sock);
     return found;
 }
 
+#define DHCP_ATTEMPTS 2
+
 int dhcp_autoconfig(netif_t* iface) {
-    /* xid derived from MAC for uniqueness across reboots */
+    /* xid: MAC-derived for uniqueness across reboots, mixed with the boot
+     * uptime so a passive observer cannot precompute it. */
     dhcp_xid = ((uint32_t)iface->mac[2] << 24) | ((uint32_t)iface->mac[3] << 16) |
                ((uint32_t)iface->mac[4] << 8)  | (uint32_t)iface->mac[5];
+    dhcp_xid ^= (uint32_t)pit_uptime_us();
+    if (dhcp_xid == 0) dhcp_xid = 0x4B30;
 
-    /* ---- DISCOVER -> OFFER ---- */
-    if (dhcp_send(iface, DHCP_DISCOVER, 0, 0) < 0) {
-        klog("dhcp: send DISCOVER failed\n");
-        return -1;
-    }
+    /* One socket lives for the whole exchange: closing and re-binding port
+     * 68 between send and wait left a window in which OFFER/ACK packets
+     * had no receiver and were silently dropped. */
+    udp_socket_t* sock = udp_socket_create();
+    if (!sock) return -1;
+    udp_bind(sock, DHCP_CLIENT_PORT);
 
+    int rc = -1;
     uint32_t yiaddr = 0, subnet = 0, router = 0, server_id = 0;
-    if (dhcp_wait(iface, DHCP_OFFER, 4000, &yiaddr, &subnet, &router, &server_id) < 0) {
-        klog("dhcp: no OFFER received\n");
-        return -1;
+
+    /* ---- DISCOVER -> OFFER (basic retry, same xid per RFC) ---- */
+    for (int attempt = 0; attempt < DHCP_ATTEMPTS; attempt++) {
+        if (dhcp_send(iface, sock, DHCP_DISCOVER, 0, 0) < 0) {
+            klog("dhcp: send DISCOVER failed\n");
+            goto out;
+        }
+        if (dhcp_wait(iface, sock, DHCP_OFFER, 4000,
+                      &yiaddr, &subnet, &router, &server_id) >= 0) {
+            break;
+        }
     }
     if (yiaddr == 0) {
-        klog("dhcp: OFFER without yiaddr\n");
-        return -1;
+        klog("dhcp: no OFFER received\n");
+        goto out;
     }
 
     /* ---- REQUEST -> ACK ---- */
-    if (dhcp_send(iface, DHCP_REQUEST, yiaddr, server_id) < 0) return -1;
+    for (int attempt = 0; attempt < DHCP_ATTEMPTS; attempt++) {
+        if (dhcp_send(iface, sock, DHCP_REQUEST, yiaddr, server_id) < 0) goto out;
 
-    uint32_t ack_yiaddr = 0, ack_subnet = 0, ack_router = 0, ack_server = 0;
-    if (dhcp_wait(iface, DHCP_ACK, 4000, &ack_yiaddr, &ack_subnet, &ack_router, &ack_server) < 0) return -1;
+        uint32_t ack_yiaddr = 0, ack_subnet = 0, ack_router = 0, ack_server = 0;
+        if (dhcp_wait(iface, sock, DHCP_ACK, 4000,
+                      &ack_yiaddr, &ack_subnet, &ack_router, &ack_server) >= 0) {
+            iface->ip      = ack_yiaddr ? ack_yiaddr : yiaddr;
+            iface->netmask = ack_subnet ? ack_subnet : (subnet ? subnet : 0xFFFFFF00);
+            iface->gateway = ack_router ? ack_router : (router ? router : 0);
+            rc = 0;
+            break;
+        }
+    }
 
-    iface->ip      = ack_yiaddr ? ack_yiaddr : yiaddr;
-    iface->netmask = ack_subnet ? ack_subnet : (subnet ? subnet : 0xFFFFFF00);
-    iface->gateway = ack_router ? ack_router : (router ? router : 0);
-    return 0;
+out:
+    udp_socket_close(sock);
+    return rc;
 }

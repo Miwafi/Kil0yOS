@@ -20,6 +20,7 @@ uint16_t ip_checksum(const void* data, uint16_t len) {
 }
 
 void ipv4_receive(netif_t* iface, const uint8_t* src_mac, const uint8_t* data, uint16_t len) {
+    (void)src_mac;
     if (len < sizeof(ipv4_header_t)) return;
 
     ipv4_header_t hdr;
@@ -28,19 +29,33 @@ void ipv4_receive(netif_t* iface, const uint8_t* src_mac, const uint8_t* data, u
     uint8_t version = (hdr.ihl_version >> 4) & 0x0F;
     uint8_t ihl = hdr.ihl_version & 0x0F;
     if (version != 4) return;
+    /* An IHL below 5 means a header shorter than the fixed 20 bytes:
+     * payload would point into the header itself. */
+    if (ihl < 5) return;
+
+    uint16_t hdr_len = ihl * 4;
+    if (hdr_len > len) return;
+    /* Sum including the checksum field must be 0 for a valid header. */
+    if (ip_checksum(data, hdr_len) != 0) return;
 
     uint16_t total_len = (hdr.total_len >> 8) | ((hdr.total_len & 0xFF) << 8);
-    uint16_t hdr_len = ihl * 4;
     if (total_len > len) total_len = len;
     if (total_len < hdr_len) return;
 
     uint32_t src_ip = net_ntohl(hdr.src);
-    arp_cache_update(src_ip, src_mac);
+
+    /* ARP entries are learned exclusively from validated ARP exchanges
+     * (see arp_receive) - trusting every IP source address makes
+     * one-frame cache poisoning trivial. */
 
     /* During DHCP negotiation iface->ip is still 0.0.0.0 - accept
      * everything so the OFFER/ACK (often unicast to the granted address)
      * can reach the bound UDP socket. */
-    if (iface->ip != 0 && net_ntohl(hdr.dst) != iface->ip && hdr.dst != 0xFFFFFFFF) return;
+    if (iface->ip != 0) {
+        uint32_t dst      = net_ntohl(hdr.dst);
+        uint32_t bcast    = iface->ip | ~iface->netmask;
+        if (dst != iface->ip && dst != 0xFFFFFFFF && dst != bcast) return;
+    }
 
     const uint8_t* payload = data + hdr_len;
     uint16_t payload_len = total_len - hdr_len;

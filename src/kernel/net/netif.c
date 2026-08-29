@@ -9,7 +9,6 @@ netif_t g_netif;
 
 int netif_init(void) {
     g_netif.flags = 0;
-    g_netif.tx_pending = 0;
     g_netif.send = NULL;
     g_netif.poll = NULL;
     return 0;
@@ -21,17 +20,15 @@ void netif_poll(void) {
 
 void netif_receive(const uint8_t* data, uint16_t len) {
     if (len < ETH_HDR_LEN) return;
+    /* Drivers must never hand us frames larger than the stack can hold:
+     * upper layers memcpy len-sized payloads into fixed buffers. */
+    if (len > NET_MAX_PACKET) return;
     eth_receive(&g_netif, data, len);
 }
 
 int netif_send(const uint8_t* data, uint16_t len) {
     if (g_netif.send == NULL) return -1;
     return g_netif.send(data, len);
-}
-
-int netif_tx_ready(void) {
-    if (g_netif.send == NULL) return 0;
-    return 1;
 }
 
 void netif_get_mac(uint8_t* out_mac) {

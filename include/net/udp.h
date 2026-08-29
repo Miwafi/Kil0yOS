@@ -22,8 +22,6 @@ typedef struct udp_socket {
     int      used;
 
     uint8_t  rx_buf[UDP_RX_BUFSZ];
-    uint16_t rx_head;
-    uint16_t rx_tail;
     uint16_t rx_count;
 } udp_socket_t;
 
