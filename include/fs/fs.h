@@ -87,15 +87,30 @@ typedef struct {
 #define FAT32_EOC_MARK  0x0FFFFFFF
 #define FAT32_BAD_CLUSTER 0x0FFFFFF7
 
-typedef struct fs_entry {
+typedef struct fs_entry fs_entry_t;
+
+/* Storage backend of an fs_entry_t node (Phase 2 mount/overlay support).
+ * FAT   - legacy FAT32 cluster chain (RAM disk fallback / no-ext2 mode)
+ * EXT2  - read-only data on the ext2 disk, served by the ext2 driver
+ * MEM   - in-memory buffer (overlay layer over ext2, or /tmp memfs) */
+typedef enum {
+    FS_BACKEND_FAT = 0,
+    FS_BACKEND_EXT2 = 1,
+    FS_BACKEND_MEM = 2
+} fs_backend_t;
+
+struct fs_entry {
     char name[256];
     fs_entry_type_t type;
     uint32_t size;
     uint32_t first_cluster;
     uint32_t attributes;
+    fs_backend_t backend;
+    uint32_t inode_no;      /* ext2 inode number (FS_BACKEND_EXT2) */
+    uint8_t* mem_data;      /* content buffer (FS_BACKEND_MEM files) */
     struct fs_entry* parent;
     struct fs_entry* children[MAX_DIR_ENTRIES];
-} fs_entry_t;
+};
 
 void fs_init();
 fs_entry_t* fs_root();
@@ -110,5 +125,6 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size);
 int fs_read_file(fs_entry_t* file, uint8_t* buffer, size_t size);
 int fs_get_last_error();
 void fs_save();
+int fs_ext2_active();
 
 #endif

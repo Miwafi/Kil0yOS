@@ -2,6 +2,43 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.12.0] - 2026-08-30
+This release completes **Phase 2 of the Linux compatibility roadmap** (M2 milestone): Kil0yOS now boots from a persistent ext2 root filesystem (read-only driver + in-memory overlay for writes) with a unified VFS mount tree — `/` is disk-backed (ext2) and `/tmp` is RAM-backed (MEM). `/bin` contents survive reboots, closing the RAM-disk volatility of Phase 1. Getting there required hunting down a kernel-heap free-list corruption that had been hiding since Phase 2 development began.
+
+### Added
+- **ext2 read-only driver** (`include/fs/ext2.h`, `src/kernel/fs/ext2.c`): superblock/group-descriptor/inode parsing, extent-free classic block mapping with 12 direct + singly/doubly/triply indirect block resolution (`ext2_bmap`), inode cache, directory iteration, and recursive directory-tree loading into the VFS (`ext2_build_tree`). Probes the raw disk for the `0xEF53` magic; a read-only WSL `mke2fs` image (`tools/make_ext2_disk.sh`, 8 MiB / 8192 blocks to match the RAM disk sector budget) ships `/bin/busybox`.
+- **Multi-backend VFS with write overlay** (`include/fs/fs.h`, `src/kernel/fs/fs.c`): `fs_entry_t` gained a `backend` field (`FS_BACKEND_FAT` / `FS_BACKEND_EXT2` / `FS_BACKEND_MEM`); `fs_read_file`/`fs_write_file` dispatch per backend. Writes to ext2-backed entries go through a copy-on-write MEM overlay (data copied out on first write), `create`/`delete`/`save` guard against persisting overlay nodes to the read-only disk.
+- **Unified mount tree**: `fs_init` mounts ext2 at `/` (falling back to FAT when no ext2 signature is found), mounts the MEM filesystem at `/tmp`, and keeps the FAT RAM-disk fallback fully functional — regression-tested headless with the diskless boot path.
+- **`tools/ext2_qemu_test.py`**: two-boot end-to-end acceptance harness (boot1: mount + `ls /` + busybox `echo` from ext2; boot2: `/bin` persistence check) with strict serial markers.
+- **`tools/parse_serial.py`**: strips interleaved QEMU serial timestamps so heap/panic diagnostics can be grepped reliably.
+- **Serial console mirror for terminal I/O** (`shell/terminal.c`): `term_putchar`/`term_puts` now mirror every character to COM1 (same approach as `tty.c`'s program-output mirror), so shell builtins (`ls`, `touch`, ...) are visible to headless tests. Previously builtin output went to the GUI only and the serial log was blind to it.
+- **Exception forensics** (`isr.c`): CPU exception frames (ISR #, RIP/CS/RSP, error code, CR2 for #PF) and, for ring-3 faults, a user-stack dump are mirrored to COM1 so traces survive triple-fault resets.
+- **Heap integrity diagnostics** (`memory.c` / `mm/memory.h`): every heap block header carries a `HEAP_MAGIC` ("KYOS") canary; `heap_verify(stage)` walks the free list checking range, monotonic order, magic, and physical adjacency, and milestone checks were planted across boot (`keyboard`, `pci`, `pre-e1000`, `dhcp-offer`, shell `pre-exec`/`post-exec`). `kfree` dumps the first 16 free-list blocks (size/free/rawsize + 32-byte hex) when it detects corruption.
+
+### Fixed
+- **kmalloc split underflow shredded the free list (CRITICAL, the Phase 2 heap-corruption root cause)**: when a free block exceeded the request by *less than* `sizeof(heap_block_t)` (24 bytes), `remaining = current->size - size - sizeof(...)` wrapped around as `size_t` and passed the `remaining > 0` split check — producing a bogus block with a huge size (observed as `size=0xFFFFFFxx`) and links pointing backwards into unrelated payloads. Debugging was slowed by *misaligned block headers*: odd request sizes (`strlen+1` path copies) placed headers at non-8-aligned addresses, so magic canaries appeared at shifted offsets in hex dumps. The fix rounds every request up to 8 bytes and splits only when the leftover can hold a full header. This also explains why Phase 1 was unaffected: its allocation pattern never hit the 1..23-byte gap window, while the ext2 tree build churns path strings and directory buffers through it.
+- **`fs_write_file` on the overlay path** and related backend dispatch hardened while wiring MEM writes.
+- Shell `execute_command` and network/DHCP/e1000/PCI paths gained stage-tagged `heap_verify()` checks (kept in-tree as permanent tripwires).
+
+### Changed
+- Version strings bumped to 2.12.0 (boot banner, `version` command, GUI title bar, `uname` release).
+- `Makefile`: `ext2.c` registered in `FS_SRCS`.
+- Removed stale root-level `find_call.py` debug script.
+
+### File Changes
+- `include/fs/ext2.h`, `src/kernel/fs/ext2.c`: ext2 read-only driver (new)
+- `include/fs/fs.h`, `src/kernel/fs/fs.c`: backend field, per-backend read/write dispatch, ext2+MEM mount logic
+- `src/kernel/mm/memory.c`, `include/mm/memory.h`: kmalloc alignment + split-guard fix, HEAP_MAGIC canary, `heap_verify`, kfree diagnostics
+- `src/kernel/shell/terminal.c`: COM1 mirror for terminal output
+- `src/kernel/shell/shell.c`, `src/kernel/net/dhcp.c`, `src/kernel/net/e1000.c`, `src/kernel/core/main.c`: heap_verify milestones
+- `src/kernel/core/isr.c`: exception trace + user-stack dump over serial
+- `Makefile`: ext2.c build wiring
+- `tools/make_ext2_disk.sh`, `tools/ext2_qemu_test.py`, `tools/parse_serial.py`, `tools/_probe_repro.sh`: disk image builder + test harnesses (new)
+- `CHANGELOG.md`: docs
+
+### Notes
+- Acceptance (`tools/ext2_qemu_test.py`, QEMU headless, 2 consecutive boots): boot1 mounts ext2 at `/` (`ls /` → `lost+found  bin  tmp`), busybox runs from ext2 (`echo hello-from-ext2` → `hello-from-ext2`); boot2 after a full reboot still lists the same `/bin` contents (M2 persistence). Heap verifier clean (`CORRUPT` count 0, down from 14 corrupt events per boot before the fix). Diskless regression (Phase 1 harness): FAT fallback formats, `fs_init` completes, busybox applets work — Phase 2 closed (M2).
+
 ## [2.11.0] - 2026-08-30
 This release completes **Phase 1 of the Linux compatibility roadmap** (M1 milestone): Kil0yOS can now run the real busybox (1.36.1, musl-gcc static, all ~390 applets) from `/bin`, and packages can be pulled at runtime over the network with a built-in TFTP client. This required per-process address spaces (private page-table roots with `CR3` switching), a working `fork`/`wait4`/`execve` process model, a TTY line discipline with canonical-mode input, a Linux VFS shim (`statx`/`getdents64`/`openat`/fd tables) layered over the internal FAT32 filesystem, plus a large batch of network-driver and filesystem fixes found while getting the 1.15 MB busybox download + install to work end-to-end.
 

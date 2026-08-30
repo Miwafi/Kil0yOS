@@ -93,7 +93,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.11.0\n");
+    klog("Kil0yOS version 2.12.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -131,36 +131,45 @@ void kernel_main(uint64_t mb_info_phys) {
 
     klog("VFS: initializing filesystem...\n");
     fs_init();
+    heap_verify("fs_init");
 
     klog("user: installing built-in user programs...\n");
     user_programs_install();
+    heap_verify("user_install");
 
     klog("Shell: initializing command interpreter...\n");
     shell_init();
+    heap_verify("shell_init");
     klog("[init] shell_init done\n");
 
     klog("input: keyboard initializing...\n");
     keyboard_init();
+    heap_verify("keyboard");
     klog("[init] keyboard_init done\n");
 
     klog("input: mouse initializing...\n");
     mouse_init();
+    heap_verify("mouse");
     klog("[init] mouse_init done\n");
 
     klog("Speaker: initializing...\n");
     speaker_init();
+    heap_verify("speaker");
     klog("[init] speaker_init done\n");
 
     klog("Scheduler: initializing round-robin scheduler...\n");
     scheduler_init();
+    heap_verify("sched");
     klog("[init] scheduler_init done\n");
 
     klog("ACPI: initializing...\n");
     power_init();
+    heap_verify("acpi");
     klog("[init] power_init done\n");
 
     klog("PCI: initializing bus...\n");
     pci_init();
+    heap_verify("pci");
     klog("[init] pci_init done\n");
 
     klog("net: initializing network stack...\n");
@@ -188,6 +197,7 @@ void kernel_main(uint64_t mb_info_phys) {
         klog("net: no NIC found\n");
     }
     klog("[init] net done\n");
+    heap_verify("net");
 
     klog("SMP: initializing multiprocessor...\n");
     smp_init();

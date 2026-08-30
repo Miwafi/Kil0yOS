@@ -129,6 +129,24 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
     ex_serial_puts(" err=");
     utohex(frame->error_code, buf);
     ex_serial_puts(buf);
+    ex_serial_puts(" RAX=");
+    utohex(frame->rax, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" RBX=");
+    utohex(frame->rbx, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" RCX=");
+    utohex(frame->rcx, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" RDX=");
+    utohex(frame->rdx, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" RSI=");
+    utohex(frame->rsi, buf);
+    ex_serial_puts(buf);
+    ex_serial_puts(" RDI=");
+    utohex(frame->rdi, buf);
+    ex_serial_puts(buf);
 
     if (frame->interrupt_number == 14) {
         uint64_t cr2;
@@ -136,6 +154,24 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
         ex_serial_puts(" CR2=");
         utohex(cr2, buf);
         ex_serial_puts(buf);
+    }
+
+    /* Kernel stack dump: helps identify the caller chain of a fault in
+     * kernel context (code lives at 0x100000-0x400000). */
+    if ((frame->cs & 3) == 0) {
+        ex_serial_puts("\n[KSTACK]");
+        const uint64_t* sp = (const uint64_t*)((frame->rsp + 7) & ~7ULL);
+        for (int i = 0; i < 48; i++) {
+            uint64_t v = sp[i];
+            if (v >= 0x100000 && v < 0x400000) {
+                ex_serial_puts(i == 0 ? "=" : " ");
+                utohex((uint64_t)(sp + i), buf);
+                ex_serial_puts(buf);
+                ex_serial_puts(":");
+                utohex(v, buf);
+                ex_serial_puts(buf);
+            }
+        }
     }
 
     /* Ring-3 fault: dump the user stack (kernel shares the address space)

@@ -45,6 +45,7 @@ DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
 
 # --- Filesystem ---
 FS_SRCS = $(SRCDIR)/kernel/fs/fs.c \
+          $(SRCDIR)/kernel/fs/ext2.c \
           $(SRCDIR)/kernel/fs/edit.c
 
 # --- Standard Library ---

@@ -4,6 +4,7 @@
 #include "timer/pit.h"
 #include "lib/string.h"
 #include "drivers/vga.h"
+#include "mm/memory.h"
 #define DHCP_BOOT_REQUEST  1
 #define DHCP_BOOT_REPLY    2
 #define DHCP_HTYPE_ETHER   1
@@ -185,6 +186,7 @@ int dhcp_autoconfig(netif_t* iface) {
         }
         if (dhcp_wait(iface, sock, DHCP_OFFER, 4000,
                       &yiaddr, &subnet, &router, &server_id) >= 0) {
+            heap_verify("dhcp-offer");
             break;
         }
     }

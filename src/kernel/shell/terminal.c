@@ -1,6 +1,15 @@
 #include "shell/terminal.h"
 #include "drivers/vga.h"
+#include "drivers/io.h"
 #include "lib/string.h"
+
+/* Serial console mirror (COM1): headless QEMU acceptance tests read shell
+ * I/O from the serial log. Mirrors the same approach used by tty.c for
+ * program output; without it builtin ls/touch output is GUI-only. */
+static void term_serial_putc(char c) {
+    while ((inb(0x3F8 + 5) & 0x20) == 0) {}
+    outb(0x3F8, (uint8_t)c);
+}
 
 static terminal_t* g_current_term = NULL;
 
@@ -162,14 +171,21 @@ terminal_t* term_get(void) {
 }
 
 void term_putchar(char c) {
+    /* Serial console mirror: headless QEMU acceptance tests read terminal
+     * I/O from the serial log (same approach as tty.c for program output).
+     * Applied at the term level so both text and GUI terminals mirror. */
+    if (c == '\n') term_serial_putc('\r');
+    if (c == '\n' || c == '\r' || (c >= 32 && c <= 126)) term_serial_putc(c);
     if (g_current_term && g_current_term->putchar) {
         g_current_term->putchar(g_current_term, c);
     }
 }
 
 void term_puts(const char* str) {
-    if (g_current_term && g_current_term->puts) {
-        g_current_term->puts(g_current_term, str);
+    /* Route through term_putchar so every char hits the serial mirror
+     * exactly once, regardless of the active terminal implementation. */
+    while (str && *str) {
+        term_putchar(*str++);
     }
 }
 

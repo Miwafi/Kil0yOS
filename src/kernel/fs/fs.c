@@ -1,4 +1,5 @@
 #include "fs/fs.h"
+#include "fs/ext2.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
@@ -10,6 +11,11 @@ static uint8_t* fat_buffer;
 static int fat_cache_ready = 0;
 static fs_entry_t* root;
 static fs_entry_t* current;
+
+/* Phase 2: when an ext2 superblock is found on the disk, the ext2 tree is
+ * mounted at "/" and the legacy FAT layer stays inactive (the disk must not
+ * be FAT-formatted in that case). */
+static int ext2_mode = 0;
 
 static int fs_last_error = FS_ERR_NONE;
 
@@ -561,6 +567,46 @@ void fs_init() {
     disk_init();
     klog("[fs] disk_init done\n");
 
+    /* Phase 2: prefer a persistent ext2 root filesystem on the disk. */
+    if (ext2_probe()) {
+        fs_entry_t* ext2_root = ext2_build_tree();
+        if (ext2_root != NULL) {
+            root = ext2_root;
+            current = root;
+            ext2_mode = 1;
+            klog("[fs] ext2 mounted at /\n");
+
+            /* /tmp is an in-memory fs (Phase 2.3 mount unification). If the
+             * disk image already ships a /tmp it stays ext2-backed and gets
+             * the same overlay treatment as every other directory. */
+            if (fs_resolve_path("/tmp") == NULL) {
+                fs_entry_t* tmp = fs_create_dir("tmp");
+                if (tmp != NULL) {
+                    tmp->backend = FS_BACKEND_MEM;
+                    klog("[fs] memfs mounted at /tmp\n");
+                }
+            }
+
+            /* Self-test: MEM backend create/write/read round trip. */
+            fs_entry_t* st = fs_create_file("/tmp/.selftest");
+            if (st != NULL) {
+                const char* msg = "kil0yos memfs ok";
+                uint8_t rbuf[32];
+                int w = fs_write_file(st, (const uint8_t*)msg, strlen(msg));
+                int r = fs_read_file(st, rbuf, sizeof(rbuf));
+                if (w >= 0 && r == (int)strlen(msg) &&
+                    memcmp(rbuf, msg, strlen(msg)) == 0) {
+                    klog("[fs] memfs self-test ok\n");
+                } else {
+                    klog("[fs] memfs self-test FAILED\n");
+                }
+            }
+            klog("[fs] fs_init complete (ext2 mode)\n");
+            return;
+        }
+        klog("[fs] ext2 probe ok but tree build failed, falling back\n");
+    }
+
     if (fs_load() == 0) {
         klog("[fs] fs_load ok (disk present)\n");
         return;
@@ -756,6 +802,25 @@ fs_entry_t* fs_create_file(const char* name) {
         entry->children[i] = NULL;
     }
 
+    /* Non-FAT parent (ext2 dir or memfs dir): the overlay creates a
+     * memory-backed node without touching the read-only disk (Phase 2.2). */
+    if (parent_dir->backend != FS_BACKEND_FAT) {
+        entry->backend = FS_BACKEND_MEM;
+        entry->inode_no = 0;
+        entry->mem_data = NULL;
+        for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+            if (parent_dir->children[i] == NULL) {
+                parent_dir->children[i] = entry;
+                break;
+            }
+        }
+        return entry;
+    }
+
+    entry->backend = FS_BACKEND_FAT;
+    entry->inode_no = 0;
+    entry->mem_data = NULL;
+
     fat32_dir_entry_t dir_entry;
     memset(&dir_entry, 0, sizeof(fat32_dir_entry_t));
     format_short_name(base_name, dir_entry.name);
@@ -807,6 +872,34 @@ fs_entry_t* fs_create_dir(const char* name) {
     if (full == FS_ERR_FULL) {
         fs_last_error = FS_ERR_FULL;
         return NULL;
+    }
+
+    /* Non-FAT parent (ext2 dir or memfs dir): memory-only directory node. */
+    if (parent_dir->backend != FS_BACKEND_FAT) {
+        fs_entry_t* entry = (fs_entry_t*)kmalloc(sizeof(fs_entry_t));
+        if (entry == NULL) {
+            fs_last_error = FS_ERR_FULL;
+            return NULL;
+        }
+        strcpy(entry->name, base_name);
+        entry->type = FS_TYPE_DIRECTORY;
+        entry->size = 0;
+        entry->first_cluster = 0;
+        entry->attributes = ATTR_DIRECTORY;
+        entry->parent = parent_dir;
+        entry->backend = FS_BACKEND_MEM;
+        entry->inode_no = 0;
+        entry->mem_data = NULL;
+        for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+            entry->children[i] = NULL;
+        }
+        for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+            if (parent_dir->children[i] == NULL) {
+                parent_dir->children[i] = entry;
+                break;
+            }
+        }
+        return entry;
     }
 
     uint32_t new_cluster = fat_alloc_cluster();
@@ -887,13 +980,40 @@ fs_entry_t* fs_create_dir(const char* name) {
     return entry;
 }
 
+/* MEM backend write: (re)allocate the in-memory content buffer. */
+static int fs_write_file_mem(fs_entry_t* file, const uint8_t* data, size_t size) {
+    uint8_t* buf = (uint8_t*)kmalloc(size > 0 ? size : 1);
+    if (buf == NULL) return -1;
+    if (size > 0) memcpy(buf, data, size);
+
+    if (file->mem_data != NULL) kfree(file->mem_data);
+    file->mem_data = buf;
+    file->size = (uint32_t)size;
+    return (int)size;
+}
+
 int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
     if (file == NULL || file->type != FS_TYPE_FILE || data == NULL) return -1;
-    
+
     if (size > MAX_FILE_SIZE) {
         size = MAX_FILE_SIZE;
     }
-    
+
+    /* MEM backend: pure in-memory write. */
+    if (file->backend == FS_BACKEND_MEM) {
+        return fs_write_file_mem(file, data, size);
+    }
+
+    /* EXT2 backend: overlay copy-on-write - the file becomes memory-backed
+     * and shadows the read-only disk copy (Phase 2.2: memory layer writes,
+     * disk layer reads). fs_write_file replaces the whole content, so the
+     * old data does not need to be read back. */
+    if (file->backend == FS_BACKEND_EXT2) {
+        file->backend = FS_BACKEND_MEM;
+        return fs_write_file_mem(file, data, size);
+    }
+
+    /* FAT backend: legacy cluster chain write. */
     uint32_t old_first_cluster = file->first_cluster;
     uint32_t old_size = file->size;
     
@@ -985,11 +1105,25 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
 
 int fs_read_file(fs_entry_t* file, uint8_t* buffer, size_t size) {
     if (file == NULL || file->type != FS_TYPE_FILE || buffer == NULL) return -1;
-    
+
     if (size > file->size) {
         size = file->size;
     }
-    
+
+    /* MEM backend: content lives in the in-memory buffer. */
+    if (file->backend == FS_BACKEND_MEM) {
+        if (file->mem_data != NULL && size > 0) {
+            memcpy(buffer, file->mem_data, size);
+        }
+        return (int)size;
+    }
+
+    /* EXT2 backend: read through to the disk (Phase 2.2 overlay). */
+    if (file->backend == FS_BACKEND_EXT2) {
+        return ext2_read_file(file->inode_no, buffer, size);
+    }
+
+    /* FAT backend: legacy cluster chain read. */
     if (file->first_cluster == 0) {
         return 0;
     }
@@ -1024,7 +1158,7 @@ int fs_read_file(fs_entry_t* file, uint8_t* buffer, size_t size) {
 
 void fs_delete_entry_recursive(fs_entry_t* entry) {
     if (entry == NULL) return;
-    
+
     if (entry->type == FS_TYPE_DIRECTORY) {
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
             if (entry->children[i] != NULL) {
@@ -1033,11 +1167,16 @@ void fs_delete_entry_recursive(fs_entry_t* entry) {
             }
         }
     }
-    
-    if (entry->first_cluster != 0) {
+
+    /* Only FAT-backed nodes own cluster chains; MEM files own a buffer. */
+    if (entry->backend == FS_BACKEND_FAT && entry->first_cluster != 0) {
         fat_free_cluster_chain(entry->first_cluster);
     }
-    
+    if (entry->mem_data != NULL) {
+        kfree(entry->mem_data);
+        entry->mem_data = NULL;
+    }
+
     kfree(entry);
 }
 
@@ -1054,7 +1193,14 @@ int fs_delete_entry(const char* name) {
         if (parent_dir->children[i] != NULL &&
             strcmp(parent_dir->children[i]->name, base_name) == 0) {
 
-            /* 将磁盘目录项标记为已删除 (0xE5) */
+            /* 将磁盘目录项标记为已删除 (0xE5) - FAT 后端专属；
+             * MEM/ext2 overlay 节点只需从内存树摘除 */
+            if (parent_dir->children[i]->backend != FS_BACKEND_FAT) {
+                fs_delete_entry_recursive(parent_dir->children[i]);
+                parent_dir->children[i] = NULL;
+                return 0;
+            }
+
             uint32_t cluster = parent_dir->first_cluster;
             uint32_t current_cluster = cluster;
             while (current_cluster != 0 && current_cluster != FAT32_EOC_MARK && current_cluster != FAT32_IO_ERROR) {
@@ -1094,6 +1240,10 @@ static void fs_save_file(fs_entry_t* file);
 static void fs_save_directory(fs_entry_t* dir);
 
 void fs_save() {
+    /* ext2 mode: the disk is read-only ext2, in-memory overlay state is
+     * volatile by design - do not write FAT structures onto the disk. */
+    if (ext2_mode) return;
+
     uint8_t buffer[DISK_SECTOR_SIZE];
 
     /* 1. Save boot sector */
@@ -1239,4 +1389,8 @@ static void fs_save_directory(fs_entry_t* dir) {
     }
 
     kfree(dir_data);
+}
+
+int fs_ext2_active() {
+    return ext2_mode;
 }

@@ -22,6 +22,7 @@ void* kmalloc(size_t size);
 void kfree(void* ptr);
 void* kcalloc(size_t nmemb, size_t size);
 void* krealloc(void* ptr, size_t size);
+int heap_verify(const char* stage); /* 0 = clean, -1 = corrupted (logged) */
 
 /* --- PMM --- */
 #define PMM_MAX_PAGES (1024ULL * 1024ULL)  /* 4GB / 4KB */

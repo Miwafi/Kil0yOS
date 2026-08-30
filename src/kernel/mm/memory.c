@@ -17,10 +17,107 @@ typedef struct heap_block {
     size_t size;
     struct heap_block* next;
     int free;
-    int _pad;
+    int magic; /* HEAP_MAGIC canary: catches header stomps early */
 } heap_block_t;
 
 static heap_block_t* heap_list = NULL;
+
+#define HEAP_MAGIC 0x4B594F53 /* "KYOS" */
+
+extern void klog(const char* s);
+
+/* Public heap integrity check. Walks the block list verifying range,
+ * monotonic order, header magic AND physical adjacency
+ * (next must equal cur + sizeof(header) + size). Returns 0 if clean,
+ * -1 (with a klog marking the failing block) otherwise. */
+int heap_verify(const char* stage) {
+    extern void klog(const char* s);
+    heap_block_t* it = heap_list;
+    heap_block_t* last = NULL;
+    while (it != NULL) {
+        if ((uint8_t*)it < heap_start || (uint8_t*)it >= heap_end ||
+            (last != NULL && it <= last) || it->magic != HEAP_MAGIC) {
+            klog("[heap] CORRUPT");
+            if (stage != NULL) {
+                klog(" (");
+                klog(stage);
+                klog(")");
+            }
+            klog(" at/after blk ");
+            char b[16];
+            itoa((int)(((uint64_t)last) >> 4), b, 16, sizeof(b));
+            klog(b);
+            klog("x");
+            if (last != NULL) {
+                klog(" good(size=");
+                itoa((int)last->size, b, 10, sizeof(b));
+                klog(b);
+                klog(" free=");
+                itoa(last->free, b, 10, sizeof(b));
+                klog(b);
+                klog(")");
+            }
+            /* Hex-dump 32 bytes AT the bad block itself: the stomp payload
+             * identifies the writer (packet data? pointer? ASCII?). */
+            {
+                heap_block_t* bad = (last != NULL) ? last->next : heap_list;
+                if ((uint8_t*)bad >= heap_start && (uint8_t*)bad < heap_end) {
+                    klog(" BAD@");
+                    itoa((int)(((uint64_t)bad) >> 4), b, 16, sizeof(b));
+                    klog(b);
+                    klog("x");
+                    klog(" rawsize=");
+                    /* print full 64-bit size as 8 hex digits */
+                    static const char hexd[] = "0123456789abcdef";
+                    char hb[19];
+                    hb[0] = '0'; hb[1] = 'x';
+                    for (int i = 0; i < 16; i++)
+                        hb[2 + i] = hexd[((uint64_t)bad->size >> (60 - i * 4)) & 0xF];
+                    hb[18] = 0;
+                    klog(hb);
+                    uint8_t* p = (uint8_t*)bad;
+                    for (int i = 0; i < 32; i++) {
+                        if ((i & 7) == 0) klog(" |");
+                        itoa((int)(p[i] >> 4), b, 16, sizeof(b));
+                        klog(b);
+                        itoa((int)(p[i] & 0xF), b, 16, sizeof(b));
+                        klog(b);
+                    }
+                }
+            }
+            klog("\n");
+            return -1;
+        }
+        /* Physical adjacency: blocks must be laid out back-to-back. */
+        if (it->next != NULL &&
+            (uint8_t*)it->next != (uint8_t*)it + sizeof(heap_block_t) + it->size) {
+            klog("[heap] NON-ADJACENT");
+            if (stage != NULL) {
+                klog(" (");
+                klog(stage);
+                klog(")");
+            }
+            klog(" blk ");
+            char b[20];
+            itoa((int)(((uint64_t)it) >> 4), b, 16, sizeof(b));
+            klog(b);
+            klog("x size=");
+            itoa((int)it->size, b, 10, sizeof(b));
+            klog(b);
+            klog(" next=");
+            itoa((int)(((uint64_t)it->next) >> 4), b, 16, sizeof(b));
+            klog(b);
+            klog("x expect=");
+            itoa((int)((((uint64_t)it) + sizeof(heap_block_t) + it->size) >> 4), b, 16, sizeof(b));
+            klog(b);
+            klog("x\n");
+            return -1;
+        }
+        last = it;
+        it = it->next;
+    }
+    return 0;
+}
 
 static void pmm_mark_region(uint64_t base, uint64_t length, int used);
 
@@ -75,6 +172,7 @@ void memory_init(memory_map_t* map, size_t count) {
     heap_list->size = heap_end - heap_start - sizeof(heap_block_t);
     heap_list->next = NULL;
     heap_list->free = 1;
+    heap_list->magic = HEAP_MAGIC;
 
     /* CRITICAL: the kernel heap arena lives in identity-mapped RAM that the
      * PMM considers free (heap starts at 2 MiB, PMM reserves only the first
@@ -108,21 +206,41 @@ void memory_init(memory_map_t* map, size_t count) {
 }
 
 void* kmalloc(size_t size) {
+    /* Round requests up to 8 bytes: keeps every block header 8-aligned
+     * (odd sizes from strlen+1 path copies used to create misaligned
+     * headers) and makes the split window below well-defined. */
+    if (size == 0) size = 8;
+    size = (size + 7) & ~(size_t)7;
+
     heap_block_t* current = heap_list;
     heap_block_t* prev    = NULL;
 
     while (current != NULL) {
         if (current->free && current->size >= size) {
-            size_t remaining = current->size - size - sizeof(heap_block_t);
-            if (remaining > 0) {
+            /* Split ONLY when the leftover can hold a full header.
+             * The old `remaining > 0` test underflowed when the free
+             * block exceeded the request by less than sizeof(header)
+             * (24 bytes): remaining wrapped to a huge size_t and the
+             * bogus block shredded the free list (observed as
+             * size=0xFFFFFFxx blocks and backward links right after
+             * fs_init's ext2 tree build). */
+            if (current->size - size > sizeof(heap_block_t)) {
+                size_t remaining = current->size - size - sizeof(heap_block_t);
                 heap_block_t* new_block = (heap_block_t*)((uint8_t*)(current + 1) + size);
                 new_block->size = remaining;
                 new_block->next = current->next;
                 new_block->free = 1;
+                new_block->magic = HEAP_MAGIC;
                 current->next   = new_block;
+                /* Split: the front piece shrinks to the request. */
+                current->size = size;
             }
-            current->size = size;
+            /* remaining <= 0: use the block whole and KEEP its recorded
+             * size. Shrinking it here would break the physical-adjacency
+             * invariant (next == cur + 24 + size) that kfree's coalescing
+             * and heap_verify rely on. */
             current->free = 0;
+            current->magic = HEAP_MAGIC;
             return (void*)(current + 1);
         }
         prev = current;
@@ -143,6 +261,7 @@ void* kmalloc(size_t size) {
         block->size = size;
         block->next = NULL;
         block->free = 0;
+        block->magic = HEAP_MAGIC;
         if (prev != NULL) {
             prev->next = block;
         } else if (heap_list == NULL) {
@@ -161,6 +280,30 @@ void kfree(void* ptr) {
     }
     heap_block_t* block = (heap_block_t*)ptr - 1;
     if ((uint8_t*)block < heap_start || (uint8_t*)block >= heap_end) return;
+
+    /* Heap integrity check: the free list must stay within [heap_start,
+     * heap_end), strictly increasing and magic-stamped. On corruption we
+     * REFUSE to touch the list (walking it would #GP on garbage links)
+     * and leak the block instead. */
+    if (heap_verify("kfree") != 0) {
+        /* Dump the first healthy-looking blocks to bracket the stomp. */
+        heap_block_t* it = heap_list;
+        int n = 0;
+        while (it != NULL && n < 16) {
+            char b1[12], b2[12];
+            klog("  blk ");
+            itoa((int)((uint64_t)it >> 4), b1, 16, sizeof(b1));
+            klog(b1);
+            klog("x size=");
+            itoa((int)it->size, b2, 10, sizeof(b2));
+            klog(b2);
+            klog("\n");
+            if (it->next <= it) break;
+            it = it->next;
+            n++;
+        }
+        return;
+    }
 
     block->free = 1;
     heap_block_t* current = heap_list;

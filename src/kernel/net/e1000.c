@@ -222,6 +222,7 @@ int e1000_send(const uint8_t* data, uint16_t len) {
 }
 
 int e1000_init(void) {
+    heap_verify("pre-e1000");
     pci_device_t* dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID);
     if (!dev) dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID_82545);
     if (!dev) dev = pci_find_device(E1000_VENDOR_ID, E1000_DEVICE_ID_82574);
@@ -355,6 +356,7 @@ int e1000_init(void) {
         tx_descs[i].addr = tx_phys[i];
         tx_descs[i].status = 0x01; /* DD=1, initially available */
     }
+    heap_verify("tx-bufs");
     tx_tail = 0;
 
     e1000_write(E1000_TDBAL, (uint32_t)tx_desc_phys);
@@ -377,6 +379,7 @@ int e1000_init(void) {
         rx_descs[i].addr = rx_phys[i];
         rx_descs[i].status = 0;
     }
+    heap_verify("rx-bufs");
     rx_head = 0;
 
     e1000_write(E1000_RDBAL, (uint32_t)rx_desc_phys);
@@ -389,6 +392,7 @@ int e1000_init(void) {
     e1000_write(E1000_RCTL,
         RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE |
         RCTL_LBM_NO | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2048);
+    heap_verify("rx-enabled");
 
     /* Enable transmitter */
     e1000_write(E1000_TIPG, 0x0060200A);
@@ -414,5 +418,6 @@ int e1000_init(void) {
     g_netif.send = e1000_send;
     g_netif.poll = e1000_rx_poll;
     g_netif.flags = 1;
+    heap_verify("e1000_init");
     return 0;
 }
