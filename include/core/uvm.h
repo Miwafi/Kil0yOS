@@ -45,4 +45,14 @@ uint64_t uvm_mmap_anon(process_t* proc, uint64_t hint, size_t len,
 /* Release every region of the process (unmap + free physical pages). */
 void uvm_release_all(process_t* proc);
 
+/* fork: copy all mapped user pages of parent into fresh frames of child
+ * and mirror the region table + brk/mmap cursors. Returns 0 or -1. */
+int uvm_fork(process_t* parent, process_t* child);
+
+/* Copy into/out of a user VA of the given process through the identity
+ * map (works regardless of which CR3 is active). */
+void uvm_write_user_va(process_t* proc, uint64_t dst_va, const void* src,
+                       size_t len);
+void uvm_read_user_va(process_t* proc, void* dst, uint64_t src_va, size_t len);
+
 #endif

@@ -23,6 +23,59 @@ static uint32_t pte_to_prot(uint64_t pte) {
 static uint64_t page_down(uint64_t a) { return a & ~0xFFFULL; }
 static uint64_t page_up(uint64_t a)   { return (a + 0xFFF) & ~0xFFFULL; }
 
+/* --- Address-space targeting ---
+ * uvm ops may run for a process that is not the currently active CR3
+ * (exec load, fork, reaping). The vmm walk pointer is switched to the
+ * target's root; the CPU's CR3 is NOT touched. All user VAs are < 4GB,
+ * so page contents are accessed through the identity map (VA == PA). */
+static uint64_t uvm_enter(process_t* proc) {
+    uint64_t old = vmm_current_root();
+    if (proc->cr3) vmm_set_root_ptr(proc->cr3);
+    return old;
+}
+static void uvm_leave(uint64_t old) {
+    vmm_set_root_ptr(old);
+}
+
+/* Copy into a user VA of the given process through the identity map */
+void uvm_write_user_va(process_t* proc, uint64_t dst_va,
+                       const void* src, size_t len) {
+    uint64_t old = uvm_enter(proc);
+    const uint8_t* s = (const uint8_t*)src;
+    while (len > 0) {
+        uint64_t page = page_down(dst_va);
+        uint64_t phys = vmm_get_phys(page);
+        if (phys == 0) break;   /* unmapped: drop (callers pre-map) */
+        size_t off = (size_t)(dst_va - page);
+        size_t chunk = PAGE_SIZE - off;
+        if (chunk > len) chunk = len;
+        memcpy((void*)(phys + off), s, chunk);
+        s += chunk;
+        dst_va += chunk;
+        len -= chunk;
+    }
+    uvm_leave(old);
+}
+
+/* Copy out of a user VA (through the identity map) */
+void uvm_read_user_va(process_t* proc, void* dst, uint64_t src_va, size_t len) {
+    uint64_t old = uvm_enter(proc);
+    uint8_t* d = (uint8_t*)dst;
+    while (len > 0) {
+        uint64_t page = page_down(src_va);
+        uint64_t phys = vmm_get_phys(page);
+        if (phys == 0) break;
+        size_t off = (size_t)(src_va - page);
+        size_t chunk = PAGE_SIZE - off;
+        if (chunk > len) chunk = len;
+        memcpy(d, (const void*)(phys + off), chunk);
+        d += chunk;
+        src_va += chunk;
+        len -= chunk;
+    }
+    uvm_leave(old);
+}
+
 /* Region bookkeeping: extend an overlapping region or add a new one. */
 static void region_commit(process_t* proc, uint64_t start, uint64_t end, uint32_t prot) {
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
@@ -52,6 +105,7 @@ int uvm_map_range(process_t* proc, uint64_t start, uint64_t end, uint32_t prot) 
     (void)proc;
     if (end <= start) return -1;
 
+    uint64_t old_root = uvm_enter(proc);
     uint64_t s = page_down(start);
     uint64_t e = page_up(end);
 
@@ -82,18 +136,21 @@ int uvm_map_range(process_t* proc, uint64_t start, uint64_t end, uint32_t prot) 
                         pmm_free_page(pphys & ~0xFFF);
                     }
                 }
+                uvm_leave(old_root);
                 return -1;
             }
             vmm_map_page(v, phys, prot_to_pte(prot));
-            memset((void*)v, 0, PAGE_SIZE);  /* anonymous pages are zeroed */
+            memset((void*)phys, 0, PAGE_SIZE);  /* zero via identity map */
         }
     }
 
     region_commit(proc, s, e, prot);
+    uvm_leave(old_root);
     return 0;
 }
 
 int uvm_unmap_range(process_t* proc, uint64_t start, uint64_t end) {
+    uint64_t old_root = uvm_enter(proc);
     uint64_t s = page_down(start);
     uint64_t e = page_up(end);
 
@@ -104,6 +161,7 @@ int uvm_unmap_range(process_t* proc, uint64_t start, uint64_t end) {
             pmm_free_page(phys & ~0xFFF);
         }
     }
+    uvm_leave(old_root);
 
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
         vm_region_t* r = &proc->regions[i];
@@ -126,11 +184,13 @@ int uvm_change_prot(process_t* proc, uint64_t start, uint64_t end, uint32_t prot
     /* Every page must belong to a region before we touch page tables. */
     if (!uvm_check_range(proc, s, e - s)) return -1;
 
+    uint64_t old_root = uvm_enter(proc);
     for (uint64_t v = s; v < e; v += PAGE_SIZE) {
         uint64_t phys = vmm_get_phys(v);
         if (phys == 0) continue;
         vmm_map_page(v, phys & ~0xFFF, prot_to_pte(prot));
     }
+    uvm_leave(old_root);
 
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
         vm_region_t* r = &proc->regions[i];
@@ -182,6 +242,7 @@ uint64_t uvm_mmap_anon(process_t* proc, uint64_t hint, size_t len, uint32_t prot
 }
 
 void uvm_release_all(process_t* proc) {
+    uint64_t old_root = uvm_enter(proc);
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
         vm_region_t* r = &proc->regions[i];
         if (!r->used) continue;
@@ -194,7 +255,57 @@ void uvm_release_all(process_t* proc) {
         }
         r->used = 0;
     }
+    uvm_leave(old_root);
     proc->brk_start = 0;
     proc->brk_cur = 0;
     proc->mmap_top = 0;
+}
+
+/* fork (Phase 1.5): copy every mapped user page of parent into fresh
+ * frames of child (no COW). Content flows through the identity map so
+ * neither CR3 needs to be active. Returns 0 or -1 (out of memory). */
+int uvm_fork(process_t* parent, process_t* child) {
+    uint64_t old_root = uvm_enter(parent);
+
+    for (int i = 0; i < MAX_VM_REGIONS; i++) {
+        vm_region_t* r = &parent->regions[i];
+        if (!r->used) continue;
+
+        for (uint64_t v = r->start; v < r->end; v += PAGE_SIZE) {
+            uint64_t pphys = vmm_get_phys(v);
+            if (pphys == 0) continue;
+            pphys &= ~0xFFF;
+
+            uint64_t cphys = pmm_alloc_page();
+            if (cphys == 0) {
+                uvm_leave(old_root);
+                uvm_release_all(child);
+                return -1;
+            }
+            memcpy((void*)cphys, (const void*)pphys, PAGE_SIZE);
+
+            /* Map into the child's address space */
+            vmm_set_root_ptr(child->cr3);
+            vmm_map_page(v, cphys, prot_to_pte(r->prot));
+            vmm_set_root_ptr(parent->cr3);
+        }
+
+        /* Mirror the region entry */
+        vm_region_t* cr = NULL;
+        for (int j = 0; j < MAX_VM_REGIONS; j++) {
+            if (!child->regions[j].used) { cr = &child->regions[j]; break; }
+        }
+        if (cr == NULL) {
+            uvm_leave(old_root);
+            uvm_release_all(child);
+            return -1;
+        }
+        *cr = *r;
+    }
+
+    uvm_leave(old_root);
+    child->brk_start = parent->brk_start;
+    child->brk_cur = parent->brk_cur;
+    child->mmap_top = parent->mmap_top;
+    return 0;
 }

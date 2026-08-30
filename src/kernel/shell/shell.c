@@ -19,6 +19,7 @@
 #include "net/icmp.h"
 #include "net/arp.h"
 #include "net/udp.h"
+#include "net/tftp.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -52,6 +53,7 @@ static int cmd_ifconfig(int argc, char** argv);
 static int cmd_netstat(int argc, char** argv);
 static int cmd_net(int argc, char** argv);
 static int cmd_exec(int argc, char** argv);
+static int cmd_tftp(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -72,6 +74,7 @@ static shell_command_t commands[] = {
     {"ifconfig", "Show network configuration", cmd_ifconfig},
     {"netstat", "Show network status", cmd_netstat},
     {"net", "Network info / subcommand (ping|ifconfig|netstat)", cmd_net},
+    {"tftp", "Download a file via TFTP (installs to /bin)", cmd_tftp},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
     {"exec", "Execute a user program", cmd_exec},
@@ -417,7 +420,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.10.0\n");
+    vga_puts("Kil0yOS v2.11.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -776,7 +779,7 @@ static int cmd_gui(int argc, char** argv) {
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.10.0", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.11.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);
@@ -1074,6 +1077,23 @@ static int cmd_net(int argc, char** argv) {
     return 1;
 }
 
+/* Shared launch path: load `file` with the given argv and run it until
+ * it exits. argv[0] is passed through (busybox dispatches applets by
+ * argv[0] basename). Returns the process exit code or -1. */
+static int shell_launch_program(const char* file, char** argv, int argc) {
+    if (process_any_active()) {
+        vga_puts("exec: another process is still active\n");
+        return -1;
+    }
+    process_reap_zombies();
+
+    int pid = exec_load_program(file, argv, argc);
+    if (pid < 0) return -1;
+
+    process_run(pid);
+    return 0;
+}
+
 static int cmd_exec(int argc, char** argv) {
     if (argc < 2) {
         vga_puts("Usage: exec <program> [args...]\n");
@@ -1081,34 +1101,122 @@ static int cmd_exec(int argc, char** argv) {
         return 1;
     }
 
-    /* One user process at a time (single shared user address space) */
-    if (process_any_active()) {
-        vga_puts("exec: another process is still active\n");
-        return 1;
-    }
-    process_reap_zombies();
-
-    /* Unified exec path (Phase 0.6): detects ELF64 / KIL0 / raw binary,
-     * builds the process and lays out argv/envp/auxv. */
-    int pid = exec_load_program(argv[1], argv + 1, argc - 1);
-    if (pid < 0) {
+    if (shell_launch_program(argv[1], argv + 1, argc - 1) < 0) {
         vga_puts("exec: failed to load: ");
         vga_puts(argv[1]);
         vga_puts("\n");
         return 1;
     }
+    return 0;
+}
 
-    char pid_buf[16];
-    itoa(pid, pid_buf, 10, 4);
-    vga_puts("Process created with PID: ");
-    vga_puts(pid_buf);
+/* Phase 1.4: pull a file from a TFTP server and install it. Without a
+ * server the gateway is used (matches QEMU's built-in TFTP and PXE
+ * conventions); without a local name the file lands in /bin under its
+ * basename, so downloaded ELFs are directly runnable. */
+static int cmd_tftp(int argc, char** argv) {
+    if (argc < 2) {
+        vga_puts("Usage: tftp [server-ip] <file> [local-name]\n");
+        vga_puts("Default server: gateway. Example: tftp busybox -> /bin/busybox\n");
+        return 1;
+    }
+
+    if (!g_netif.flags) {
+        vga_puts("Network not available.\n");
+        return 1;
+    }
+
+    const char* remote;
+    uint32_t server;
+    if (argc >= 3) {
+        server = parse_ip(argv[1]);
+        remote = argv[2];
+    } else {
+        server = g_netif.gateway;
+        remote = argv[1];
+    }
+
+    klog("[shell] tftp: fetching ");
+    klog(remote);
+    klog("\n");
+
+    vga_puts("Downloading ");
+    vga_puts(remote);
+    vga_puts(" from ");
+    print_ip(server);
+    vga_puts(" ...\n");
+
+    uint8_t* buf = NULL;
+    size_t size = 0;
+    if (tftp_download(&g_netif, server, remote, &buf, &size) != 0) {
+        vga_puts("tftp: download failed\n");
+        klog("[shell] tftp: download failed\n");
+        return 1;
+    }
+
+    /* Default destination: /bin/<basename of remote> */
+    const char* base = remote;
+    for (const char* p = remote; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+    char local[128];
+    if (argc >= 4) {
+        strncpy(local, argv[3], sizeof(local) - 1);
+        local[sizeof(local) - 1] = '\0';
+    } else {
+        strcpy(local, "/bin/");
+        size_t room = sizeof(local) - strlen(local) - 1;
+        size_t nlen = strlen(base);
+        if (nlen > room) nlen = room;
+        memcpy(local + strlen(local), base, nlen);
+        local[strlen(local) + nlen] = '\0';
+    }
+
+    /* fs_create_file works in the current directory: switch to /bin for
+     * the default case, then restore. */
+    fs_entry_t* saved_cwd = fs_current();
+    int installed = 0;
+    if (fs_resolve_path("/bin") != NULL && local[0] != '/') {
+        fs_set_current(fs_resolve_path("/bin"));
+    }
+    fs_entry_t* f = fs_resolve_path(local);
+    if (f == NULL) {
+        /* create under the chosen directory using the final component */
+        const char* lname = local;
+        for (const char* p = local; *p; p++) {
+            if (*p == '/') lname = p + 1;
+        }
+        f = fs_create_file(lname);
+    }
+    if (f != NULL) {
+        installed = (fs_write_file(f, buf, size) >= 0);
+    }
+    fs_set_current(saved_cwd);
+
+    if (!installed) {
+        vga_puts("tftp: install failed (");
+        vga_puts(local);
+        vga_puts(")\n");
+        klog("[shell] tftp: install failed (");
+        klog(local);
+        klog(")\n");
+        kfree(buf);
+        return 1;
+    }
+
+    char num[16];
+    itoa((int)size, num, 10, sizeof(num));
+    klog("[shell] tftp: installed ");
+    klog(local);
+    klog(" (");
+    klog(num);
+    klog(" bytes)\n");
+    vga_puts("Installed ");
+    vga_puts(num);
+    vga_puts(" bytes to ");
+    vga_puts(local);
     vga_puts("\n");
-
-    /* Actually run the process */
-    process_run(pid);
-
-    /* If we return here, the process exited */
-    vga_puts("Process exited.\n");
+    kfree(buf);
     return 0;
 }
 
@@ -1132,10 +1240,45 @@ static int execute_command(char* cmd) {
             return commands[i].func(argc, argv);
         }
     }
-    
-    vga_puts(argv[0]);
-    vga_puts(" not found\n");
-    return 1;
+
+    /* Not a builtin: run a Linux-ABI program. Try /bin/<cmd> first,
+     * then the busybox multi-call binary (it dispatches the applet by
+     * argv[0] basename, so argv[0] must stay the typed command). */
+    {
+        char* bargv[MAX_ARGUMENTS];
+        char path[128];
+        int i;
+
+        strcpy(path, "/bin/");
+        {
+            size_t room = sizeof(path) - strlen(path) - 1;
+            size_t nlen = strlen(argv[0]);
+            if (nlen > room) nlen = room;
+            memcpy(path + strlen(path), argv[0], nlen);
+            path[strlen(path) + nlen] = '\0';
+        }
+
+        if (fs_resolve_path(path) != NULL) {
+            bargv[0] = path;
+        } else {
+            strcpy(path, "/bin/busybox");
+            if (fs_resolve_path(path) == NULL) {
+                vga_puts(argv[0]);
+                vga_puts(" not found\n");
+                return 1;
+            }
+            bargv[0] = argv[0];
+        }
+        for (i = 1; i < argc; i++) bargv[i] = argv[i];
+        bargv[argc] = NULL;
+
+        if (shell_launch_program(path, bargv, argc) < 0) {
+            vga_puts(argv[0]);
+            vga_puts(": failed to load\n");
+            return 1;
+        }
+        return 0;
+    }
 }
 
 void shell_init() {

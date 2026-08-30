@@ -52,23 +52,28 @@ int elf_is_elf64(const uint8_t* data, size_t size) {
     return data[0] == 0x7F && data[1] == 'E' && data[2] == 'L' && data[3] == 'F';
 }
 
-/* Copy the file-backed slice of one PT_LOAD page-by-page through the
- * freshly mapped user VAs (ring 0 may write user pages). BSS pages were
- * zero-filled by uvm_map_range, so only [p_offset, p_offset+p_filesz)
- * needs copying. Returns 0 or ELF_ERR_MAP. */
+/* Copy the file-backed slice of one PT_LOAD. The segment pages live in the
+ * process's own page tables, so vmm_get_phys must walk the process root;
+ * content is then written through the identity map (VA == PA, CPU CR3
+ * stays on the boot tables). Writing user VAs directly would hit the boot
+ * tables' 2MB identity huge pages and the copy would silently vanish.
+ * BSS pages were zero-filled by uvm_map_range, so only
+ * [p_offset, p_offset+p_filesz) needs copying. Returns 0 or ELF_ERR_MAP. */
 static int elf_copy_segment(const uint8_t* data, const elf_phdr_t* ph, uint64_t bias) {
     uint64_t vstart = bias + ph->p_vaddr;
     const uint8_t* src = data + ph->p_offset;
 
-    uint64_t page = page_down(vstart);
-    uint64_t end  = vstart + ph->p_filesz;
-    while (page < end) {
-        uint64_t slice_start = (vstart > page) ? vstart : page;
-        uint64_t slice_end = page + PAGE_SIZE;
-        if (slice_end > end) slice_end = end;
-        memcpy((void*)slice_start, src + (slice_start - vstart),
-               (size_t)(slice_end - slice_start));
-        page += PAGE_SIZE;
+    uint64_t done = 0;
+    while (done < ph->p_filesz) {
+        uint64_t va = vstart + done;
+        uint64_t page = page_down(va);
+        uint64_t phys = vmm_get_phys(page);   /* walks vmm_pml4 = proc root */
+        if (phys == 0) return ELF_ERR_MAP;
+        uint64_t off = va - page;
+        uint64_t chunk = PAGE_SIZE - off;
+        if (chunk > ph->p_filesz - done) chunk = ph->p_filesz - done;
+        memcpy((void*)(phys + off), src + done, chunk);
+        done += chunk;
     }
     return 0;
 }
@@ -125,7 +130,14 @@ int elf_load(process_t* proc, const uint8_t* data, size_t size,
         uint64_t vs = bias + p->p_vaddr;
         uint64_t ve = vs + p->p_memsz;      /* BSS included: mapped + zeroed */
         if (uvm_map_range(proc, vs, ve, prot) != 0) return ELF_ERR_MAP;
-        elf_copy_segment(data, p, bias);
+
+        /* Walk the process root while resolving segment pages (see
+         * elf_copy_segment); the CPU CR3 itself stays untouched. */
+        uint64_t saved_root = vmm_current_root();
+        if (proc->cr3) vmm_set_root_ptr(proc->cr3);
+        int crc = elf_copy_segment(data, p, bias);
+        vmm_set_root_ptr(saved_root);
+        if (crc != 0) return ELF_ERR_MAP;
 
         if (page_up(ve) > max_end) max_end = page_up(ve);
     }

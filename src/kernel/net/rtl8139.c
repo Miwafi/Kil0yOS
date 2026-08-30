@@ -57,15 +57,24 @@ void rtl8139_rx_poll(void) {
     int enabled = irq_save();
     disable_interrupts();
 
-    while ((inb(io_base + RTL8139_REG_CR) & CR_BUFE) == 0) {
+    int drained = 0;
+    while ((inb(io_base + RTL8139_REG_CR) & CR_BUFE) == 0 && drained < 32) {
+        drained++;
         uint16_t capr = inw(io_base + RTL8139_REG_CAPR);
         /* CAPR holds the read pointer minus 0x10 (per RTL8139 datasheet):
          * with RxBufPtr=0 the register reads 0xFFF0. Add the 0x10 back
          * before converting to a ring offset. */
         uint16_t offset = (uint16_t)(capr + 0x10) % RX_BUF_SIZE;
 
-        uint8_t* pkt = rx_buffer + offset;
-        uint32_t header = *(uint32_t*)pkt;
+        /* The 4-byte status+length header can straddle the end of the
+         * ring: the hardware wraps DMA writes byte-wise, so a flat
+         * *(uint32_t*) read here picks up data from the ring start and
+         * yields a bogus length - which would desync CAPR from the
+         * hardware write pointer. */
+        uint32_t header = 0;
+        for (int k = 0; k < 4; k++) {
+            ((uint8_t*)&header)[k] = rx_buffer[(offset + k) % RX_BUF_SIZE];
+        }
         uint16_t pkt_len = header >> 16;
         uint8_t pkt_status = header & 0xFF;
 
@@ -73,11 +82,27 @@ void rtl8139_rx_poll(void) {
             /* pkt_len comes straight from DMA: a bogus value would push
              * CAPR past the hardware write pointer and desync the ring
              * forever. Skip the 4-byte header and resync on the next pass. */
-            pkt_len = 0;
+            rx_offset = (offset + 4 + 3) & ~3;
+            while (rx_offset >= RX_BUF_SIZE) rx_offset -= RX_BUF_SIZE;
+            outw(io_base + RTL8139_REG_CAPR, rx_offset - 0x10);
+            continue;
         }
 
-        if ((pkt_status & 0x01) && pkt_len > 4) {
-            netif_receive(pkt + 4, pkt_len - 4);
+        /* Deliver frames. A frame wrapping the ring end is reassembled
+         * byte-wise into a linear buffer first: the hardware writes it
+         * wrapped, so a direct pointer would hand up stale bytes from
+         * outside the ring (IP checksums drop them; ARP has none). */
+        uint16_t frame_len = (uint16_t)(pkt_len - 4);   /* minus CRC */
+        if ((pkt_status & 0x01) && pkt_len > 4 && frame_len <= NET_MAX_PACKET) {
+            if (RX_BUF_SIZE - offset >= (uint16_t)(pkt_len + 4)) {
+                netif_receive(rx_buffer + offset + 4, frame_len);
+            } else {
+                uint8_t lin[NET_MAX_PACKET];
+                for (uint16_t k = 0; k < frame_len; k++) {
+                    lin[k] = rx_buffer[(offset + 4 + k) % RX_BUF_SIZE];
+                }
+                netif_receive(lin, frame_len);
+            }
         }
 
         rx_offset = (offset + pkt_len + 4 + 3) & ~3;

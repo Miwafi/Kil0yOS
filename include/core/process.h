@@ -2,6 +2,7 @@
 #define PROCESS_H
 
 #include "lib/types.h"
+#include "core/lnxvfs.h"
 
 /* Maximum number of processes */
 #define MAX_PROCESSES 16
@@ -84,6 +85,18 @@ typedef struct process {
 
     /* File system */
     int current_dir_cluster;
+
+    /* Linux-ABI open file table (fd 0/1/2 = console, never in the array) */
+    struct lnx_file* fds[LNX_MAX_FDS];
+
+    /* Address space + fork/wait state (Phase 1.5). cr3 is the phys of
+     * this process's PML4 (0 = legacy kernel-shared). parked_rsp holds a
+     * resumable IRQ-frame while the process is blocked (wait4). */
+    uint64_t cr3;
+    uint64_t parked_rsp;
+    int parent_pid;
+    int wait_pid;             /* -1 = any child */
+    uint64_t wait_status_ptr; /* user pointer for the wait4 status int */
 } process_t;
 
 /* Process management functions */
@@ -96,6 +109,9 @@ process_t* process_get_by_pid(uint32_t pid);
 
 /* Free resources of exited processes; call before creating new ones */
 void process_reap_zombies(void);
+
+/* Free every resource of an exited process and release its slot */
+void process_reap(process_t* proc);
 
 /* True if any user process is loaded (READY/RUNNING/BLOCKED) */
 int process_any_active(void);
@@ -123,6 +139,30 @@ int load_user_program(const char* path);
  * builds the process, and lays out argc/argv/envp/auxv on the user stack.
  * argv points to kernel strings. Returns the new pid or -1. */
 int exec_load_program(const char* path, char* const* argv, int argc);
+
+/* execve (Phase 1.5): replace the CURRENT process image with a new ELF.
+ * frame_rsp points at the live syscall-entry frame; on success its
+ * RIP/RSP/RAX fields are rewritten so the syscall epilogue's iretq lands
+ * directly in the new program. Returns 0, or -1 (old image intact). */
+int exec_replace(uint64_t frame_rsp, const char* path,
+                 char* const* argv, int argc);
+
+/* fork/wait4 (Phase 1.5). frame_rsp points at the caller's syscall-entry
+ * frame holding the user context to clone / park. */
+int  process_fork(uint64_t frame_rsp);
+void process_wait_run(process_t* child, uint64_t status_ptr, uint64_t frame_rsp);
+process_t* process_find_waiter(int child_pid);
+process_t* process_find_child(process_t* parent, int pid);
+
+/* Write an int into a user VA of the given process (wait4 status) */
+void process_write_user_int(process_t* p, uint64_t uaddr, int val);
+
+/* Scheduler helper: another READY process holding a parked user frame
+ * (fork child / preempted parent), or NULL. */
+process_t* process_pick_ready(uint32_t exclude_pid);
+
+/* Scheduler hook: mark the given process RUNNING and current */
+void process_become_current(process_t* proc);
 
 /* Top of the current process's kernel stack; the Linux-ABI `syscall`
  * entry switches to it because the syscall instruction does not load

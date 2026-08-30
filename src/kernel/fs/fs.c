@@ -3,13 +3,20 @@
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "drivers/disk.h"
+#include "drivers/vga.h"
 
 static fat32_boot_sector_t boot_sector;
 static uint8_t* fat_buffer;
+static int fat_cache_ready = 0;
 static fs_entry_t* root;
 static fs_entry_t* current;
 
 static int fs_last_error = FS_ERR_NONE;
+
+/* Cluster allocation starts scanning here; bumped after each allocation and
+ * lowered when clusters are freed. Keeps appending to a large file O(1)
+ * instead of rescanning the whole FAT per cluster. */
+static uint32_t fat_alloc_hint = 2;
 
 static uint32_t get_sectors_per_fat() {
     return boot_sector.sectors_per_fat_32;
@@ -37,46 +44,77 @@ static uint32_t get_fat_entry_offset(uint32_t cluster) {
     return entry_offset % boot_sector.bpb.bytes_per_sector;
 }
 
+static uint32_t fat_entry_count() {
+    return (get_sectors_per_fat() * DISK_SECTOR_SIZE) / 4;
+}
+
+/* Load FAT #1 into memory: entry reads/writes become memory accesses instead
+ * of a disk sector I/O each (a 1 MB file write touches ~2300 entries). */
+static int fat_cache_load() {
+    uint32_t fat_sectors = get_sectors_per_fat();
+    uint8_t* buf = (uint8_t*)kmalloc(fat_sectors * DISK_SECTOR_SIZE);
+    if (buf == NULL) return -1;
+
+    for (uint32_t s = 0; s < fat_sectors; s++) {
+        if (disk_read_sector(get_first_fat_sector() + s, buf + s * DISK_SECTOR_SIZE) != 0) {
+            kfree(buf);
+            return -1;
+        }
+    }
+
+    fat_buffer = buf;
+    fat_cache_ready = 1;
+    return 0;
+}
+
 #define FAT32_IO_ERROR 0xFFFFFFFF
 
 static uint32_t fat_read_entry(uint32_t cluster) {
+    if (fat_cache_ready && cluster < fat_entry_count()) {
+        return *(uint32_t*)(fat_buffer + cluster * 4);
+    }
+
     uint32_t sector = get_fat_entry_sector(cluster);
     uint32_t offset = get_fat_entry_offset(cluster);
     uint8_t buffer[DISK_SECTOR_SIZE];
-    
+
     if (disk_read_sector(sector, buffer) != 0) {
         return FAT32_IO_ERROR;
     }
-    
+
     return *(uint32_t*)(buffer + offset);
 }
 
 static int fat_write_entry(uint32_t cluster, uint32_t value) {
+    if (fat_cache_ready && cluster < fat_entry_count()) {
+        *(uint32_t*)(fat_buffer + cluster * 4) = value;
+    }
+
     uint32_t sector = get_fat_entry_sector(cluster);
     uint32_t offset = get_fat_entry_offset(cluster);
     uint8_t buffer[DISK_SECTOR_SIZE];
-    
+
     if (disk_read_sector(sector, buffer) != 0) {
         return -1;
     }
-    
+
     *(uint32_t*)(buffer + offset) = value;
-    
+
     return disk_write_sector(sector, buffer);
 }
 
 static uint32_t fat_alloc_cluster() {
     uint32_t data_sectors = DISK_MAX_SECTORS - get_first_data_sector();
     uint32_t max_cluster = 2 + (data_sectors / boot_sector.bpb.sectors_per_cluster);
-    char tmp[16];
-    itoa((int)max_cluster, tmp, 10, sizeof(tmp));
-    klog("[fs] alloc_cluster max_cluster=");
-    klog(tmp);
-    klog("\n");
 
-    for (uint32_t cluster = 2; cluster < max_cluster; cluster++) {
-        uint32_t entry = fat_read_entry(cluster);
-        if (entry == 0) {
+    /* Resume scanning where the previous allocation left off; one wrap
+     * around the hint before giving up. */
+    uint32_t start = fat_alloc_hint;
+    if (start < 2 || start >= max_cluster) start = 2;
+
+    uint32_t cluster = start;
+    for (;;) {
+        if (fat_read_entry(cluster) == 0) {
             if (fat_write_entry(cluster, FAT32_EOC_MARK) == 0) {
                 /* Update FSInfo sector */
                 uint8_t buffer[DISK_SECTOR_SIZE];
@@ -95,16 +133,26 @@ static uint32_t fat_alloc_cluster() {
                     }
                     disk_write_sector(boot_sector.fs_info_sector, buffer);
                 }
+                fat_alloc_hint = (cluster + 1 >= max_cluster) ? 2 : cluster + 1;
                 return cluster;
             }
         }
+        cluster++;
+        if (cluster >= max_cluster) cluster = 2;
+        if (cluster == start) break;
     }
+    klog("[fs] alloc_cluster: no free clusters\n");
     return 0;
 }
 
 static int fat_free_cluster_chain(uint32_t first_cluster) {
     uint32_t cluster = first_cluster;
     uint32_t freed_count = 0;
+
+    /* Freed clusters become allocation candidates again */
+    if (first_cluster >= 2 && first_cluster < fat_alloc_hint) {
+        fat_alloc_hint = first_cluster;
+    }
 
     while (cluster != 0 && cluster != FAT32_EOC_MARK && cluster != FAT32_IO_ERROR) {
         uint32_t next = fat_read_entry(cluster);
@@ -483,7 +531,11 @@ int fs_load() {
         boot_sector.boot_signature_word != 0xAA55) {
         return -1;
     }
-    
+
+    if (fat_cache_ready == 0 && fat_cache_load() != 0) {
+        klog("[fs] fat cache load failed (falling back to disk I/O)\n");
+    }
+
     root = (fs_entry_t*)kmalloc(sizeof(fs_entry_t));
     if (root == NULL) return -1;
     
@@ -610,15 +662,9 @@ fs_entry_t* fs_resolve_path(const char* path) {
 
 static int fs_check_entry_exists(fs_entry_t* dir, const char* name) {
     if (dir == NULL || name == NULL) return FS_ERR_INVALID;
-    char dbg[16]; itoa((int)(uint64_t)dir, dbg, 16, sizeof(dbg));
-    klog("[fs] check_exists dir=0x"); klog(dbg); klog(" name="); klog(name); klog("\n");
 
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         if (dir->children[i] != NULL) {
-            char nb[16];
-            for (int j=0;j<16;j++){ nb[j] = ((char*)(dir->children[i]->name))[j]; if(nb[j]<0x20&&nb[j]!='\n')nb[j]='.'; }
-            nb[15]=0;
-            klog("[fs]     name='"); klog(nb); klog("'\n");
             if (strcmp(dir->children[i]->name, name) == 0) {
                 return FS_ERR_EXISTS;
             }
@@ -736,9 +782,6 @@ fs_entry_t* fs_create_file(const char* name) {
 
 fs_entry_t* fs_create_dir(const char* name) {
     fs_last_error = FS_ERR_NONE;
-    klog("[fs] create_dir: ");
-    klog(name);
-    klog("\n");
 
     if (name == NULL || strlen(name) >= 256) {
         fs_last_error = FS_ERR_INVALID;
@@ -748,7 +791,6 @@ fs_entry_t* fs_create_dir(const char* name) {
     fs_entry_t* parent_dir;
     const char* base_name;
     resolve_parent_and_name(name, &parent_dir, &base_name);
-    klog("[fs] create_dir: resolved parent\n");
 
     if (parent_dir == NULL || base_name == NULL || *base_name == '\0') {
         fs_last_error = FS_ERR_INVALID;
@@ -756,21 +798,18 @@ fs_entry_t* fs_create_dir(const char* name) {
     }
 
     int exists = fs_check_entry_exists(parent_dir, base_name);
-    klog("[fs] create_dir: checked exists\n");
     if (exists == FS_ERR_EXISTS) {
         fs_last_error = FS_ERR_EXISTS;
         return NULL;
     }
 
     int full = fs_check_dir_full(parent_dir);
-    klog("[fs] create_dir: checked full\n");
     if (full == FS_ERR_FULL) {
         fs_last_error = FS_ERR_FULL;
         return NULL;
     }
-    
+
     uint32_t new_cluster = fat_alloc_cluster();
-    klog("[fs] create_dir: allocated cluster\n");
     if (new_cluster == 0) {
         fs_last_error = FS_ERR_FULL;
         return NULL;

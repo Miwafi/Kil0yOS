@@ -24,7 +24,9 @@ CORE_SRCS = $(SRCDIR)/kernel/core/main.c \
             $(SRCDIR)/kernel/core/uvm.c \
             $(SRCDIR)/kernel/core/elf.c \
             $(SRCDIR)/kernel/core/syscall.c \
-            $(SRCDIR)/kernel/core/syscall_lnx.c
+            $(SRCDIR)/kernel/core/syscall_lnx.c \
+            $(SRCDIR)/kernel/core/tty.c \
+            $(SRCDIR)/kernel/core/lnxvfs.c
 
 # --- Memory Management ---
 MM_SRCS = $(SRCDIR)/kernel/mm/memory.c
@@ -67,6 +69,7 @@ NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
            $(SRCDIR)/kernel/net/icmp.c \
            $(SRCDIR)/kernel/net/udp.c \
            $(SRCDIR)/kernel/net/dhcp.c \
+           $(SRCDIR)/kernel/net/tftp.c \
            $(SRCDIR)/kernel/net/rtl8139.c \
            $(SRCDIR)/kernel/net/e1000.c
 
@@ -143,6 +146,16 @@ $(BUILDDIR)/user_blob_mmt.o: $(BUILDDIR)/user/mmt
 	printf 'section .rodata\nglobal user_mmt_start\nuser_mmt_start:\nincbin "%s"\nglobal user_mmt_end\nuser_mmt_end:\n' '$<' > $(BUILDDIR)/user_blob_mmt.s
 	$(AS) -f elf64 $(BUILDDIR)/user_blob_mmt.s -o $@
 
+# --- busybox: musl static multi-call binary (Phase 1.3) -----------------
+# Built in WSL at $(BUSYBOX_SRC) (see tools/build_busybox.sh). Embedded
+# only when the binary exists, and installed to /bin/busybox at boot.
+BUSYBOX_SRC := $(HOME)/busybox-1.36.1/busybox
+BUSYBOX_BLOB := $(if $(wildcard $(BUSYBOX_SRC)),$(BUILDDIR)/user_blob_busybox.o,)
+
+$(BUILDDIR)/user_blob_busybox.o: $(BUSYBOX_SRC)
+	printf 'section .rodata\nglobal user_busybox_start\nuser_busybox_start:\nincbin "%s"\nglobal user_busybox_end\nuser_busybox_end:\n' '$<' > $(BUILDDIR)/user_blob_busybox.s
+	$(AS) -f elf64 $(BUILDDIR)/user_blob_busybox.s -o $@
+
 $(BUILDDIR)/user/hello.o: user/hello.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CCFLAGS) -c $< -o $@
@@ -179,8 +192,8 @@ $(BUILDDIR)/kernel/core/ap_trampoline.o: $(BUILDDIR)/ap_trampoline.bin | $(BUILD
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -I binary -O elf64-x86-64 $< $@
 
-$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(LNX_BLOB_OBJS)
-	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(LNX_BLOB_OBJS) -o $@
+$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(LNX_BLOB_OBJS) $(BUSYBOX_BLOB)
+	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(LNX_BLOB_OBJS) $(BUSYBOX_BLOB) -o $@
 
 $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 	@mkdir -p $(BUILDDIR)/iso/boot/grub

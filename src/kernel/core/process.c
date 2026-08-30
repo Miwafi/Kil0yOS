@@ -26,6 +26,35 @@ uint64_t syscall_kernel_rsp = 0;
 static uint8_t kernel_stacks[MAX_PROCESSES][KERNEL_STACK_SIZE] __attribute__((aligned(16)));
 
 static void process_release_memory(process_t* proc);
+process_t* process_find_waiter(int child_pid);
+process_t* process_find_child(process_t* parent, int pid);
+extern void restore_frame(uint64_t rsp);   /* isr.asm */
+
+/* --- Saved-frame layouts -------------------------------------------------
+ * syscall_lnx_entry frame (indexes of uint64_t from RSP):
+ *   0..14  r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax
+ *   15     user RIP    16 CS(0x1B)   17 RFLAGS   18 user RSP   19 SS(0x23)
+ * irq_common_stub frame:
+ *   0..14  same register order
+ *   15     int num     16 error code 17 RIP      18 CS         19 RFLAGS
+ *   20     RSP         21 SS
+ * ----------------------------------------------------------------------- */
+#define IRQ_INTNUM 15
+#define IRQ_ERR    16
+#define IRQ_RIP    17
+#define IRQ_CS     18
+#define IRQ_RFLAGS 19
+#define IRQ_RSP    20
+#define IRQ_SS     21
+#define IRQ_RAX    14
+#define FRAME_QWORDS 22
+#define FRAME_BYTES  (FRAME_QWORDS * 8)
+
+#define ENTY_RIP    15
+#define ENTY_CS     16
+#define ENTY_RFLAGS 17
+#define ENTY_RSP    18
+#define ENTY_SS     19
 
 static inline void wrmsr(uint32_t msr, uint64_t val) {
     uint32_t lo = (uint32_t)val, hi = (uint32_t)(val >> 32);
@@ -68,6 +97,14 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     int proc_index = proc - processes;
     proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
 
+    proc->wait_pid = 0;
+    proc->cr3 = vmm_create_address_space();
+    if (proc->cr3 == 0) {
+        memset(proc, 0, sizeof(process_t));
+        vga_puts("[proc] create failed: no address space\n");
+        return -1;
+    }
+
     /* Legacy raw-binary layout: one RWX code image at USER_CODE_BASE
      * (above the kernel heap arena) plus the user stack, tracked as
      * ordinary uvm regions so teardown/exit works for every format. */
@@ -80,7 +117,7 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
         goto fail;
     }
     proc->code_pages = (uint32_t)((code_size + 4095) / 4096);
-    memcpy((void*)USER_CODE_BASE, code, code_size);
+    uvm_write_user_va(proc, USER_CODE_BASE, code, code_size);
 
     if (uvm_map_range(proc, USER_STACK_BASE - USER_STACK_SIZE, USER_STACK_BASE,
                       UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
@@ -101,6 +138,7 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
 fail:
     /* Undo partial allocation so no half-initialized process remains */
     uvm_release_all(proc);
+    vmm_destroy_address_space(proc->cr3);
     memset(proc, 0, sizeof(process_t));
     return -1;
 }
@@ -116,10 +154,21 @@ static void process_release_memory(process_t* proc) {
 void process_reap_zombies(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (processes[i].state == PROCESS_STATE_ZOMBIE) {
-            process_release_memory(&processes[i]);
-            processes[i].state = PROCESS_STATE_UNUSED;
+            process_reap(&processes[i]);
         }
     }
+}
+
+/* Free every resource of an exited process and release its slot
+ * (wait4 reaping). The process must not be running. */
+void process_reap(process_t* proc) {
+    process_release_memory(proc);
+    if (proc->cr3) {
+        vmm_destroy_address_space(proc->cr3);
+        proc->cr3 = 0;
+    }
+    proc->parked_rsp = 0;
+    proc->state = PROCESS_STATE_UNUSED;
 }
 
 int process_any_active(void) {
@@ -136,6 +185,9 @@ int process_any_active(void) {
 uint64_t process_kill_current(int status) {
     process_t* proc = process_get_current();
     if (proc == NULL) return 0;
+
+    /* Flush and free the process's open files */
+    lnxvfs_close_all(proc);
 
     /* Same IRQ0-exclusion rule as process_exit(): no tick may observe the
      * half-updated state. isr_handler already runs with IF=0 (interrupt
@@ -157,9 +209,38 @@ int process_check_user_range(uint64_t uaddr, size_t len) {
 void process_exit(int status) {
     if (current_process < 0) return;
 
-    klog("[proc] exit syscall\n");
-
     process_t* proc = &processes[current_process];
+
+    /* Flush and free the process's open files before anything else */
+    lnxvfs_close_all(proc);
+
+    /* A parent blocked in wait4 resumes directly from here with the
+     * child's status delivered into its parked frame. */
+    process_t* par = process_find_waiter(proc->pid);
+    if (par != NULL) {
+        __asm__ volatile("cli");
+
+        proc->state = PROCESS_STATE_ZOMBIE;
+        proc->exit_status = status;
+
+        /* wait4 status format: exit code in bits 15..8 */
+        if (par->wait_status_ptr) {
+            process_write_user_int(par, par->wait_status_ptr,
+                                   (status & 0xFF) << 8);
+        }
+        uint64_t* f = (uint64_t*)par->parked_rsp;
+        f[IRQ_RAX] = proc->pid;              /* wait4() returns child pid */
+
+        current_process = par - processes;
+        par->state = PROCESS_STATE_RUNNING;
+        par->wait_pid = 0;
+        tss_set_kernel_stack(par->kernel_stack);
+        syscall_kernel_rsp = par->kernel_stack;
+        if (par->cr3) vmm_switch_cr3(par->cr3);
+        scheduler_invalidate_user_frame();
+
+        restore_frame(par->parked_rsp);      /* never returns */
+    }
 
     /* Atomic w.r.t. IRQ0: no timer tick may observe the half-updated
      * state below and save this dying frame into tasks[0].rsp. */
@@ -202,8 +283,6 @@ void process_run(uint32_t pid) {
         return;
     }
 
-    klog("[proc] run pid\n");
-
     /* No tick may fire from here until the iretq into ring 3: the moment
      * state becomes RUNNING, scheduler_tick() would classify this ring0
      * context as the user frame and switch away mid-setup, corrupting the
@@ -214,6 +293,11 @@ void process_run(uint32_t pid) {
     /* Mark as running */
     proc->state = PROCESS_STATE_RUNNING;
     current_process = proc - processes;
+
+    /* Switch to the process's private address space. From here on the
+     * kernel runs (and the vmm walks) inside this process's page tables
+     * until the scheduler returns to the kernel-main task. */
+    if (proc->cr3) vmm_switch_cr3(proc->cr3);
 
     /* Set TSS kernel stack for interrupt/syscall returns, and the global
      * copy used by the Linux-ABI `syscall` entry (which does not switch
@@ -304,7 +388,8 @@ static void rand_fill16(uint8_t* dst) {
 }
 
 /* Build argc/argv/envp/auxv at the top of the user stack.
- * Returns the RSP to hand to jump_to_user. */
+ * Returns the RSP to hand to jump_to_user. All writes go through the
+ * identity map so the process's CR3 need not be active yet. */
 static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* res,
                                     char* const* argv, int argc) {
     uint64_t sp = proc->stack_top;
@@ -316,28 +401,29 @@ static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* re
     size_t env_len = strlen(env) + 1;
     sp -= env_len;
     uint64_t uenv = sp;
-    memcpy((void*)sp, env, env_len);
+    uvm_write_user_va(proc, sp, env, env_len);
 
     for (int i = 0; i < n; i++) {
         const char* s = argv[i] ? argv[i] : "";
         size_t l = strlen(s) + 1;
         sp -= l;
         ustr[i] = sp;
-        memcpy((void*)sp, s, l);
+        uvm_write_user_va(proc, sp, s, l);
     }
 
     uint8_t rnd[16];
     rand_fill16(rnd);
     sp -= 16;
     uint64_t urandom = sp;
-    memcpy((void*)sp, rnd, 16);
+    uvm_write_user_va(proc, sp, rnd, 16);
 
     /* Final block: argc + argv[] + NULL + envp[] + NULL + auxv.
      * RSP must be 16-byte aligned at the entry point per the ABI. */
     size_t block = 8 + 8 * ((size_t)n + 1) + 8 * 2 + 8 * (2 * AUXV_PAIRS);
     sp = (sp - block) & ~0xFULL;
 
-    uint64_t* u = (uint64_t*)sp;
+    uint64_t blk[2 + 8 + 2 + 2 * AUXV_PAIRS];
+    uint64_t* u = blk;
     *u++ = (uint64_t)n;
     for (int i = 0; i < n; i++) *u++ = ustr[i];
     *u++ = 0;                 /* argv end */
@@ -364,10 +450,12 @@ static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* re
         *u++ = aux[i].k;
         *u++ = aux[i].v;
     }
+    uvm_write_user_va(proc, sp, blk, (size_t)((uint8_t*)u - (uint8_t*)blk));
     return sp;
 }
 
-/* Allocate and initialize a bare process slot (no user memory yet). */
+/* Allocate and initialize a bare process slot (no user memory yet).
+ * Each process gets its own address space (Phase 1.5). */
 static process_t* process_alloc_slot(const char* name) {
     process_t* proc = find_free_process();
     if (proc == NULL) return NULL;
@@ -376,6 +464,13 @@ static process_t* process_alloc_slot(const char* name) {
     strncpy(proc->name, name, sizeof(proc->name) - 1);
     int proc_index = proc - processes;
     proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
+    proc->wait_pid = 0;
+    proc->cr3 = vmm_create_address_space();
+    if (proc->cr3 == 0) {
+        memset(proc, 0, sizeof(process_t));
+        return NULL;
+    }
+    proc->parent_pid = (current_process >= 0) ? processes[current_process].pid : 0;
     return proc;
 }
 
@@ -446,18 +541,6 @@ int exec_load_program(const char* path, char* const* argv, int argc) {
         proc->brk_start = proc->brk_cur = res.brk_start;
         proc->mmap_top = UVM_MMAP_BASE;
 
-        klog("[exec] ELF64 loaded: entry=");
-        char b[19];
-        b[0] = '0'; b[1] = 'x';
-        for (int i = 0; i < 16; i++) b[2 + i] = "0123456789abcdef"[(res.entry >> (60 - i * 4)) & 0xF];
-        b[18] = 0;
-        klog(b);
-        klog(" brk=");
-        b[0] = '0'; b[1] = 'x';
-        for (int i = 0; i < 16; i++) b[2 + i] = "0123456789abcdef"[(res.brk_start >> (60 - i * 4)) & 0xF];
-        klog(b);
-        klog("\n");
-
         proc->entry_point = res.entry;
         proc->user_rsp = process_build_stack(proc, &res, argv, argc);
         proc->state = PROCESS_STATE_READY;
@@ -508,6 +591,10 @@ extern const uint8_t user_mini_end[];
 /* Freestanding brk/mmap/mprotect acceptance probe (always embedded) */
 extern const uint8_t user_mmt_start[];
 extern const uint8_t user_mmt_end[];
+
+/* musl static busybox (embedded only when built via tools/build_busybox.sh) */
+extern const uint8_t user_busybox_start[] __attribute__((weak));
+extern const uint8_t user_busybox_end[] __attribute__((weak));
 
 void user_programs_install(void) {
     fs_entry_t* bin = fs_resolve_path("/bin");
@@ -561,5 +648,232 @@ void user_programs_install(void) {
         }
     }
 
+    if (&user_busybox_start != NULL &&
+        &user_busybox_end > &user_busybox_start &&
+        fs_resolve_path("/bin/busybox") == NULL) {
+        fs_entry_t* f = fs_create_file("busybox");
+        if (f != NULL) {
+            size_t size = (size_t)(user_busybox_end - user_busybox_start);
+            fs_write_file(f, user_busybox_start, size);
+            klog("[user] /bin/busybox installed (musl static)\n");
+        }
+    }
+
     fs_set_current(prev);
+}
+
+/* ======================================================================== */
+/*  fork / wait4 (Phase 1.5)                                                */
+/* ======================================================================== */
+
+process_t* process_find_waiter(int child_pid) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = &processes[i];
+        if (p->state != PROCESS_STATE_BLOCKED) continue;
+        if (p->wait_pid == child_pid ||
+            (p->wait_pid == -1 && p->parent_pid != 0)) {
+            /* wait_pid == -1: waiter of this child only if it forked it */
+            if (p->wait_pid == -1) {
+                int found = 0;
+                for (int j = 0; j < MAX_PROCESSES; j++) {
+                    if (processes[j].pid == (uint32_t)child_pid &&
+                        processes[j].parent_pid == (int)p->pid) { found = 1; break; }
+                }
+                if (!found) continue;
+            }
+            return p;
+        }
+    }
+    return NULL;
+}
+
+process_t* process_find_child(process_t* parent, int pid) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* c = &processes[i];
+        if (c->state == PROCESS_STATE_UNUSED) continue;
+        if (c->parent_pid != (int)parent->pid) continue;
+        if (pid > 0 && (int)c->pid != pid) continue;
+        if (c->state == PROCESS_STATE_READY ||
+            c->state == PROCESS_STATE_RUNNING ||
+            c->state == PROCESS_STATE_ZOMBIE) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* Write an int into a user VA of the given process (wait4 status
+ * delivery; the process may not be the currently active CR3). */
+void process_write_user_int(process_t* p, uint64_t uaddr, int val) {
+    uint64_t old = vmm_current_root();
+    vmm_set_root_ptr(p->cr3);
+    uint64_t page = uaddr & ~0xFFFULL;
+    uint64_t phys = vmm_get_phys(page);
+    if (phys != 0) {
+        *(int*)(phys + (uaddr - page)) = val;
+    }
+    vmm_set_root_ptr(old);
+}
+
+/* fork from the Linux-ABI syscall context. frame_rsp points at the
+ * caller's syscall-entry frame holding the parent's user context; the
+ * child gets a clone of it (IRQ layout, RAX=0) parked on its own kernel
+ * stack so the scheduler can resume it like any user frame. */
+int process_fork(uint64_t frame_rsp) {
+    process_t* p = process_get_current();
+    if (p == NULL) return -1;
+
+    process_t* c = process_alloc_slot(p->name);
+    if (c == NULL) return -1;
+    c->parent_pid = (int)p->pid;
+
+    if (uvm_fork(p, c) != 0) {
+        vmm_destroy_address_space(c->cr3);
+        memset(c, 0, sizeof(process_t));
+        return -1;
+    }
+    lnxvfs_inherit_fds(p, c);
+
+    uint64_t* e = (uint64_t*)frame_rsp;               /* entry layout */
+    uint64_t frsp = ((c->kernel_stack - FRAME_BYTES) & ~0xFULL);
+    uint64_t* f = (uint64_t*)frsp;
+    for (int i = 0; i < 15; i++) f[i] = e[i];
+    f[IRQ_RAX] = 0;                                   /* child return value */
+    f[IRQ_INTNUM] = 32;
+    f[IRQ_ERR] = 0;
+    f[IRQ_RIP] = e[ENTY_RIP];
+    f[IRQ_CS] = 0x1B;
+    f[IRQ_RFLAGS] = e[ENTY_RFLAGS];
+    f[IRQ_RSP] = e[ENTY_RSP];
+    f[IRQ_SS] = 0x23;
+
+    c->entry_point = e[ENTY_RIP];
+    c->user_rsp = e[ENTY_RSP];
+    c->parked_rsp = frsp;
+    c->state = PROCESS_STATE_READY;
+
+    klog("[fork] child ready\n");
+    return (int)c->pid;
+}
+
+/* wait4 slow path: park the caller (BLOCKED) and run the child until it
+ * exits; the exit path then resumes the caller's frame with the status
+ * patched into RAX. Never returns. */
+void process_wait_run(process_t* child, uint64_t status_ptr, uint64_t frame_rsp) {
+    process_t* p = process_get_current();
+    if (p == NULL) return;
+
+    __asm__ volatile("cli");
+
+    /* Convert the caller's live entry-layout frame into a resumable
+     * IRQ-layout frame parked below it on the caller's kernel stack. */
+    uint64_t* e = (uint64_t*)frame_rsp;
+    uint64_t frsp = ((frame_rsp - FRAME_BYTES) & ~0xFULL);
+    uint64_t* f = (uint64_t*)frsp;
+    for (int i = 0; i < 15; i++) f[i] = e[i];
+    f[IRQ_RAX] = 0;                    /* patched with child pid at exit */
+    f[IRQ_INTNUM] = 32;
+    f[IRQ_ERR] = 0;
+    f[IRQ_RIP] = e[ENTY_RIP];
+    f[IRQ_CS] = e[ENTY_CS];
+    f[IRQ_RFLAGS] = e[ENTY_RFLAGS];
+    f[IRQ_RSP] = e[ENTY_RSP];
+    f[IRQ_SS] = e[ENTY_SS];
+
+    p->state = PROCESS_STATE_BLOCKED;
+    p->wait_pid = (int)child->pid;
+    p->wait_status_ptr = status_ptr;
+    p->parked_rsp = frsp;
+
+    /* Hand the CPU to the child */
+    current_process = child - processes;
+    child->state = PROCESS_STATE_RUNNING;
+    tss_set_kernel_stack(child->kernel_stack);
+    syscall_kernel_rsp = child->kernel_stack;
+    if (child->cr3) vmm_switch_cr3(child->cr3);
+    scheduler_invalidate_user_frame();
+
+    restore_frame(child->parked_rsp);  /* never returns */
+}
+
+/* Scheduler helper: another READY process holding a parked user frame
+ * (fork child / preempted parent), or NULL. */
+process_t* process_pick_ready(uint32_t exclude_pid) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = &processes[i];
+        if (p->state == PROCESS_STATE_READY && p->parked_rsp != 0 &&
+            p->pid != exclude_pid) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* Scheduler hook: make the given process the current one (tick path
+ * resuming a parked user frame). */
+void process_become_current(process_t* proc) {
+    current_process = proc - processes;
+    proc->state = PROCESS_STATE_RUNNING;
+}
+
+/* execve (Phase 1.5): replace the current process image with a new ELF.
+ * The caller passes kernel-side copies of path/argv (user memory is
+ * about to be torn down). On success the live syscall-entry frame is
+ * rewritten so its iretq lands in the new program; returns 0. On early
+ * failure (before the old image is dropped) returns -1. */
+int exec_replace(uint64_t frame_rsp, const char* path,
+                 char* const* argv, int argc) {
+    fs_entry_t* entry = fs_resolve_path(path);
+    if (entry == NULL || entry->type != FS_TYPE_FILE) return -1;
+
+    uint8_t* buffer = (uint8_t*)kmalloc(entry->size);
+    if (buffer == NULL) return -1;
+    if (fs_read_file(entry, buffer, entry->size) != (int)entry->size) {
+        kfree(buffer);
+        return -1;
+    }
+    if (!elf_is_elf64(buffer, entry->size)) {
+        kfree(buffer);
+        return -1;
+    }
+
+    process_t* proc = process_get_current();
+    if (proc == NULL) {
+        kfree(buffer);
+        return -1;
+    }
+
+    /* Point of no return: drop the old image. Any failure from here on
+     * terminates the process - there is nothing left to return to. */
+    uvm_release_all(proc);
+
+    proc->stack_top = USER_STACK_BASE;
+    if (uvm_map_range(proc, USER_STACK_BASE - USER_STACK_SIZE, USER_STACK_BASE,
+                      UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
+        goto dead;
+    }
+    proc->stack_pages = USER_STACK_SIZE / 4096;
+
+    elf_load_result_t res;
+    if (elf_load(proc, buffer, entry->size, &res) != 0) goto dead;
+    kfree(buffer);
+
+    proc->entry_point = res.entry;
+    proc->brk_start = proc->brk_cur = res.brk_start;
+    proc->mmap_top = UVM_MMAP_BASE;
+    proc->user_rsp = process_build_stack(proc, &res, argv, argc);
+
+    /* Rewrite the live syscall frame: the epilogue's iretq now enters
+     * the new image with RAX = 0 (execve "never returns" to the caller). */
+    uint64_t* f = (uint64_t*)frame_rsp;
+    f[IRQ_RAX] = 0;
+    f[ENTY_RIP] = res.entry;
+    f[ENTY_RSP] = proc->user_rsp;
+
+    return 0;
+
+dead:
+    kfree(buffer);
+    process_exit(127);   /* never returns */
+    __builtin_unreachable();
 }

@@ -77,9 +77,36 @@ int udp_bind(udp_socket_t* sock, uint16_t port) {
     return 0;
 }
 
+/* Pick a free ephemeral source port. udp_receive() only demuxes to bound
+ * sockets, so sending from an unbound socket would silently lose every
+ * reply. Returns 0 if no port is free. */
+static uint16_t udp_ephemeral_port(void) {
+    static uint16_t next = 49152;
+    for (int tries = 0; tries < 0x4000; tries++) {
+        uint16_t p = next++;
+        if (next < 49152) next = 49152;
+        int taken = 0;
+        for (int i = 0; i < UDP_MAX_SOCKETS; i++) {
+            if (sockets[i].used && sockets[i].bound && sockets[i].local_port == p) {
+                taken = 1;
+                break;
+            }
+        }
+        if (!taken) return p;
+    }
+    return 0;
+}
+
 int udp_sendto(udp_socket_t* sock, uint32_t dst_ip, uint16_t dst_port,
                const uint8_t* data, uint16_t len) {
     if (!sock || !sock->used) return -1;
+
+    if (!sock->bound) {
+        uint16_t p = udp_ephemeral_port();
+        if (p == 0) return -1;
+        sock->local_port = p;
+        sock->bound = 1;
+    }
 
     /* Fail up front: the IP+UDP headers must fit under the Ethernet MTU,
      * otherwise the oversized packet would only be rejected deep inside

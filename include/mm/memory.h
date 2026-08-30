@@ -52,6 +52,18 @@ uint64_t vmm_get_phys(uint64_t virt);
 uint64_t vmm_get_pte(uint64_t virt);
 void vmm_reload_cr3(void);
 
+/* --- Per-process address spaces (Phase 1.5 fork) ---
+ * A fresh address space shares the boot kernel mappings (identity map)
+ * but owns private page-table pages for the user range, so processes no
+ * longer collide at the fixed user VAs. All user VAs are < 4GB, so page
+ * table pages and user frames are always reachable through the identity
+ * map (VA == PA) regardless of which CR3 is active. */
+uint64_t vmm_create_address_space(void);
+void     vmm_destroy_address_space(uint64_t root);
+uint64_t vmm_current_root(void);      /* phys of the walked root */
+void     vmm_set_root_ptr(uint64_t phys);   /* walk target only, no CR3 */
+void     vmm_switch_cr3(uint64_t phys);     /* pointer + CR3 load */
+
 /* --- Panic / Assert --- */
 void panic(const char* msg, const char* file, int line);
 void panic_assert(const char* cond, const char* file, int line);

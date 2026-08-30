@@ -156,6 +156,8 @@ extern syscall_lnx_dispatch
 extern syscall_kernel_rsp
 
 global syscall_lnx_entry
+global lnx_frame_rsp
+global restore_frame
 syscall_lnx_entry:
     mov [lnx_user_rsp_tmp], rsp      ; remember the user stack pointer
     mov rsp, [syscall_kernel_rsp]    ; switch to the process kernel stack
@@ -186,6 +188,7 @@ syscall_lnx_entry:
 
     ; Saved-frame offsets: r15+0 r14+8 r13+16 r12+24 r11+32 r10+40
     ; r9+48 r8+56 rbp+64 rdi+72 rsi+80 rdx+88 rcx+96 rbx+104 rax+112
+    mov [lnx_frame_rsp], rsp          ; entry-frame ptr for fork/wait4/execve
     mov rdi, [rsp + 112]             ; syscall number (rax)
     mov rsi, [rsp + 72]              ; a0 (rdi)
     mov rdx, [rsp + 80]              ; a1 (rsi)
@@ -219,8 +222,33 @@ syscall_lnx_entry:
 
     iretq
 
+; --- Resume a saved IRQ-layout frame (fork/wait4 exit paths) ---------
+; RDI holds the frame RSP. Pops the full frame and iretqs into it.
+; Never returns to the caller.
+global restore_frame
+restore_frame:
+    mov rsp, rdi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
+
 section .data
 lnx_user_rsp_tmp: dq 0
+lnx_frame_rsp:    dq 0
 
 section .text
 isr_common_stub:

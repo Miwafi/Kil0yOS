@@ -2,6 +2,60 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.11.0] - 2026-08-30
+This release completes **Phase 1 of the Linux compatibility roadmap** (M1 milestone): Kil0yOS can now run the real busybox (1.36.1, musl-gcc static, all ~390 applets) from `/bin`, and packages can be pulled at runtime over the network with a built-in TFTP client. This required per-process address spaces (private page-table roots with `CR3` switching), a working `fork`/`wait4`/`execve` process model, a TTY line discipline with canonical-mode input, a Linux VFS shim (`statx`/`getdents64`/`openat`/fd tables) layered over the internal FAT32 filesystem, plus a large batch of network-driver and filesystem fixes found while getting the 1.15 MB busybox download + install to work end-to-end.
+
+### Added
+- **Per-process address spaces (Phase 1.5 foundation)** (`memory.c` / `uvm.c`): `vmm_create_address_space()` builds a fresh PML4 that shares the boot identity/kernel mappings but owns private page-table pages for the user range; `vmm_switch_cr3()`/`vmm_destroy_address_space()` complete the lifecycle. All user VAs are < 4 GB, so page-table pages and user frames stay reachable through the identity map regardless of the active `CR3`.
+- **fork/wait4/execve process model** (`process.c`, `syscall_lnx.c`, `isr.asm`): `fork` (also aliased for `vfork`/`clone`) copies all mapped user pages into fresh frames via `uvm_fork()`, mirrors the VM region table and `brk`/`mmap` cursors, and returns 0 in the child through the new `restore_frame` assembly path (a saved IRQ-layout frame is resumed and `iretq`ed into); `wait4` reaps children and reports exit status; `execve` replaces the current image in-process (reload via the unified exec path, old regions unmapped). `lnx_frame_rsp` in `isr.asm` pins the entry frame for all three.
+- **TTY line discipline** (`tty.c` / `tty.h`): canonical-mode input for the `read` syscall — local echo, backspace handling, line buffering, and `\n` translation; non-canonical raw reads supported. Blocked reads wake on keyboard IRQ.
+- **Linux VFS shim** (`lnxvfs.c` / `lnxvfs.h`): fd tables (0/1/2 console), `openat`/`getdents64` (converts FAT directory walks into Linux `dirent` records), `stat`/`lstat`/`newfstatat`/`fstat`/`statx` (musl 1.2.x routes `stat` through `statx`) mapped onto the internal FAT filesystem, plus `lseek`, `mkdir`/`rmdir`, `unlink`, `chdir`/`getcwd`, `dup`/`dup2`, `access`, `readlink`, `nanosleep`, `getppid`.
+- **busybox integration (Phase 1.3)**: busybox 1.36.1 is built by `tools/build_busybox.sh` (musl-gcc, `-Wl,-Ttext-segment=0x10000000` to sit inside `UVM_ELF_BASE`), embedded as an `.incbin` blob by the Makefile, and installed to `/bin/busybox` at boot. The shell dispatches unknown commands to `/bin/busybox <cmd>` as a fallback, so `ls`, `echo`, `mkdir`, `cat`, ... just work.
+- **TFTP client (Phase 1.4)** (`net/tftp.c` / `tftp.h`): RFC 1350 RRQ/octet-mode downloader over UDP with block ACKs, retransmission limits, peer-stall detection, 64 KiB progress logging, and RRQ retry on transient (ARP resolution) failures. Exposed as the `tftp <file>` shell command, which downloads into a RAM buffer and installs the result into `/bin` — verified with a 1181504-byte busybox pull from QEMU's user-mode networking.
+- **`tools/ksym.py`**: resolve kernel addresses against `nm` output (used to pinpoint the `power_shutdown`/`keyboard_getc` HLT states from `-d int` logs).
+- **`tools/test_tftp.sh` / `test_tftp_fast.sh` / `drive_keys.py` / `pcap_tftp.py`**: headless end-to-end harness — boots the ISO, types the `tftp` command via the QEMU monitor, waits for the `tftp: installed` serial marker (not a bare word: boot logs contain `installed` too), runs busybox acceptance applets (`echo`/`mkdir`/`ls`), then shuts down; `pcap_tftp.py` decodes the UDP/ TFTP packet trace from `filter-dump` captures.
+- **Syscalls registered this phase**: `openat`, `fstat`, `stat`, `lstat`, `newfstatat`, `lseek`, `getdents64`, `mkdir`, `rmdir`, `unlink`, `getcwd`, `dup`, `dup2`, `readlink`, `fork`, `vfork`, `clone`, `wait4`, `execve`, `chdir`, `statx`, `access`, `nanosleep`, `getppid`.
+
+### Fixed
+- **ELF segments silently not copied (CRITICAL for per-process exec)**: `elf_copy_segment()` resolved segment pages through the *boot* page tables and wrote user VAs directly, which hit the boot tables' 2 MB identity huge pages — user text stayed all-zero. The segment pages are now resolved by walking the process root (`vmm_set_root_ptr(proc->cr3)` around the copy) and written through the identity map.
+- **Kernel heap overlapped the kernel image (CRITICAL)**: the heap start was a fixed `0x200000`; embedding busybox grew the image past it and the heap-overlapping-BSS memset corrupted the boot page tables (#PF at the pdpt page `0x24f000`). The heap now starts at `kernel_end` aligned up.
+- **`vmm_get_phys()` returned non-canonical addresses**: attribute bits (including NX on bit 63) and bits above 39 were not masked, so `memcpy` through the result raised #GP (`0x8000000004497ff6`). The mask is now `0x000FFFFFFFFFF000`.
+- **RAM disk too small for TFTP installs (silent install failure)**: `DISK_MAX_SECTORS` was 4096 (2 MB); the boot-time `/bin` payloads (~1.2 MB busybox alone) left ~1700 free clusters while a second busybox needs 2308 — `fat_alloc_cluster()` exhausted, and the failure was only printed to VGA so the serial-only test harness saw nothing. Enlarged to 16384 sectors (8 MB) and the shell now `klog()`s install failures too.
+- **`cmd_tftp` misreported success as failure**: `fs_write_file()` returns bytes written (negative on error), but the caller checked `== 0` — every successful install was labeled `install failed`. Now checks `< 0`.
+- **FAT allocation was O(n²) with a disk I/O per FAT entry**: every cluster allocation rescanned from cluster 2, each probe hitting `disk_read_sector` — a 1.15 MB file write (~2300 clusters) ground the kernel for minutes. The FAT is now cached in memory (`fat_cache_load()`, ~130 KB) and a scan hint makes appending O(1); the install finishes in ~30 ms. Writes stay coherent (cache + disk).
+- **RTL8139 RX ring desync and wrap corruption**: the RX buffer was treated as 8208 bytes; QEMU actually uses 8192 — after the first wrap `CAPR` desynced from the write pointer and packets were lost (TFTP stalled mid-transfer). Ring arithmetic now uses the real 8192-byte size, the 4-byte DMA header is read byte-wise (it can straddle the ring end and previously produced bogus lengths that pushed `CAPR` past the hardware pointer), frames wrapping the ring end are reassembled into a linear buffer, and the drain loop is bounded (32 packets) to prevent infinite polling.
+- **TFTP client could retransmit ACKs forever** when the server stopped responding: added retry limits and peer-stall abort.
+- **UDP sockets without bound ports**: `udp_sendto` now auto-allocates an ephemeral port, so the first TFTP `sendto` after boot works without an explicit bind.
+- **Test-harness input**: `drive_keys.py` uses `spc` for space, longer inter-key delays, and tolerates connection errors while the guest is shutting down; QEMU `sendkey` only accepts lowercase key names, so markers must stay lowercase (uppercase/`_` are silently dropped).
+- **Exec-path log spam removed**: the per-syscall `[sc N->ret]` trace, `[exec] ELF64 loaded`, `[proc] run/exit`, the scheduler's user-RIP sampler, and the fs `check_exists`/`create_dir` progress logs are gone; genuine error diagnostics (ELF rejection with relink hint, ENOSYS one-shot warnings, no-free-clusters) remain.
+
+### Changed
+- Version strings bumped to 2.11.0 (boot banner, `version` command, GUI title bar, uname release notes Phase 1).
+- `fs.c` includes `drivers/vga.h` explicitly (klog prototype).
+- Debug logging during TFTP transfer is throttled (every 16 blocks / 64 KiB).
+
+### File Changes
+- `src/kernel/core/memory.c`-side (`src/kernel/mm/memory.c`, `include/mm/memory.h`): per-process address spaces, heap-from-`kernel_end`, `vmm_get_phys` mask
+- `include/core/uvm.h`, `src/kernel/core/uvm.c`: `uvm_fork`, user-VA read/write helpers
+- `src/kernel/core/process.c`, `include/core/process.h`: fork/wait4/execve, embedded busybox install, exec-path debug removal
+- `src/kernel/core/isr.asm`: `lnx_frame_rsp`, `restore_frame`
+- `include/core/lnxvfs.h`, `src/kernel/core/lnxvfs.c`: Linux VFS shim (new)
+- `include/core/tty.h`, `src/kernel/core/tty.c`: TTY line discipline (new)
+- `include/net/tftp.h`, `src/kernel/net/tftp.c`: TFTP client (new)
+- `src/kernel/core/syscall_lnx.c`: 24 new syscalls, ENOSYS warnings, uname 2.11.0
+- `src/kernel/sched/scheduler.c`, `include/sched/scheduler.h`: per-process context switching, frame-restore path, debug removal
+- `src/kernel/net/rtl8139.c`: RX ring 8192 fix, header reassembly, bounded drain; `src/kernel/net/udp.c`: ephemeral ports; `src/kernel/net/arp.c`: minor fix
+- `src/kernel/fs/fs.c`: FAT cache + alloc hint, debug-log removal, `no free clusters` diagnostic
+- `include/drivers/disk.h`, `src/kernel/drivers/disk.c`: 8 MB RAM disk
+- `src/kernel/shell/shell.c`: busybox fallback dispatch, `tftp` command, version bump
+- `src/kernel/core/elf.c`: process-root segment copy
+- `Makefile`: busybox blob embedding, tty/lnxvfs/tftp build wiring
+- `tools/build_busybox.sh`, `tools/test_tftp.sh`, `tools/test_tftp_fast.sh`, `tools/drive_keys.py`, `tools/ksym.py`, `tools/pcap_tftp.py` (+ probe scripts): build/test tooling (new)
+- `README.zh.md`, `CHANGELOG.md`: docs
+
+### Notes
+- Regression (`tools/test_tftp.sh`, QEMU headless + RTL8139 user networking): TFTP pull of busybox 1.36.1 (`1181504 bytes`) completes in ~19 s, installs to `/bin/busybox` in ~30 ms, and the freshly installed binary passes the applet checks — `echo`, `mkdir /bin/tftpdir` (verified via `ls /bin`), and `ls /bin` itself — with the shell recovered after each. Combined with the Phase 0 musl-ELF acceptance this closes Phase 1 (M1).
+
 ## [2.10.0] - 2026-08-30
 This release completes **Phase 0 of the Linux compatibility roadmap** (M0 milestone): Kil0yOS can now load and run static Linux x86-64 ELF binaries — a `musl-gcc -static` hello world runs end-to-end, performing the full musl runtime initialization (`arch_prctl(SET_FS)`, `set_tid_address`, `mmap`, `brk`, ...) and exiting cleanly via `exit_group` back to the shell. This required an ELF64 loader, a per-process user VM manager, a native `syscall`-instruction ABI with a Linux-compatible handler table, and three deep CPU/virtual-memory fixes (EFER.NXE, huge-page split attribute, CR4.OSFXSR). Also includes the previously uncommitted network/timer hardening from the ping-debugging sessions: unified PIT clock, e1000/E1000E flash-NVM support, VID:DID-only NIC matching, and 1-second ping pacing.
 

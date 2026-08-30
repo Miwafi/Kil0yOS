@@ -1,6 +1,8 @@
 #include "sched/scheduler.h"
 #include "core/process.h"
 #include "core/isr.h"
+#include "core/tss.h"
+#include "mm/memory.h"
 #include "lib/string.h"
 
 static task_t tasks[MAX_TASKS];
@@ -24,6 +26,13 @@ static volatile int main_switch_requested = 0;
 
 void scheduler_request_main_switch(void) {
     main_switch_requested = 1;
+}
+
+/* Drop the parked user-process frame: the process it belonged to has
+ * been resumed directly (wait4 exit path / exec), so the next tick
+ * must not iretq into the stale snapshot. */
+void scheduler_invalidate_user_frame(void) {
+    user_frame_valid = 0;
 }
 
 void scheduler_set_main_return(void (*entry)(void)) {
@@ -143,28 +152,25 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
             /* current frame belongs to the kernel main task */
             tasks[0].rsp = current_rsp;
             user_frame_valid = 0;
+
+            /* Phase 1.5 round-robin: a forked child (or a preempted
+             * process) may hold a parked frame - give it the CPU
+             * instead of resuming the same user process. */
+            process_t* next = process_pick_ready(uproc->pid);
+            if (next != NULL) {
+                uproc->parked_rsp = user_frame;   /* park, do not lose */
+                uproc->state = PROCESS_STATE_READY;
+                process_become_current(next);
+                tss_set_kernel_stack(next->kernel_stack);
+                syscall_kernel_rsp = next->kernel_stack;
+                if (next->cr3) vmm_switch_cr3(next->cr3);
+                return next->parked_rsp;
+            }
             return user_frame;              /* resume user process */
         } else {
             /* current frame belongs to the user process (or its syscall) */
             user_frame = current_rsp;
             user_frame_valid = 1;
-            /* TEMPORARY Phase 0 debug: sample the user RIP periodically */
-            {
-                static int ucnt = 0;
-                if ((++ucnt & 0x3F) == 1) {
-                    const interrupt_frame_t* f =
-                        (const interrupt_frame_t*)current_rsp;
-                    char b[46];
-                    b[0] = 'u'; b[1] = ' '; b[2] = 'r'; b[3] = 'i'; b[4] = 'p'; b[5] = '=';
-                    for (int i = 0; i < 16; i++)
-                        b[6 + i] = "0123456789abcdef"[(f->rip >> (60 - i * 4)) & 0xF];
-                    b[22] = ' '; b[23] = 'r'; b[24] = 's'; b[25] = 'p'; b[26] = '=';
-                    for (int i = 0; i < 16; i++)
-                        b[27 + i] = "0123456789abcdef"[(f->rsp >> (60 - i * 4)) & 0xF];
-                    b[43] = '\n'; b[44] = 0;
-                    klog(b);
-                }
-            }
             return tasks[0].rsp;            /* run kernel main */
         }
     }

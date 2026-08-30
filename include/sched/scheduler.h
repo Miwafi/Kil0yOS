@@ -26,6 +26,10 @@ void task_exit(void);
  * kernel-main frame instead of the dying user process frame. */
 void scheduler_request_main_switch(void);
 
+/* Discard the parked user frame (process resumed outside the tick path
+ * or replaced by exec). */
+void scheduler_invalidate_user_frame(void);
+
 /* Arm a FRESH kernel-main entry frame on the scheduler's own stack.
  * Must be called right before jump_to_user(): the old tasks[0].rsp frame
  * is a snapshot of the boot stack at some earlier tick depth and has been

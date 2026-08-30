@@ -137,6 +137,7 @@ int arp_resolve(netif_t* iface, uint32_t ip, uint8_t* out_mac) {
             return 0;
         }
     }
+    klog("arp: resolve failed\n");
     return -1;
 }
 

@@ -31,8 +31,16 @@ void memory_init(memory_map_t* map, size_t count) {
      * 256 MiB) arena left the PMM with zero free pages and exec died
      * with "PMM out of pages". USER_CODE_BASE (256 MB) stays well above
      * the capped arena in every configuration. */
-    uint8_t* default_start = (uint8_t*)0x200000;
-    uint8_t* default_end   = (uint8_t*)0x4200000;   /* 2 MiB + 64 MiB */
+    /* The heap must start AFTER the kernel image: kernel_end grows with the
+     * binary (e.g. embedding busybox pushed it past 0x35c000), and a heap
+     * overlapping .bss corrupts the boot page tables / PMM bitmap on the
+     * first big kmalloc + memset (observed as #PF at the pdpt page). */
+    extern char kernel_end[];
+    uint64_t heap_base = ((uint64_t)kernel_end + 0xFFF) & ~0xFFFULL;
+    if (heap_base < 0x200000) heap_base = 0x200000;
+
+    uint8_t* default_start = (uint8_t*)heap_base;
+    uint8_t* default_end   = (uint8_t*)(heap_base + 0x4000000); /* + 64 MiB */
 
     if (map != NULL && count > 0) {
         uint64_t largest_size = 0;
@@ -45,7 +53,7 @@ void memory_init(memory_map_t* map, size_t count) {
             uint64_t base  = ((uint64_t)entry->base_addr_high << 32) | entry->base_addr_low;
             uint64_t length = ((uint64_t)entry->length_high << 32) | entry->length_low;
 
-            if (length > largest_size && base >= 0x200000) {
+            if (length > largest_size && base >= heap_base) {
                 largest_size = length;
                 largest_start = (uint8_t*)base;
             }
@@ -356,10 +364,16 @@ void pmm_get_stats(uint64_t* total_pages, uint64_t* used_pages, uint64_t* free_p
 
 static uint64_t* vmm_pml4 = NULL;
 
+/* Boot address space (recorded in vmm_init): shared kernel mappings */
+static uint64_t vmm_boot_root = 0;
+static uint64_t* vmm_boot_pml4 = 0;   /* boot PML4 pointer */
+
 void vmm_init(void) {
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     vmm_pml4 = (uint64_t*)(cr3 & ~0xFFF);
+    vmm_boot_root = cr3 & ~0xFFF;
+    vmm_boot_pml4 = vmm_pml4;
 
     /* Enable EFER.NXE: user mappings set NX (PTE bit 63) on non-executable
      * pages via uvm prot_to_pte(). With NXE=0 the CPU treats that bit as
@@ -523,23 +537,137 @@ uint64_t vmm_get_phys(uint64_t virt) {
     uint64_t pml4i = (virt >> 39) & 0x1FF;
     if (!(vmm_pml4[pml4i] & VMM_PRESENT)) return 0;
 
-    uint64_t* pdpt = (uint64_t*)(vmm_pml4[pml4i] & ~0xFFF);
+    uint64_t* pdpt = (uint64_t*)(vmm_pml4[pml4i] & 0x000FFFFFFFFFF000ULL);
     uint64_t pdpti = (virt >> 30) & 0x1FF;
     if (!(pdpt[pdpti] & VMM_PRESENT)) return 0;
 
-    uint64_t* pd = (uint64_t*)(pdpt[pdpti] & ~0xFFF);
+    uint64_t* pd = (uint64_t*)(pdpt[pdpti] & 0x000FFFFFFFFFF000ULL);
     uint64_t pdi = (virt >> 21) & 0x1FF;
     if (!(pd[pdi] & VMM_PRESENT)) return 0;
 
     if (pd[pdi] & VMM_HUGE) {
-        return (pd[pdi] & ~0x1FFFFF) | (virt & 0x1FFFFF);
+        /* Mask attribute bits AND the upper bits (NX lives on bit 63);
+         * callers use the result as a plain physical address. */
+        return (pd[pdi] & 0x000FFFFFFFFFF00000ULL) | (virt & 0x1FFFFF);
     }
 
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
     uint64_t pti = (virt >> 12) & 0x1FF;
     if (!(pt[pti] & VMM_PRESENT)) return 0;
 
-    return (pt[pti] & ~0xFFF) | (virt & 0xFFF);
+    return (pt[pti] & 0x000FFFFFFFFFF000ULL) | (virt & 0xFFF);
+}
+
+/* ======================================================================== */
+/*  Per-process address spaces (Phase 1.5 fork)                             */
+/* ======================================================================== */
+
+uint64_t vmm_current_root(void) {
+    return (uint64_t)vmm_pml4 & ~0xFFF;
+}
+
+void vmm_set_root_ptr(uint64_t phys) {
+    vmm_pml4 = (uint64_t*)(phys & ~0xFFF);
+}
+
+void vmm_switch_cr3(uint64_t phys) {
+    static uint64_t active = 0;   /* dedupe: CR3 reload flushes the TLB */
+    phys &= ~0xFFF;
+    vmm_pml4 = (uint64_t*)phys;
+    if (active != phys) {
+        active = phys;
+        __asm__ volatile("mov %0, %%cr3" :: "r"(phys));
+    }
+}
+
+/* Build a fresh PD copy that keeps ONLY huge identity entries. Any 4KB
+ * page table referenced by the boot copy belongs to the previous owner's
+ * user mappings and must not leak into the new address space. */
+static uint64_t as_copy_pd(uint64_t boot_pd) {
+    uint64_t pd_phys = pmm_alloc_page();
+    if (!pd_phys) return 0;
+    uint64_t* src = (uint64_t*)(boot_pd & ~0xFFF);
+    uint64_t* dst = (uint64_t*)pd_phys;
+    for (int i = 0; i < 512; i++) {
+        dst[i] = (src[i] & VMM_PRESENT && src[i] & VMM_HUGE) ? src[i] : 0;
+    }
+    return pd_phys;
+}
+
+uint64_t vmm_create_address_space(void) {
+    if (vmm_boot_root == 0) {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        vmm_boot_root = cr3 & ~0xFFF;
+    }
+
+    uint64_t pml4_phys = pmm_alloc_page();
+    if (!pml4_phys) return 0;
+    uint64_t* pml4 = (uint64_t*)pml4_phys;
+    memset(pml4, 0, PAGE_SIZE);
+
+    /* Share every boot PML4 subtree verbatim (kernel half + identity) ... */
+    for (int i = 0; i < 512; i++) {
+        pml4[i] = vmm_boot_pml4[i];
+    }
+
+    /* ... except PML4[0]: private PDPT so user mappings diverge. The
+     * identity map lives in PML4[0] -> PDPT[0..3] (2MB huge pages). */
+    if (!(vmm_boot_pml4[0] & VMM_PRESENT)) {
+        pmm_free_page(pml4_phys);
+        return 0;
+    }
+    uint64_t boot_pdpt = vmm_boot_pml4[0] & ~0xFFF;
+    uint64_t pdpt_phys = pmm_alloc_page();
+    if (!pdpt_phys) { pmm_free_page(pml4_phys); return 0; }
+    uint64_t* pdpt = (uint64_t*)pdpt_phys;
+    memset(pdpt, 0, PAGE_SIZE);
+    uint64_t* boot_pdpt_v = (uint64_t*)boot_pdpt;
+    for (int i = 0; i < 512; i++) pdpt[i] = boot_pdpt_v[i];
+
+    /* Private copies of the four PDs covering the identity 4GB */
+    for (int i = 0; i < 4; i++) {
+        uint64_t npd = as_copy_pd(pdpt[i]);
+        if (!npd) {
+            for (int j = 0; j < i; j++) pmm_free_page(pdpt[j] & ~0xFFF);
+            pmm_free_page(pdpt_phys);
+            pmm_free_page(pml4_phys);
+            return 0;
+        }
+        pdpt[i] = npd | (pdpt[i] & 0xFFF);
+    }
+
+    pml4[0] = pdpt_phys | VMM_PRESENT | VMM_WRITABLE;
+    return pml4_phys;
+}
+
+/* Free the per-AS page-table pages. Caller must have released all user
+ * pages (uvm_release_all) first. */
+void vmm_destroy_address_space(uint64_t root) {
+    if (root == 0 || (root & ~0xFFF) == vmm_boot_root) return;
+    uint64_t* pml4 = (uint64_t*)(root & ~0xFFF);
+    uint64_t old = vmm_current_root();
+
+    if (!(pml4[0] & VMM_PRESENT)) return;
+    uint64_t* pdpt = (uint64_t*)(pml4[0] & ~0xFFF);
+
+    /* pdpt[0..3] are private PD copies; free their per-AS user PTs */
+    for (int i = 0; i < 4; i++) {
+        if (!(pdpt[i] & VMM_PRESENT)) continue;
+        uint64_t* pd = (uint64_t*)(pdpt[i] & ~0xFFF);
+        for (int j = 0; j < 512; j++) {
+            if ((pd[j] & VMM_PRESENT) && !(pd[j] & VMM_HUGE)) {
+                pmm_free_page(pd[j] & ~0xFFF);   /* PT page (per-AS) */
+            }
+        }
+        pmm_free_page(pdpt[i] & ~0xFFF);         /* the PD copy */
+    }
+    pmm_free_page(pml4[0] & ~0xFFF);             /* the PDPT copy */
+    pmm_free_page(root & ~0xFFF);                /* the PML4 */
+
+    /* Restore the walk pointer if we just pulled it out */
+    vmm_set_root_ptr(old);
+    if (old == root) vmm_set_root_ptr(vmm_boot_root);
 }
 
 /* ======================================================================== */
