@@ -59,12 +59,15 @@ static void process_scancode(uint8_t scancode) {
     if (c != 0) {
         if (ctrl_pressed && c >= 'a' && c <= 'z') {
             c = c - 'a' + 1;
-        } else if ((shift_pressed ^ caps_lock) && c >= 'a' && c <= 'z') {
-            c = scancode_map_shift[scancode];
-        } else if (shift_pressed && c >= '1' && c <= '9') {
-            c = scancode_map_shift[scancode];
-        } else if (shift_pressed && c == '0') {
-            c = scancode_map_shift[scancode];
+        } else if (c >= 'a' && c <= 'z') {
+            /* Letter case: shift XOR caps lock (classic PC behaviour). */
+            if (shift_pressed ^ caps_lock) c = scancode_map_shift[scancode];
+        } else if (shift_pressed) {
+            /* Punctuation/number shifted forms (: " < > ? _ ! ...) - the
+             * driver previously shifted only letters/digits, so URLs with
+             * ':' typed over sendkey came out as ';'. */
+            char sc = scancode_map_shift[scancode];
+            if (sc != 0) c = sc;
         }
         
         if (buffer_count < BUFFER_SIZE) {

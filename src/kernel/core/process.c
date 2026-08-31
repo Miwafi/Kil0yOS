@@ -363,17 +363,19 @@ void jump_to_user(uint64_t entry, uint64_t stack) {
 #define AT_PHENT    4
 #define AT_PHNUM    5
 #define AT_PAGESZ   6
-#define AT_HWCAP    16
-#define AT_CLKTCK   17
+#define AT_BASE     7
 #define AT_ENTRY    9
 #define AT_UID      11
 #define AT_EUID     12
 #define AT_GID      13
 #define AT_EGID     14
+#define AT_HWCAP    16
+#define AT_CLKTCK   17
 #define AT_SECURE   23
 #define AT_RANDOM   25
+#define AT_EXECFN   31
 
-#define AUXV_PAIRS  14
+#define AUXV_PAIRS  16
 
 static uint64_t rand_seed = 0;
 
@@ -388,20 +390,29 @@ static void rand_fill16(uint8_t* dst) {
 }
 
 /* Build argc/argv/envp/auxv at the top of the user stack.
+ * interp_base: load base of the ELF interpreter (0 = none/static).
+ * exec_path: path string published via AT_EXECFN.
  * Returns the RSP to hand to jump_to_user. All writes go through the
  * identity map so the process's CR3 need not be active yet. */
 static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* res,
-                                    char* const* argv, int argc) {
+                                    char* const* argv, int argc,
+                                    uint64_t interp_base, const char* exec_path) {
     uint64_t sp = proc->stack_top;
 
     int n = (argc < 8) ? argc : 8;   /* argv[0] = program path anyway */
     uint64_t ustr[8];
 
-    const char* env = "PATH=/bin";
-    size_t env_len = strlen(env) + 1;
+    /* envp: just PATH for now */
+    static const char env_str[] = "PATH=/bin";
+    size_t env_len = sizeof(env_str);   /* includes NUL */
     sp -= env_len;
     uint64_t uenv = sp;
-    uvm_write_user_va(proc, sp, env, env_len);
+    uvm_write_user_va(proc, sp, env_str, env_len);
+
+    size_t exec_len = strlen(exec_path) + 1;
+    sp -= exec_len;
+    uint64_t uexecfn = sp;
+    uvm_write_user_va(proc, sp, exec_path, exec_len);
 
     for (int i = 0; i < n; i++) {
         const char* s = argv[i] ? argv[i] : "";
@@ -419,10 +430,10 @@ static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* re
 
     /* Final block: argc + argv[] + NULL + envp[] + NULL + auxv.
      * RSP must be 16-byte aligned at the entry point per the ABI. */
-    size_t block = 8 + 8 * ((size_t)n + 1) + 8 * 2 + 8 * (2 * AUXV_PAIRS);
+    size_t block = 8 + 8 * ((size_t)n + 1) + 8 * 3 + 8 * (2 * AUXV_PAIRS);
     sp = (sp - block) & ~0xFULL;
 
-    uint64_t blk[2 + 8 + 2 + 2 * AUXV_PAIRS];
+    uint64_t blk[1 + 8 + 1 + 3 + 2 * AUXV_PAIRS];
     uint64_t* u = blk;
     *u++ = (uint64_t)n;
     for (int i = 0; i < n; i++) *u++ = ustr[i];
@@ -435,15 +446,17 @@ static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* re
         {AT_PHENT,  56},
         {AT_PHNUM,  res->phnum},
         {AT_PAGESZ, 4096},
-        {AT_CLKTCK, 100},
-        {AT_HWCAP,  0},
+        {AT_BASE,   interp_base},
+        {AT_ENTRY,  res->entry},
         {AT_UID,    0},
         {AT_EUID,   0},
         {AT_GID,    0},
         {AT_EGID,   0},
+        {AT_HWCAP,  0},
+        {AT_CLKTCK, 100},
         {AT_SECURE, 0},
         {AT_RANDOM, urandom},
-        {AT_ENTRY,  res->entry},
+        {AT_EXECFN, uexecfn},
         {AT_NULL,   0},
     };
     for (int i = 0; i < AUXV_PAIRS; i++) {
@@ -512,17 +525,85 @@ int exec_load_program(const char* path, char* const* argv, int argc) {
         int rc = elf_load(proc, buffer, entry->size, &res);
         if (rc != 0) {
             const char* why = "invalid ELF";
-            if (rc == ELF_ERR_DYNAMIC) why = "dynamic ELF (PT_INTERP) not supported yet";
-            else if (rc == ELF_ERR_LAYOUT) why = "linked below 0x10000000 (kernel heap); relink with -Wl,-Ttext-segment=0x10000000";
+            if (rc == ELF_ERR_LAYOUT) why = "linked below 0x10000000 (kernel heap); relink with -Wl,-Ttext-segment=0x10000000";
             else if (rc == ELF_ERR_MAP) why = "out of memory mapping segments";
             else if (rc == ELF_ERR_PHDRS) why = "program headers outside PT_LOAD";
             klog("[exec] ELF rejected: ");
             klog(why);
+            klog(" size=");
+            klog_hex("", (uint32_t)entry->size);
+            if (rc == ELF_ERR_FORMAT && entry->size >= 64) {
+                klog_hex(" class=", buffer[4]);
+                klog_hex(" ei_data=", buffer[5]);
+                klog_hex(" type=", buffer[16] | ((uint32_t)buffer[17] << 8));
+                klog_hex(" machine=", buffer[18] | ((uint32_t)buffer[19] << 8));
+                klog_hex(" phentsize=", buffer[54] | ((uint32_t)buffer[55] << 8));
+                klog_hex(" phnum=", buffer[56] | ((uint32_t)buffer[57] << 8));
+                /* first phdr (offset 64): type/offset/filesz */
+                klog_hex(" p0type=", buffer[64] | ((uint32_t)buffer[65] << 8));
+                klog_hex(" p0off=", (uint32_t)buffer[72] | ((uint32_t)buffer[73] << 8));
+                klog_hex(" p0fsz=", (uint32_t)buffer[96] | ((uint32_t)buffer[97] << 8));
+                /* raw bytes 72..79 + checksum of the first 128 bytes */
+                klog_hex(" b72=", buffer[72]);
+                klog_hex(" b73=", buffer[73]);
+                klog_hex(" b74=", buffer[74]);
+                klog_hex(" b75=", buffer[75]);
+                {
+                    uint32_t sum = 0;
+                    for (int q = 0; q < 128; q++) sum += buffer[q];
+                    klog_hex(" sum128=", sum);
+                }
+            }
             klog("\n");
             uvm_release_all(proc);
             memset(proc, 0, sizeof(process_t));
             kfree(buffer);
             return -1;
+        }
+
+        /* Phase 3.0: dynamically linked image - map the interpreter and
+         * enter through it. The interpreter itself is a musl ET_DYN that
+         * finds the main image via auxv AT_PHDR and itself via AT_BASE. */
+        uint64_t interp_base = 0;
+        uint64_t entry = res.entry;
+        if (res.interp[0]) {
+            fs_entry_t* ie = fs_resolve_path(res.interp);
+            if (ie == NULL || ie->type != FS_TYPE_FILE) {
+                klog("[exec] interpreter not found: ");
+                klog(res.interp);
+                klog("\n");
+                uvm_release_all(proc);
+                memset(proc, 0, sizeof(process_t));
+                kfree(buffer);
+                return -1;
+            }
+            uint8_t* ibuf = (uint8_t*)kmalloc(ie->size);
+            if (ibuf == NULL ||
+                fs_read_file(ie, ibuf, ie->size) != (int)ie->size) {
+                klog("[exec] failed to read interpreter\n");
+                if (ibuf) kfree(ibuf);
+                uvm_release_all(proc);
+                memset(proc, 0, sizeof(process_t));
+                kfree(buffer);
+                return -1;
+            }
+            elf_load_result_t ires;
+            rc = elf_load_interp(proc, ibuf, ie->size, UVM_INTERP_BASE, &ires);
+            kfree(ibuf);
+            if (rc != 0) {
+                klog("[exec] interpreter load failed\n");
+                uvm_release_all(proc);
+                memset(proc, 0, sizeof(process_t));
+                kfree(buffer);
+                return -1;
+            }
+            interp_base = UVM_INTERP_BASE;
+            entry = ires.entry;
+            /* The mmap arena of a dynamic process starts above the
+             * interpreter so loader/library mappings cannot collide. */
+            if (ires.brk_start > UVM_MMAP_BASE) {
+                proc->mmap_top = ires.brk_start;
+            }
         }
 
         /* Map the user stack and lay out argc/argv/envp/auxv */
@@ -537,13 +618,18 @@ int exec_load_program(const char* path, char* const* argv, int argc) {
         }
         proc->stack_pages = USER_STACK_SIZE / 4096;
 
-        proc->entry_point = res.entry;
+        proc->entry_point = entry;
         proc->brk_start = proc->brk_cur = res.brk_start;
-        proc->mmap_top = UVM_MMAP_BASE;
+        if (proc->mmap_top < UVM_MMAP_BASE) proc->mmap_top = UVM_MMAP_BASE;
 
-        proc->entry_point = res.entry;
-        proc->user_rsp = process_build_stack(proc, &res, argv, argc);
+        proc->user_rsp = process_build_stack(proc, &res, argv, argc,
+                                             interp_base, path);
         proc->state = PROCESS_STATE_READY;
+        if (interp_base != 0) {
+            klog("[exec] dynamic exec via ");
+            klog(res.interp);
+            klog("\n");
+        }
         kfree(buffer);
         return proc->pid;
     }
@@ -584,6 +670,28 @@ extern const uint8_t user_pong_end[];
 extern const uint8_t user_hello_lnx_start[] __attribute__((weak));
 extern const uint8_t user_hello_lnx_end[] __attribute__((weak));
 
+/* musl DYNAMIC PIE (Phase 3.0 acceptance, embedded when musl-gcc exists) */
+extern const uint8_t user_hello_dyn_start[] __attribute__((weak));
+extern const uint8_t user_hello_dyn_end[] __attribute__((weak));
+
+/* musl dynamic interpreter: libc.so deployed as /lib/ld-musl-x86_64.so.1 */
+extern const uint8_t user_ldmusl_start[] __attribute__((weak));
+extern const uint8_t user_ldmusl_end[] __attribute__((weak));
+
+/* glibc dynamic chain (Phase 3.1): hello + Debian rtld + libc.so.6 */
+extern const uint8_t user_hello_glibc_start[] __attribute__((weak));
+extern const uint8_t user_hello_glibc_end[] __attribute__((weak));
+extern const uint8_t user_ldlinux_start[] __attribute__((weak));
+extern const uint8_t user_ldlinux_end[] __attribute__((weak));
+extern const uint8_t user_glibc_start[] __attribute__((weak));
+extern const uint8_t user_glibc_end[] __attribute__((weak));
+extern const uint8_t user_probe_ld_start[] __attribute__((weak));
+extern const uint8_t user_probe_ld_end[] __attribute__((weak));
+
+/* glibc dynamic + pthread primitives (Phase 3.2) */
+extern const uint8_t user_pthread_start[] __attribute__((weak));
+extern const uint8_t user_pthread_end[] __attribute__((weak));
+
 /* Freestanding Linux-ABI syscall probe (always embedded) */
 extern const uint8_t user_mini_start[];
 extern const uint8_t user_mini_end[];
@@ -592,9 +700,94 @@ extern const uint8_t user_mini_end[];
 extern const uint8_t user_mmt_start[];
 extern const uint8_t user_mmt_end[];
 
+/* Freestanding TCP connect/GET probe (Phase 3.3, always embedded) */
+extern const uint8_t user_nettest_start[];
+extern const uint8_t user_nettest_end[];
+
 /* musl static busybox (embedded only when built via tools/build_busybox.sh) */
 extern const uint8_t user_busybox_start[] __attribute__((weak));
 extern const uint8_t user_busybox_end[] __attribute__((weak));
+
+/* Phase 3: deploy an embedded file under a root directory (created on
+ * demand), e.g. ("lib64", "ld-linux-x86-64.so.2", ...). Skipped when the
+ * blob is absent (weak symbols) or the file already exists. */
+static void user_install_blob(const char* dir, const char* name,
+                              const uint8_t* start, const uint8_t* end,
+                              const char* note) {
+    if (start == NULL || end == NULL || end <= start) return;
+    if (fs_resolve_path(dir) == NULL) {
+        fs_entry_t* prev_root = fs_current();
+        fs_set_current(fs_root());
+        fs_entry_t* d = fs_create_dir(dir + 1);   /* strip leading '/' */
+        fs_set_current(prev_root);
+        if (d == NULL) {
+            klog("[user] failed to create ");
+            klog(dir);
+            klog("\n");
+            return;
+        }
+    }
+    char full[MAX_PATH_LENGTH];
+    int flen = 0;
+    while (dir[flen] && flen < (int)sizeof(full) - 1) {
+        full[flen] = dir[flen];
+        flen++;
+    }
+    if (flen < (int)sizeof(full) - 1) full[flen++] = '/';
+    for (int i = 0; name[i] && flen < (int)sizeof(full) - 1; i++) {
+        full[flen++] = name[i];
+    }
+    full[flen] = 0;
+    if (fs_resolve_path(full) != NULL) return;
+
+    fs_entry_t* d = fs_resolve_path(dir);
+    fs_entry_t* prev = fs_current();
+    fs_set_current(d);
+    fs_entry_t* f = fs_create_file(name);
+    if (f != NULL) {
+        fs_write_file(f, start, (size_t)(end - start));
+        klog("[user] ");
+        klog(full);
+        klog(" installed");
+        if (note && note[0]) {
+            klog(" (");
+            klog(note);
+            klog(")");
+        }
+        klog("\n");
+    }
+    fs_set_current(prev);
+}
+
+/* Boot-time sentinel: read /bin/hello-lnx back after ALL installs and
+ * compare with the embedded blob. Catches FAT corruption (e.g. a too-small
+ * FAT spilling entries into the data area) right where it happens. */
+static void verify_hello_lnx(void) {
+    static uint8_t chk[36864];
+    const uint8_t* blob = user_hello_lnx_start;
+    size_t size = (size_t)(user_hello_lnx_end - user_hello_lnx_start);
+    if (blob == NULL || size == 0 || size > sizeof(chk)) return;
+
+    fs_entry_t* vf = fs_resolve_path("/bin/hello-lnx");
+    if (vf == NULL || (size_t)vf->size != size ||
+        fs_read_file(vf, chk, size) != (int)size) {
+        klog("[chk] hello-lnx readback size failed\n");
+        return;
+    }
+    int bad = -1;
+    for (size_t i = 0; i < size; i++) {
+        if (chk[i] != blob[i]) { bad = (int)i; break; }
+    }
+    if (bad < 0) {
+        klog("[chk] hello-lnx ok\n");
+    } else {
+        klog("[chk] hello-lnx MISMATCH at ");
+        klog_hex("", (uint64_t)bad);
+        klog_hex(" got=", chk[bad]);
+        klog_hex(" want=", blob[bad]);
+        klog("\n");
+    }
+}
 
 void user_programs_install(void) {
     fs_entry_t* bin = fs_resolve_path("/bin");
@@ -648,18 +841,76 @@ void user_programs_install(void) {
         }
     }
 
-    if (&user_busybox_start != NULL &&
-        &user_busybox_end > &user_busybox_start &&
-        fs_resolve_path("/bin/busybox") == NULL) {
-        fs_entry_t* f = fs_create_file("busybox");
+    if (fs_resolve_path("/bin/nettest") == NULL) {
+        fs_entry_t* f = fs_create_file("nettest");
         if (f != NULL) {
-            size_t size = (size_t)(user_busybox_end - user_busybox_start);
-            fs_write_file(f, user_busybox_start, size);
-            klog("[user] /bin/busybox installed (musl static)\n");
+            size_t size = (size_t)(user_nettest_end - user_nettest_start);
+            fs_write_file(f, user_nettest_start, size);
+            klog("[user] /bin/nettest installed (TCP probe)\n");
         }
     }
 
+    user_install_blob("/bin", "busybox", user_busybox_start, user_busybox_end,
+                      "musl static");
+    user_install_blob("/bin", "hello-dyn", user_hello_dyn_start,
+                      user_hello_dyn_end, "musl dynamic PIE");
+    /* musl interpreter: libc.so IS ld-musl; SONAME "libc.so" matches
+     * DT_NEEDED so the loader resolves libc to itself (Phase 3.0) */
+    user_install_blob("/lib", "ld-musl-x86_64.so.1", user_ldmusl_start,
+                      user_ldmusl_end, "musl ldso");
+    /* glibc dynamic chain (Phase 3.1): .interp=/lib64/ld-linux-x86-64.so.2,
+     * DT_NEEDED libc.so.6 found via ld.so's built-in /lib search path */
+    user_install_blob("/bin", "hello-glibc", user_hello_glibc_start,
+                      user_hello_glibc_end, "glibc dynamic PIE");
+    user_install_blob("/bin", "probe-ld", user_probe_ld_start,
+                      user_probe_ld_end, "ldso probe");
+    user_install_blob("/lib64", "ld-linux-x86-64.so.2", user_ldlinux_start,
+                      user_ldlinux_end, "glibc rtld");
+    user_install_blob("/lib", "libc.so.6", user_glibc_start, user_glibc_end,
+                      "glibc");
+    user_install_blob("/bin", "hello-pthread", user_pthread_start,
+                      user_pthread_end, "glibc pthread probe");
+
     fs_set_current(prev);
+
+    /* /etc/resolv.conf: busybox nslookup/wget parse this file directly.
+     * 10.0.2.3 is QEMU user-net's built-in DNS forwarder. */
+    if (fs_resolve_path("/etc") == NULL) {
+        fs_entry_t* prev_root = fs_current();
+        fs_set_current(fs_root());
+        fs_create_dir("etc");
+        fs_set_current(prev_root);
+    }
+    if (fs_resolve_path("/etc/resolv.conf") == NULL) {
+        static const char resolv_conf[] = "nameserver 10.0.2.3\n";
+        fs_entry_t* d = fs_resolve_path("/etc");
+        if (d != NULL && d->type == FS_TYPE_DIRECTORY) {
+            fs_entry_t* prev2 = fs_current();
+            fs_set_current(d);
+            fs_entry_t* f = fs_create_file("resolv.conf");
+            if (f != NULL)
+                fs_write_file(f, (const uint8_t*)resolv_conf,
+                              sizeof(resolv_conf) - 1);
+            fs_set_current(prev2);
+        }
+    }
+
+    /* /etc/hosts: musl getaddrinfo (busybox wget) checks it before DNS.
+     * "kil0yos" maps to the QEMU user-net host (10.0.2.2). */
+    if (fs_resolve_path("/etc/hosts") == NULL) {
+        static const char hosts[] = "127.0.0.1 localhost\n10.0.2.2 kil0yos\n";
+        fs_entry_t* d = fs_resolve_path("/etc");
+        if (d != NULL && d->type == FS_TYPE_DIRECTORY) {
+            fs_entry_t* prev2 = fs_current();
+            fs_set_current(d);
+            fs_entry_t* f = fs_create_file("hosts");
+            if (f != NULL)
+                fs_write_file(f, (const uint8_t*)hosts, sizeof(hosts) - 1);
+            fs_set_current(prev2);
+        }
+    }
+
+    verify_hello_lnx();
 }
 
 /* ======================================================================== */
@@ -857,23 +1108,51 @@ int exec_replace(uint64_t frame_rsp, const char* path,
     elf_load_result_t res;
     if (elf_load(proc, buffer, entry->size, &res) != 0) goto dead;
     kfree(buffer);
+    buffer = NULL;   /* dead: frees it; interp failures jump past here */
 
-    proc->entry_point = res.entry;
+    /* Phase 3.0: map the PT_INTERP interpreter, if any, and enter
+     * through it (same layout as the shell exec path). */
+    uint64_t interp_base = 0;
+    uint64_t entry_va = res.entry;
+    if (res.interp[0]) {
+        fs_entry_t* ie = fs_resolve_path(res.interp);
+        if (ie == NULL || ie->type != FS_TYPE_FILE) goto dead;
+        uint8_t* ibuf = (uint8_t*)kmalloc(ie->size);
+        if (ibuf == NULL) goto dead;
+        if (fs_read_file(ie, ibuf, ie->size) != (int)ie->size) {
+            kfree(ibuf);
+            goto dead;
+        }
+        elf_load_result_t ires;
+        if (elf_load_interp(proc, ibuf, ie->size, UVM_INTERP_BASE, &ires) != 0) {
+            kfree(ibuf);
+            goto dead;
+        }
+        kfree(ibuf);
+        interp_base = UVM_INTERP_BASE;
+        entry_va = ires.entry;
+        if (ires.brk_start > UVM_MMAP_BASE) {
+            proc->mmap_top = ires.brk_start;
+        }
+    }
+
+    proc->entry_point = entry_va;
     proc->brk_start = proc->brk_cur = res.brk_start;
-    proc->mmap_top = UVM_MMAP_BASE;
-    proc->user_rsp = process_build_stack(proc, &res, argv, argc);
+    if (proc->mmap_top < UVM_MMAP_BASE) proc->mmap_top = UVM_MMAP_BASE;
+    proc->user_rsp = process_build_stack(proc, &res, argv, argc,
+                                         interp_base, path);
 
     /* Rewrite the live syscall frame: the epilogue's iretq now enters
      * the new image with RAX = 0 (execve "never returns" to the caller). */
     uint64_t* f = (uint64_t*)frame_rsp;
     f[IRQ_RAX] = 0;
-    f[ENTY_RIP] = res.entry;
+    f[ENTY_RIP] = entry_va;
     f[ENTY_RSP] = proc->user_rsp;
 
     return 0;
 
 dead:
-    kfree(buffer);
+    if (buffer) kfree(buffer);
     process_exit(127);   /* never returns */
     __builtin_unreachable();
 }

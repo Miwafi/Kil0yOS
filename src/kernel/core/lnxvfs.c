@@ -202,6 +202,28 @@ long long lnxvfs_seek_pos(int fd) {
     return (long long)f->pos;
 }
 
+/* Size of the fd's file (for file-backed mmap bounds). */
+long long lnxvfs_filesize(int fd) {
+    lnx_file_t* f = fd_get(fd);
+    if (f == NULL || f->entry == NULL) return -L_EBADF;
+    if (f->entry->type != FS_TYPE_FILE) return -L_EISDIR;
+    return (long long)f->size;
+}
+
+/* Read from the fd's file at an offset without moving the cursor.
+ * Returns bytes read (short read at EOF) or negative errno. */
+int lnxvfs_pread(int fd, void* buf, size_t count, long long off) {
+    lnx_file_t* f = fd_get(fd);
+    if (f == NULL || f->entry == NULL) return -L_EBADF;
+    if (f->entry->type != FS_TYPE_FILE) return -L_EISDIR;
+    if (off < 0) return -L_EINVAL;
+    if (off >= (long long)f->size || count == 0) return 0;
+    size_t avail = f->size - (size_t)off;
+    if (count > avail) count = avail;
+    memcpy(buf, f->cache + (size_t)off, count);
+    return (int)count;
+}
+
 int lnxvfs_lseek(int fd, int whence, long long off) {
     lnx_file_t* f = fd_get(fd);
     if (f == NULL) return -L_EBADF;
@@ -298,8 +320,16 @@ struct lnx_stat {
     int64_t  __unused[3];
 };
 
+/* File identity: ld.so matches already-loaded objects by (dev,ino)
+ * (_dl_get_file_id). Zero/zero would make every file match the main
+ * executable (whose id is zeroed via __RTLD_OPENEXEC), so fill in a
+ * nonzero device and an entry-pointer-based stable inode. */
+#define LNX_VFS_DEV 0xFE01ULL
+
 static void stat_fill(struct lnx_stat* s, fs_entry_t* e) {
     memset(s, 0, sizeof(*s));
+    s->st_dev = LNX_VFS_DEV;
+    s->st_ino = (uint64_t)(uintptr_t)e;
     s->st_nlink = 1;
     if (e->type == FS_TYPE_DIRECTORY) {
         s->st_mode = L_S_IFDIR | 0755;
@@ -379,6 +409,9 @@ static void statx_fill(struct lnx_statx* x, fs_entry_t* e) {
     x->stx_blksize = 512;
     x->stx_attributes_mask = 0;
     x->stx_nlink = 1;
+    x->stx_ino = (uint64_t)(uintptr_t)e;
+    x->stx_dev_major = (LNX_VFS_DEV >> 8) & 0xFFF;
+    x->stx_dev_minor = LNX_VFS_DEV & 0xFF;
     if (e->type == FS_TYPE_DIRECTORY) {
         x->stx_mode = L_S_IFDIR | 0755;
     } else {

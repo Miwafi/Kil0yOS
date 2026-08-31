@@ -14,6 +14,7 @@ void* memcpy(void* dest, const void* src, size_t num);
 int strncmp(const char* str1, const char* str2, size_t num);
 char* strncpy(char* dest, const char* src, size_t num);
 char* strrchr(const char* str, int c);
+char* strstr(const char* haystack, const char* needle);
 void* memmove(void* dest, const void* src, size_t num);
 int memcmp(const void* s1, const void* s2, size_t n);
 

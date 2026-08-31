@@ -17,6 +17,10 @@
 #define UVM_BRK_LIMIT   0x17000000ULL  /* brk heap may grow up to here */
 #define UVM_MMAP_BASE   0x18000000ULL  /* anonymous mmap arena start */
 #define UVM_MMAP_LIMIT  0x7F000000ULL  /* below the user stack */
+/* Fixed base for the ELF interpreter (ld-musl). The mmap arena of a
+ * dynamic process starts above the loaded interpreter (exec sets
+ * mmap_top accordingly), so loader/library mappings never collide. */
+#define UVM_INTERP_BASE 0x20000000ULL
 
 /* Map [start, end) (rounded out to page boundaries) into the shared page
  * tables and record a region. Fresh pages are zeroed; pages already mapped

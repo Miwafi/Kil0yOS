@@ -4,8 +4,13 @@
 #include "lib/types.h"
 
 #define MAX_PATH_LENGTH 260
-#define MAX_DIR_ENTRIES 32
-#define MAX_FILE_SIZE   (4096 * 1024)
+/* Real Ubuntu libc6 ships 256 files in usr/lib/x86_64-linux-gnu/gconv -
+ * the old 128 cap made tar extraction fail with FS_ERR_FULL mid-unpack. */
+#define MAX_DIR_ENTRIES 512
+/* Match the RAM disk capacity: real Ubuntu libc6.deb is 5.27 MB and was
+ * silently truncated to the old 4 MB cap (fs_write_file clamps without
+ * an error, dpkg then failed the ar magic check on the truncated copy). */
+#define MAX_FILE_SIZE   (32 * 1024 * 1024)
 
 #define FS_ERR_NONE     0
 #define FS_ERR_EXISTS   -1
@@ -117,6 +122,7 @@ fs_entry_t* fs_root();
 fs_entry_t* fs_current();
 void fs_set_current(fs_entry_t* dir);
 fs_entry_t* fs_resolve_path(const char* path);
+int fs_mkdir_p(const char* path);   /* mkdir -p, absolute path */
 fs_entry_t* fs_create_file(const char* name);
 fs_entry_t* fs_create_dir(const char* name);
 int fs_delete_entry(const char* name);

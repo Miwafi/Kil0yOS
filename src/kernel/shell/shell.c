@@ -20,6 +20,8 @@
 #include "net/arp.h"
 #include "net/udp.h"
 #include "net/tftp.h"
+#include "pkg/dpkg.h"
+#include "pkg/kilget.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -54,6 +56,8 @@ static int cmd_netstat(int argc, char** argv);
 static int cmd_net(int argc, char** argv);
 static int cmd_exec(int argc, char** argv);
 static int cmd_tftp(int argc, char** argv);
+static int cmd_dpkg(int argc, char** argv);
+static int cmd_kilget(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -75,6 +79,9 @@ static shell_command_t commands[] = {
     {"netstat", "Show network status", cmd_netstat},
     {"net", "Network info / subcommand (ping|ifconfig|netstat)", cmd_net},
     {"tftp", "Download a file via TFTP (installs to /bin)", cmd_tftp},
+    {"dpkg", "Package tool: dpkg -i file.deb | -r pkg | -l | -L pkg", cmd_dpkg},
+    {"kilget", "Repo client: kilget update|install|show|list|installed", cmd_kilget},
+    {"apt-get", "Alias of kilget (update|install)", cmd_kilget},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
     {"exec", "Execute a user program", cmd_exec},
@@ -263,7 +270,18 @@ static int cmd_echo(int argc, char** argv) {
             return 1;
         }
         
-        char* content = (char*)kmalloc(MAX_FILE_SIZE);
+        /* Size the buffer from the actual arguments: kmalloc(MAX_FILE_SIZE)
+         * became a 32 MB request after the Phase 4.3 cap raise and failed
+         * the kernel heap (error printed to VGA only). */
+        size_t total_len = 0;
+        for (int i = 1; i < redirect_pos; i++) {
+            total_len += strlen(argv[i]) + 1;   /* +1 for the joining space/NUL */
+        }
+        if (total_len > MAX_FILE_SIZE - 1) {
+            total_len = MAX_FILE_SIZE - 1;
+        }
+
+        char* content = (char*)kmalloc(total_len + 1);
         if (content == NULL) {
             vga_puts("echo: memory error\n");
             return 1;
@@ -274,7 +292,7 @@ static int cmd_echo(int argc, char** argv) {
             const char* arg = argv[i];
             size_t arg_len = strlen(arg);
 
-            if (content_len + arg_len + 1 > MAX_FILE_SIZE - 1) {
+            if ((size_t)content_len + arg_len + 1 > total_len) {
                 break;
             }
 
@@ -420,7 +438,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.12.0\n");
+    vga_puts("Kil0yOS v2.13.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -779,7 +797,7 @@ static int cmd_gui(int argc, char** argv) {
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.12.0", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.13.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);
@@ -1181,12 +1199,17 @@ static int cmd_tftp(int argc, char** argv) {
     }
     fs_entry_t* f = fs_resolve_path(local);
     if (f == NULL) {
-        /* create under the chosen directory using the final component */
-        const char* lname = local;
-        for (const char* p = local; *p; p++) {
-            if (*p == '/') lname = p + 1;
+        if (local[0] == '/') {
+            /* absolute destination: fs_create_file resolves the parent dir */
+            f = fs_create_file(local);
+        } else {
+            /* create under the chosen directory using the final component */
+            const char* lname = local;
+            for (const char* p = local; *p; p++) {
+                if (*p == '/') lname = p + 1;
+            }
+            f = fs_create_file(lname);
         }
-        f = fs_create_file(lname);
     }
     if (f != NULL) {
         installed = (fs_write_file(f, buf, size) >= 0);
@@ -1218,6 +1241,63 @@ static int cmd_tftp(int argc, char** argv) {
     vga_puts("\n");
     kfree(buf);
     return 0;
+}
+
+/* Phase 4.2: dpkg frontend shell command */
+static int cmd_dpkg(int argc, char** argv) {
+    if (argc < 2) {
+        vga_puts("Usage: dpkg -i <file.deb> | -r <pkg> | -l | -L <pkg>\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "-i") == 0 && argc >= 3) {
+        return dpkg_install_file(argv[2]) == 0 ? 0 : 1;
+    }
+    if (strcmp(argv[1], "-r") == 0 && argc >= 3) {
+        return dpkg_remove(argv[2]) == 0 ? 0 : 1;
+    }
+    if (strcmp(argv[1], "-l") == 0) {
+        dpkg_list();
+        return 0;
+    }
+    if (strcmp(argv[1], "-L") == 0 && argc >= 3) {
+        return dpkg_show_files(argv[2]) == 0 ? 0 : 1;
+    }
+    vga_puts("dpkg: unknown option ");
+    vga_puts(argv[1]);
+    vga_puts("\n");
+    return 1;
+}
+
+/* Phase 4.4/4.5: kilget repo client (apt-get equivalent) */
+static int cmd_kilget(int argc, char** argv) {
+    if (argc < 2) {
+        vga_puts("Usage: kilget update | install <pkg> | show <pkg> |"
+                 " list | installed\n");
+        vga_puts("Sources: /etc/kilget/sources.list\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "update") == 0) {
+        return kilget_update() == 0 ? 0 : 1;
+    }
+    if (strcmp(argv[1], "install") == 0 && argc >= 3) {
+        return kilget_install(argv[2]) == 0 ? 0 : 1;
+    }
+    if (strcmp(argv[1], "show") == 0 && argc >= 3) {
+        kilget_show(argv[2]);
+        return 0;
+    }
+    if (strcmp(argv[1], "list") == 0) {
+        kilget_list();
+        return 0;
+    }
+    if (strcmp(argv[1], "installed") == 0) {
+        dpkg_list();
+        return 0;
+    }
+    vga_puts("kilget: unknown command ");
+    vga_puts(argv[1]);
+    vga_puts("\n");
+    return 1;
 }
 
 static int execute_command(char* cmd) {

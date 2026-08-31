@@ -14,7 +14,16 @@ s.settimeout(3.0)
 s.connect(MON)
 time.sleep(0.3)
 
-KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '/': 'slash'}
+KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '/': 'slash', '_': 'shift-minus',
+          ':': 'shift-semicolon', ';': 'semicolon', '=': 'equal',
+          ',': 'comma', "'": 'apostrophe', '"': 'shift-apostrophe',
+          '<': 'shift-comma', '>': 'shift-dot',
+          '!': 'shift-1', '@': 'shift-2', '#': 'shift-3', '$': 'shift-4',
+          '%': 'shift-5', '&': 'shift-7', '*': 'shift-8',
+          '(': 'shift-9', ')': 'shift-0', '?': 'shift-slash'}
+# Uppercase letters are shifted lowercase in QEMU sendkey names.
+for _up in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+    KEYMAP[_up] = 'shift-' + _up.lower()
 
 for ch in sys.argv[1]:
     s.sendall(('sendkey ' + KEYMAP.get(ch, ch) + '\n').encode())

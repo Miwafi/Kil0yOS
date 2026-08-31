@@ -78,8 +78,22 @@ static int elf_copy_segment(const uint8_t* data, const elf_phdr_t* ph, uint64_t 
     return 0;
 }
 
+static int elf_load_at(process_t* proc, const uint8_t* data, size_t size,
+                       uint64_t forced_base, elf_load_result_t* out);
+
 int elf_load(process_t* proc, const uint8_t* data, size_t size,
              elf_load_result_t* out) {
+    return elf_load_at(proc, data, size, 0, out);
+}
+
+int elf_load_interp(process_t* proc, const uint8_t* data, size_t size,
+                    uint64_t base, elf_load_result_t* out) {
+    if (base == 0 || (base & 0xFFF)) return ELF_ERR_FORMAT;
+    return elf_load_at(proc, data, size, base, out);
+}
+
+static int elf_load_at(process_t* proc, const uint8_t* data, size_t size,
+                       uint64_t forced_base, elf_load_result_t* out) {
     if (!elf_is_elf64(data, size)) return ELF_ERR_FORMAT;
 
     const elf_ehdr_t* eh = (const elf_ehdr_t*)data;
@@ -97,8 +111,16 @@ int elf_load(process_t* proc, const uint8_t* data, size_t size,
 
     uint64_t bias = 0;
     uint64_t min_vaddr = ~0ULL;
+    const char* interp = "";
     for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type == PT_INTERP) return ELF_ERR_DYNAMIC;
+        if (ph[i].p_type == PT_INTERP) {
+            if (ph[i].p_offset + ph[i].p_filesz > size ||
+                ph[i].p_filesz == 0 ||
+                ph[i].p_filesz >= sizeof(out->interp)) {
+                return ELF_ERR_FORMAT;
+            }
+            interp = (const char*)(data + ph[i].p_offset);
+        }
         if (ph[i].p_type == PT_LOAD && ph[i].p_memsz > 0 &&
             ph[i].p_vaddr < min_vaddr) {
             min_vaddr = ph[i].p_vaddr;
@@ -106,13 +128,16 @@ int elf_load(process_t* proc, const uint8_t* data, size_t size,
     }
 
     if (eh->e_type == ET_DYN) {
-        /* Static-PIE: place the lowest segment at UVM_ELF_BASE; the
-         * binary's self-relocation applies the bias at runtime. */
-        bias = UVM_ELF_BASE - page_down(min_vaddr);
+        /* Place the lowest segment at the chosen base: static-PIE and
+         * dynamic-PIE images alike (the latter is relocated by the
+         * interpreter via AT_PHDR). The interpreter itself is placed at
+         * its explicit base (its first PT_LOAD is at p_vaddr 0). */
+        uint64_t want = (forced_base != 0) ? forced_base : UVM_ELF_BASE;
+        bias = want - page_down(min_vaddr);
     } else {
         /* ET_EXEC: linked addresses are absolute. Anything below the
          * kernel heap arena would corrupt it - refuse with a hint. */
-        if (min_vaddr < UVM_ELF_BASE) return ELF_ERR_LAYOUT;
+        if (min_vaddr < UVM_ELF_BASE || forced_base != 0) return ELF_ERR_LAYOUT;
     }
 
     uint64_t max_end = 0;
@@ -165,5 +190,9 @@ int elf_load(process_t* proc, const uint8_t* data, size_t size,
     out->brk_start = (max_end > 0) ? max_end : UVM_ELF_BASE;
     out->phdr = phdr_va;
     out->phnum = eh->e_phnum;
+    memset(out->interp, 0, sizeof(out->interp));
+    if (interp[0]) {
+        strncpy(out->interp, interp, sizeof(out->interp) - 1);
+    }
     return 0;
 }

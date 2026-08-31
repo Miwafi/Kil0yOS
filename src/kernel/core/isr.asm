@@ -194,8 +194,8 @@ syscall_lnx_entry:
     mov rdx, [rsp + 80]              ; a1 (rsi)
     mov rcx, [rsp + 88]              ; a2 (rdx)
     mov r8,  [rsp + 40]              ; a3 (r10)
-    mov r9,  [rsp + 48]              ; a4 (r8)
-    mov rax, [rsp + 56]              ; a5 (r9)
+    mov r9,  [rsp + 56]              ; a4 (r8)   - r8 slot is rsp+56
+    mov rax, [rsp + 48]              ; a5 (r9)   - r9 slot is rsp+48
     push rax                         ; 7th argument on the stack
     call syscall_lnx_dispatch
     add rsp, 8

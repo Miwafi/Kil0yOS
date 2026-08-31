@@ -26,6 +26,15 @@ static heap_block_t* heap_list = NULL;
 
 extern void klog(const char* s);
 
+/* Total free bytes across the free list - diagnostics for OOM paths. */
+size_t heap_free_bytes(void) {
+    size_t total = 0;
+    for (heap_block_t* it = heap_list; it != NULL; it = it->next) {
+        if (it->free) total += it->size;
+    }
+    return total;
+}
+
 /* Public heap integrity check. Walks the block list verifying range,
  * monotonic order, header magic AND physical adjacency
  * (next must equal cur + sizeof(header) + size). Returns 0 if clean,

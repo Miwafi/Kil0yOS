@@ -3,6 +3,7 @@
 #include "net/ethernet.h"
 #include "net/icmp.h"
 #include "net/udp.h"
+#include "net/tcp.h"
 #include "lib/string.h"
 
 uint16_t ip_checksum(const void* data, uint16_t len) {
@@ -64,6 +65,8 @@ void ipv4_receive(netif_t* iface, const uint8_t* src_mac, const uint8_t* data, u
         icmp_receive(iface, src_ip, payload, payload_len);
     } else if (hdr.proto == IP_PROTO_UDP) {
         udp_receive(iface, src_ip, payload, payload_len);
+    } else if (hdr.proto == IP_PROTO_TCP) {
+        tcp_receive(iface, src_ip, payload, payload_len);
     }
 }
 

@@ -113,6 +113,10 @@ static uint32_t fat_alloc_cluster() {
     uint32_t data_sectors = DISK_MAX_SECTORS - get_first_data_sector();
     uint32_t max_cluster = 2 + (data_sectors / boot_sector.bpb.sectors_per_cluster);
 
+    /* Defensive clamp: a cluster whose FAT entry lies beyond the FAT region
+     * would alias into the data area (see fs_format). Never hand out one. */
+    if (max_cluster > fat_entry_count()) max_cluster = fat_entry_count();
+
     /* Resume scanning where the previous allocation left off; one wrap
      * around the hint before giving up. */
     uint32_t start = fat_alloc_hint;
@@ -300,6 +304,9 @@ static fs_entry_t* fs_create_entry_from_dir(fat32_dir_entry_t* dir_entry, fs_ent
     entry->first_cluster = ((uint32_t)dir_entry->first_cluster_high << 16) | dir_entry->first_cluster_low;
     entry->attributes = dir_entry->attributes;
     entry->parent = parent;
+    entry->backend = FS_BACKEND_FAT;   /* entries read back from FAT disk */
+    entry->inode_no = 0;
+    entry->mem_data = NULL;
     
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         entry->children[i] = NULL;
@@ -473,8 +480,22 @@ static void fs_format() {
     boot_sector.bpb.hidden_sectors = 0;
     boot_sector.bpb.total_sectors_32 = DISK_MAX_SECTORS;
     
+    /* FAT32: 4 bytes per cluster entry (128 entries per sector). Size the
+     * FAT to cover EVERY data cluster - the old formula divided once by 512
+     * as if each entry were 512 bytes, yielding a FAT far too small. With an
+     * 8 MiB disk the FAT covered only 4224 entries while the allocator
+     * handed out ~16300 clusters, so entries for high clusters were written
+     * INTO the data area, corrupting low-cluster files (hello-lnx) whenever
+     * a big file (libc.so.6) was installed. Iterate once since the FAT size
+     * itself shrinks the data area. */
     uint32_t data_sectors = DISK_MAX_SECTORS - boot_sector.bpb.reserved_sectors;
-    uint32_t sectors_per_fat = ((data_sectors / boot_sector.bpb.sectors_per_cluster) + 1 + 511) / 512 + 1;
+    uint32_t sectors_per_fat = 1;
+    for (int iter = 0; iter < 4; iter++) {
+        data_sectors = DISK_MAX_SECTORS - boot_sector.bpb.reserved_sectors
+                     - boot_sector.bpb.fat_count * sectors_per_fat;
+        uint32_t clusters = data_sectors / boot_sector.bpb.sectors_per_cluster + 2;
+        sectors_per_fat = (clusters * 4 + DISK_SECTOR_SIZE - 1) / DISK_SECTOR_SIZE;
+    }
     boot_sector.sectors_per_fat_32 = sectors_per_fat;
     boot_sector.extended_flags = 0;
     boot_sector.fs_version = 0;
@@ -551,6 +572,13 @@ int fs_load() {
     root->first_cluster = boot_sector.root_cluster;
     root->attributes = ATTR_DIRECTORY;
     root->parent = NULL;
+    /* kmalloc does NOT clear memory: an unset backend held garbage, which
+     * failed the `parent->backend != FS_BACKEND_FAT` checks and routed
+     * EVERY new file into the MEM overlay - the whole filesystem silently
+     * lived in the kernel heap until a big install OOM'd mid-extraction. */
+    root->backend = FS_BACKEND_FAT;
+    root->inode_no = 0;
+    root->mem_data = NULL;
     
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         root->children[i] = NULL;
@@ -756,6 +784,30 @@ static void resolve_parent_and_name(const char* name, fs_entry_t** parent_out, c
     }
 }
 
+int fs_mkdir_p(const char* path) {
+    if (path == NULL || path[0] != '/') return -1;
+    if (fs_resolve_path(path) != NULL) return 0;
+
+    char buf[MAX_PATH_LENGTH];
+    size_t len = strlen(path);
+    if (len >= sizeof(buf)) return -1;
+    strcpy(buf, path);
+
+    for (size_t i = 1; i <= len; i++) {
+        if (buf[i] == '/' || buf[i] == '\0') {
+            char save = buf[i];
+            buf[i] = '\0';
+            if (fs_resolve_path(buf) == NULL) {
+                if (fs_create_dir(buf) == NULL && fs_resolve_path(buf) == NULL) {
+                    return -1;
+                }
+            }
+            buf[i] = save;
+        }
+    }
+    return fs_resolve_path(path) != NULL ? 0 : -1;
+}
+
 fs_entry_t* fs_create_file(const char* name) {
     fs_last_error = FS_ERR_NONE;
     
@@ -907,6 +959,10 @@ fs_entry_t* fs_create_dir(const char* name) {
         fs_last_error = FS_ERR_FULL;
         return NULL;
     }
+    /* Terminate the directory's cluster chain: fat_alloc_cluster treats
+     * FAT entry 0 as free, so an unmarked dir cluster would be handed
+     * out again (observed: tar payload writes into a fresh dir failed). */
+    fat_write_entry(new_cluster, FAT32_EOC_MARK);
     
     uint32_t sector = cluster_to_sector(new_cluster);
     uint8_t buffer[DISK_SECTOR_SIZE] = {0};
@@ -958,6 +1014,14 @@ fs_entry_t* fs_create_dir(const char* name) {
     entry->first_cluster = new_cluster;
     entry->attributes = ATTR_DIRECTORY;
     entry->parent = parent_dir;
+    /* Same trap as fs_load's root: kmalloc does NOT clear memory and an
+     * unset backend held garbage - such dirs randomly failed the
+     * `backend != FS_BACKEND_FAT` check, so files created under them
+     * silently went to the MEM overlay and OOM'd the heap on big
+     * installs instead of using the FAT clusters on the disk. */
+    entry->backend = FS_BACKEND_FAT;
+    entry->inode_no = 0;
+    entry->mem_data = NULL;
 
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         entry->children[i] = NULL;
@@ -983,7 +1047,15 @@ fs_entry_t* fs_create_dir(const char* name) {
 /* MEM backend write: (re)allocate the in-memory content buffer. */
 static int fs_write_file_mem(fs_entry_t* file, const uint8_t* data, size_t size) {
     uint8_t* buf = (uint8_t*)kmalloc(size > 0 ? size : 1);
-    if (buf == NULL) return -1;
+    if (buf == NULL) {
+        fs_last_error = FS_ERR_FULL;
+        klog("[fs] mem write OOM: size=");
+        char nb[16]; itoa((int)size, nb, 10, sizeof(nb));
+        klog(nb); klog(" heapfree=");
+        itoa((int)heap_free_bytes(), nb, 10, sizeof(nb));
+        klog(nb); klog("\n");
+        return -1;
+    }
     if (size > 0) memcpy(buf, data, size);
 
     if (file->mem_data != NULL) kfree(file->mem_data);
@@ -993,7 +1065,10 @@ static int fs_write_file_mem(fs_entry_t* file, const uint8_t* data, size_t size)
 }
 
 int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
-    if (file == NULL || file->type != FS_TYPE_FILE || data == NULL) return -1;
+    if (file == NULL || file->type != FS_TYPE_FILE || data == NULL) {
+        fs_last_error = FS_ERR_INVALID;
+        return -1;
+    }
 
     if (size > MAX_FILE_SIZE) {
         size = MAX_FILE_SIZE;
@@ -1016,9 +1091,13 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
     /* FAT backend: legacy cluster chain write. */
     uint32_t old_first_cluster = file->first_cluster;
     uint32_t old_size = file->size;
-    
+
     uint32_t first_cluster = fat_alloc_cluster();
-    if (first_cluster == 0) return -1;
+    if (first_cluster == 0) {
+        klog("[fs] write: fat_alloc_cluster failed\n");
+        fs_last_error = FS_ERR_FULL;
+        return -1;
+    }
     
     uint32_t current_cluster = first_cluster;
     size_t offset = 0;
@@ -1036,20 +1115,26 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
             memcpy(buffer, data + offset, copy_size);
             
             if (disk_write_sector(sector + s, buffer) != 0) {
+                klog("[fs] write: sector io failed\n");
+                fs_last_error = FS_ERR_IO;
                 fat_free_cluster_chain(first_cluster);
                 return -1;
             }
-            
+
             offset += copy_size;
         }
-        
+
         if (offset < size) {
             uint32_t next_cluster = fat_alloc_cluster();
             if (next_cluster == 0) {
+                klog("[fs] write: chain alloc failed\n");
+                fs_last_error = FS_ERR_FULL;
                 fat_free_cluster_chain(first_cluster);
                 return -1;
             }
             if (fat_write_entry(current_cluster, next_cluster) != 0) {
+                klog("[fs] write: fat chain write failed\n");
+                fs_last_error = FS_ERR_IO;
                 fat_free_cluster_chain(first_cluster);
                 return -1;
             }

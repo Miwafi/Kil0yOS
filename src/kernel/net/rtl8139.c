@@ -155,6 +155,11 @@ int rtl8139_send(const uint8_t* data, uint16_t len) {
             __asm__ volatile("pause");
             tsd = ind(io_base + RTL8139_REG_TSD0 + idx * 4);
         }
+        if (timeout <= 0) {
+            klog("[rtl] tx wait timeout on desc ");
+            char nb[4]; itoa(idx, nb, 10, sizeof(nb));
+            klog(nb); klog("\n");
+        }
     }
     tx_pending_mask &= (uint8_t)~(1u << idx);
 

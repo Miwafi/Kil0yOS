@@ -128,7 +128,10 @@ int arp_resolve(netif_t* iface, uint32_t ip, uint8_t* out_mac) {
 
     arp_send_request(iface, ip);
 
-    for (int retry = 0; retry < 50; retry++) {
+    /* ~1 s window with the request re-broadcast every ~100 ms: a single
+     * request with a 100 ms wait loses the race whenever the first reply
+     * frame is dropped (observed with wget after DHCP). */
+    for (int retry = 0; retry < 500; retry++) {
         pit_delay_ms(2);
         netif_poll();
         entry = arp_find(ip);
@@ -136,6 +139,7 @@ int arp_resolve(netif_t* iface, uint32_t ip, uint8_t* out_mac) {
             for (int i = 0; i < 6; i++) out_mac[i] = entry->mac[i];
             return 0;
         }
+        if (retry % 50 == 49) arp_send_request(iface, ip);
     }
     klog("arp: resolve failed\n");
     return -1;

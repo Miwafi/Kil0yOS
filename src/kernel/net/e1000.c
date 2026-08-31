@@ -163,6 +163,7 @@ void e1000_rx_poll(void) {
     int enabled = irq_save();
     disable_interrupts();
 
+    int drained = 0;
     while (1) {
         int idx = rx_head;
         if ((rx_descs[idx].status & 0x01) == 0) break;
@@ -174,6 +175,10 @@ void e1000_rx_poll(void) {
         rx_head = (rx_head + 1) % NUM_RX;
         rx_tail = (rx_tail + 1) % NUM_RX;
         e1000_write(E1000_RDT, rx_tail);
+        drained++;
+    }
+    if (drained != 0) {
+        klog("[e1000] rx drained\n");
     }
 
     irq_restore(enabled);
@@ -189,6 +194,7 @@ int e1000_send(const uint8_t* data, uint16_t len) {
 
     int idx = tx_tail;
     if ((tx_descs[idx].status & 0x01) == 0) {
+        klog("[e1000] tx desc busy\n");
         irq_restore(enabled);
         return -1;
     }
@@ -211,6 +217,7 @@ int e1000_send(const uint8_t* data, uint16_t len) {
     int timeout = 1000000;
     while ((tx_descs[submitted].status & 0x01) == 0) {
         if (--timeout <= 0) {
+            klog("[e1000] tx dd timeout\n");
             irq_restore(enabled);
             return -1;
         }

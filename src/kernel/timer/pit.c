@@ -36,7 +36,11 @@ uint64_t pit_uptime_us(void) {
             base_offset = pit_poll_elapsed_us() - pit_ticks * tick_us;
         }
         uint16_t cur = pit_read_counter();
-        uint64_t sub = ((uint64_t)(pit_divisor - cur)) * 1000000ULL / PIT_BASE_FREQ;
+        /* Clamp: a count above the divisor would wrap the uint32
+         * subtraction below and jump uptime by hours. */
+        uint64_t sub = 0;
+        if (cur <= pit_divisor)
+            sub = ((uint64_t)(pit_divisor - cur)) * 1000000ULL / PIT_BASE_FREQ;
         return pit_ticks * tick_us + base_offset + sub;
     }
 
@@ -128,9 +132,20 @@ void pit_init(uint32_t frequency) {
 }
 
 static uint16_t pit_read_counter(void) {
+    /* The latch + two-byte read must be ATOMIC against other readers.
+     * pit_uptime_us/pit_poll_elapsed_us/pit_delay_ms run from both
+     * mainline and IRQ context; interleaved reads reassemble the low and
+     * high bytes from two different instants, producing a count ABOVE
+     * pit_divisor. In tick mode (pit_divisor - cur) is computed as
+     * uint32 and wraps to ~4.29e9, launching uptime by hours in one
+     * call - every RTO/timeout then fires immediately (observed as TCP
+     * connect/send timeouts a few ms after start). */
+    uint64_t flags = irq_save();
+    disable_interrupts();
     outb(PIT_COMMAND, 0x00); // latch counter 0
     uint8_t lo = inb(PIT_CHANNEL0);
     uint8_t hi = inb(PIT_CHANNEL0);
+    irq_restore(flags);
     return (uint16_t)lo | ((uint16_t)hi << 8);
 }
 

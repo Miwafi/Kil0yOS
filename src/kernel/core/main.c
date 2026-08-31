@@ -22,6 +22,7 @@
 #include "net/e1000.h"
 #include "net/arp.h"
 #include "net/udp.h"
+#include "net/tcp.h"
 #include "net/dhcp.h"
 
 static inline void outb(uint16_t port, uint8_t val) {
@@ -93,7 +94,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.12.0\n");
+    klog("Kil0yOS version 2.13.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -176,6 +177,7 @@ void kernel_main(uint64_t mb_info_phys) {
     netif_init();
     arp_init();
     udp_init();
+    tcp_init();
     const char* nic = netif_probe();
     if (nic) {
         klog("net: ");

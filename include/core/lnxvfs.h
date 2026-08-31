@@ -18,6 +18,10 @@ int  lnxvfs_read(int fd, char* buf, size_t count);
 int  lnxvfs_write(int fd, const char* buf, size_t count);
 int  lnxvfs_lseek(int fd, int whence, long long off);   /* returns new offset */
 long long lnxvfs_seek_pos(int fd);
+/* File-backed mmap support (Phase 3.0): size of the fd's file (negative
+ * errno on failure) and read without moving the fd cursor. */
+long long lnxvfs_filesize(int fd);
+int  lnxvfs_pread(int fd, void* buf, size_t count, long long off);
 int  lnxvfs_getdents64(int fd, void* ubuf, size_t count);
 int  lnxvfs_fstat(int fd, void* ubuf);
 int  lnxvfs_stat_path(const char* path, void* ubuf);
