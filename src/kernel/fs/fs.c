@@ -1329,22 +1329,18 @@ void fs_save() {
      * volatile by design - do not write FAT structures onto the disk. */
     if (ext2_mode) return;
 
+    /* FAT backend: all mutations (fs_write_file, fs_create_file, fs_mkdir,
+     * fs_delete_entry, fat_write_entry, fat_alloc_cluster) already write
+     * to disk in real time via disk_write_sector().  The old recursive
+     * fs_save_directory() rebuild was a redundant full-rewrite that only
+     * added value as a space-recovery pass (truncating empty dir clusters
+     * after deletes); empty dir entries (0xE5/0x00) are reused by
+     * fs_write_directory_entry() anyway, so correctness does not depend
+     * on it.  Boot-sector sync remains as a lightweight safety net. */
     uint8_t buffer[DISK_SECTOR_SIZE];
-
-    /* 1. Save boot sector */
     memset(buffer, 0, DISK_SECTOR_SIZE);
     memcpy(buffer, &boot_sector, sizeof(fat32_boot_sector_t));
     disk_write_sector(0, buffer);
-
-    /* 2. Sync FAT table to disk (all modified entries) */
-    /* FAT entries are already written by fat_write_entry() during operations,
-       so we just need to ensure the FAT table is consistent */
-    /* No additional action needed as fat_write_entry() writes immediately */
-
-    /* 3. Save root directory and all subdirectories recursively */
-    if (root != NULL) {
-        fs_save_directory(root);
-    }
 }
 
 /*

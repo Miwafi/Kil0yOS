@@ -33,7 +33,33 @@ typedef struct {
     uint8_t*       out;
     size_t         out_cap;
     size_t         out_len;
+    /* streaming mode: when set, out points at the shared sliding window
+     * and fullness is relieved by flushing to the sink (see out_flush) */
+    int (*sink)(void* ctx, const uint8_t* data, size_t n);
+    void*          sink_ctx;
+    size_t         flushed;   /* bytes already handed to the sink */
 } inf_state_t;
+
+/* Sliding-window parameters. DEFLATE back-references reach at most
+ * 32 KB back, so keeping the last INF_KEEP bytes as history after a
+ * flush keeps every `from` index valid. The window must hold
+ * INF_KEEP (history) + room for one match run (<= 258 B). */
+#define INF_KEEP  32768
+#define INF_BUFSZ 65536
+
+/* Flush all but the last INF_KEEP bytes to the sink and slide the
+ * history to the front. Legacy (sink == NULL) callers never reach this. */
+static int out_flush(inf_state_t* s) {
+    size_t keep = s->out_len < INF_KEEP ? s->out_len : INF_KEEP;
+    size_t flush_n = s->out_len - keep;
+    if (flush_n) {
+        if (s->sink(s->sink_ctx, s->out, flush_n) != 0) return -1;
+        for (size_t i = 0; i < keep; i++) s->out[i] = s->out[flush_n + i];
+        s->flushed += flush_n;
+    }
+    s->out_len = keep;
+    return 0;
+}
 
 static const uint16_t len_base[29] = {
     3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
@@ -159,8 +185,11 @@ static int inflate_stored(inf_state_t* s) {
     if (get_bits(s, 16, &len) != 0) return -1;
     if (get_bits(s, 16, &nlen) != 0) return -1;
     if ((len ^ 0xFFFF) != nlen) return -1;
-    if (s->out_len + len > s->out_cap) return -1;
+    if (!s->sink && s->out_len + len > s->out_cap) return -1;
     for (uint32_t i = 0; i < len; i++) {
+        if (s->out_len >= s->out_cap) {
+            if (!s->sink || out_flush(s) != 0) return -1;
+        }
         uint32_t b;
         if (get_bits(s, 8, &b) != 0) return -1;
         s->out[s->out_len++] = (uint8_t)b;
@@ -173,7 +202,9 @@ static int inflate_codes(inf_state_t* s, const huff_t* lit, const huff_t* dist) 
         int sym;
         if (huff_decode(s, lit, &sym) != 0) return -1;
         if (sym < 256) {
-            if (s->out_len >= s->out_cap) return -1;
+            if (s->out_len >= s->out_cap) {
+                if (!s->sink || out_flush(s) != 0) return -1;
+            }
             s->out[s->out_len++] = (uint8_t)sym;
         } else if (sym == 256) {
             return 0;
@@ -192,9 +223,14 @@ static int inflate_codes(inf_state_t* s, const huff_t* lit, const huff_t* dist) 
             uint32_t distance = dist_base[dsym] + extra;
 
             if (distance > s->out_len) return -1;
-            if (s->out_len + length > s->out_cap) return -1;
+            /* distance <= 32768 = INF_KEEP, so the flush inside the copy
+             * loop always leaves the referenced history intact. */
             size_t from = s->out_len - distance;
             for (uint32_t i = 0; i < length; i++) {
+                if (s->out_len >= s->out_cap) {
+                    if (!s->sink || out_flush(s) != 0) return -1;
+                    from = s->out_len - distance;
+                }
                 s->out[s->out_len] = s->out[from];
                 s->out_len++;
                 from++;
@@ -326,10 +362,30 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t* p, size_t n) {
     return ~crc;
 }
 
-int gzip_inflate(const uint8_t* in, size_t in_len,
-                 uint8_t* out, size_t out_cap, size_t* out_len) {
+/* Shared sliding window (single-threaded shell context only). */
+static uint8_t inf_window[INF_BUFSZ];
+
+/* CRC-covering wrapper: counts bytes passing to the user sink so the
+ * per-member trailer check works without holding the whole output. */
+typedef struct {
+    gzip_sink_fn user;
+    void*        uctx;
+    uint32_t     crc;
+} crc_sink_t;
+
+static int crc_sink(void* ctx, const uint8_t* d, size_t n) {
+    crc_sink_t* c = ctx;
+    c->crc = crc32_update(c->crc, d, n);
+    return c->user(c->uctx, d, n);
+}
+
+int gzip_inflate_cb(const uint8_t* in, size_t in_len,
+                    gzip_sink_fn sink, void* ctx, size_t* out_len) {
     size_t pos = 0;
     size_t total = 0;
+    crc_sink_t cs;
+    cs.user = sink;
+    cs.uctx = ctx;
 
     while (in_len - pos >= 18) { /* 10 hdr + 8 trailer minimum */
         const uint8_t* p = in + pos;
@@ -356,8 +412,11 @@ int gzip_inflate(const uint8_t* in, size_t in_len,
         memset(&s, 0, sizeof(s));
         s.in = in + pos + off;
         s.in_len = in_len - pos - off;
-        s.out = out + total;
-        s.out_cap = out_cap - total;
+        s.out = inf_window;
+        s.out_cap = INF_BUFSZ;
+        s.sink = crc_sink;
+        s.sink_ctx = &cs;
+        cs.crc = 0;
         if (inflate_raw(&s) != 0) return -1;
 
         /* trailer: CRC32 (ISIZE checked by the caller via ISIZE field).
@@ -370,10 +429,12 @@ int gzip_inflate(const uint8_t* in, size_t in_len,
         const uint8_t* t = s.in + trailer_pos;
         uint32_t want_crc = (uint32_t)t[0] | ((uint32_t)t[1] << 8) |
                             ((uint32_t)t[2] << 16) | ((uint32_t)t[3] << 24);
-        uint32_t got_crc = crc32_update(0, out + total, s.out_len);
-        if (got_crc != want_crc) return -1;
+        /* deliver the tail still sitting in the window (this also
+         * completes the CRC, which only counts bytes passing the sink) */
+        if (s.out_len > 0 && crc_sink(&cs, s.out, s.out_len) != 0) return -1;
+        if (cs.crc != want_crc) return -1;
 
-        total += s.out_len;
+        total += s.flushed + s.out_len;
         pos += off + trailer_pos + 8;
 
         /* concatenated members: continue; stray trailing zero bytes
@@ -387,8 +448,42 @@ int gzip_inflate(const uint8_t* in, size_t in_len,
     return 0;
 }
 
+/* One-shot buffer sink used by the legacy gzip_inflate wrapper. */
+typedef struct {
+    uint8_t* out;
+    size_t   cap;
+    size_t   len;
+} buf_sink_t;
+
+static int buf_sink(void* ctx, const uint8_t* d, size_t n) {
+    buf_sink_t* b = ctx;
+    if (b->len + n > b->cap) return -1;
+    for (size_t i = 0; i < n; i++) b->out[b->len + i] = d[i];
+    b->len += n;
+    return 0;
+}
+
+int gzip_inflate(const uint8_t* in, size_t in_len,
+                 uint8_t* out, size_t out_cap, size_t* out_len) {
+    buf_sink_t b;
+    b.out = out;
+    b.cap = out_cap;
+    b.len = 0;
+    size_t total = 0;
+    if (gzip_inflate_cb(in, in_len, buf_sink, &b, &total) != 0) return -1;
+    *out_len = total;
+    return 0;
+}
+
 long long gzip_payload_size(const uint8_t* in, size_t in_len) {
     if (in_len < 18 || in[0] != 0x1F || in[1] != 0x8B) return -1;
+    /* Read the ISIZE trailer at its TRUE position (last 4 bytes). Do NOT
+     * scan backwards over zero bytes here: ISIZE high bytes are zero for
+     * any payload < 64 KB, so a "padding" scan eats the real trailer and
+     * returns garbage (broke every small .deb). Mirror padding AFTER the
+     * trailer is a non-issue for callers: gzip_inflate[_cb] locates the
+     * trailer bit-exactly after the final DEFLATE block and only skips
+     * padding between members. */
     const uint8_t* isize = in + in_len - 4;
     return (long long)((uint32_t)isize[0] | ((uint32_t)isize[1] << 8) |
                        ((uint32_t)isize[2] << 16) | ((uint32_t)isize[3] << 24));

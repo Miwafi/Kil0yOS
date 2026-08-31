@@ -2,6 +2,7 @@
 
 #include "net/http.h"
 #include "net/tcp.h"
+#include "net/dns.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "fs/fs.h"
@@ -78,6 +79,7 @@ int http_download(netif_t* iface, const char* host, uint16_t port,
 
     uint32_t ip = parse_ip_str(host);
     if (ip == 0) ip = resolve_hosts(host);
+    if (ip == 0) ip = dns_resolve(&g_netif, host);
     if (ip == 0) {
         klog("[http] cannot resolve host: ");
         klog(host);
@@ -170,6 +172,54 @@ int http_download(netif_t* iface, const char* host, uint16_t port,
         return -1;
     }
     size_t body_off = (size_t)(hdr_end - (const char*)resp) + 4;
+
+    /* Content-Length completeness check: tcp_recv returning 0 also
+     * happens on a RESET or slirp hiccup mid-transfer, and treating
+     * that as orderly EOF silently truncated a 1.8 MB mirror index
+     * (the gzip ISIZE then read as garbage from the cut stream). */
+    {
+        long long want_len = -1;
+        const char* hp = (const char*)resp;
+        const char* hend = (const char*)hdr_end;
+        while (hp < hend) {
+            const char* eol = strchr(hp, '\n');
+            size_t linelen = (eol && eol <= hend) ? (size_t)(eol - hp)
+                                                  : (size_t)(hend - hp);
+            /* case-insensitive "content-length:" prefix match */
+            if (linelen > 15) {
+                const char* key = "content-length:";
+                int match = 1;
+                for (int i = 0; i < 15; i++) {
+                    char a = hp[i];
+                    if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                    if (a != key[i]) { match = 0; break; }
+                }
+                if (match) {
+                    const char* v = hp + 15;
+                    while (v < hp + linelen && *v == ' ') v++;
+                    long long w = 0;
+                    while (v < hp + linelen && *v >= '0' && *v <= '9')
+                        w = w * 10 + (*v++ - '0');
+                    want_len = w;
+                }
+            }
+            if (eol == NULL || eol > hend) break;
+            hp = eol + 1;
+        }
+        size_t blen_now = rlen - body_off;
+        if (want_len >= 0 && blen_now != (size_t)want_len) {
+            klog("[http] body truncated: got ");
+            char nb[16];
+            itoa((int)blen_now, nb, 10, sizeof(nb));
+            klog(nb);
+            klog(" want ");
+            itoa((int)want_len, nb, 10, sizeof(nb));
+            klog(nb);
+            klog("\n");
+            kfree(resp);
+            return -1;
+        }
+    }
 
     /* status code check ("HTTP/1.x NNN ...") */
     if (rlen < 13 || resp[8] != ' ') {

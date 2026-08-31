@@ -351,6 +351,11 @@ int tcp_connect(tcp_socket_t* sock, uint32_t ip, uint16_t port) {
     sock->tx_retries = 0;
     sock->tx_time_us = pit_uptime_us();
 
+    /* Exponential backoff for SYN retransmission: a fixed 300 ms RTO
+     * burns the retry budget in 2.4 s, far too aggressive for real
+     * internet paths (one lost SYN to a mirror then killed the connect).
+     * 500 ms doubling to a 4 s cap fits 4-5 SYNs into the 10 s window. */
+    uint64_t rto_us = 500000;
     uint64_t start = pit_uptime_us();
     while (sock->state == TCP_SYN_SENT) {
         netif_poll();
@@ -359,7 +364,7 @@ int tcp_connect(tcp_socket_t* sock, uint32_t ip, uint16_t port) {
         if (sock->state != TCP_SYN_SENT) break;
         /* SYN retransmit (tx slot is unused for the SYN itself) */
         if (sock->tx_time_us != 0 &&
-            pit_uptime_us() - sock->tx_time_us > (uint64_t)TCP_RTO_MS * 1000) {
+            pit_uptime_us() - sock->tx_time_us > rto_us) {
             if (sock->tx_retries >= TCP_RETRIES) {
                 sock->state = TCP_CLOSED;
                 klog("[tcp] connect: SYN retries exhausted\n");
@@ -368,6 +373,7 @@ int tcp_connect(tcp_socket_t* sock, uint32_t ip, uint16_t port) {
             tcp_transmit_seg(sock, sock->iss, TCP_FLAG_SYN, NULL, 0);
             sock->tx_time_us = pit_uptime_us();
             sock->tx_retries++;
+            if (rto_us < 4000000ULL) rto_us *= 2;
         }
         if (pit_uptime_us() - start > 10000000ULL) {
             klog("[tcp] connect: 10s timeout, no SYN-ACK (retx=");

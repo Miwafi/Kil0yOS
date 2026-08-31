@@ -3,6 +3,7 @@
 #include "pkg/kilget.h"
 #include "pkg/dpkg.h"
 #include "pkg/sha256.h"
+#include "pkg/inflate.h"
 #include "net/http.h"
 #include "net/netif.h"
 #include "lib/string.h"
@@ -15,7 +16,11 @@
 #define KILGET_INDEX   "/var/lib/kilget/Packages"
 #define KILGET_SOURCES "/etc/kilget/sources.list"
 #define KILGET_CACHE   "/var/cache/kilget"
-#define KILGET_MAX_PKGS 64
+/* Real dists indexes (e.g. jammy main) carry ~2600 paragraphs; the
+ * record table must hold them all or alphabetically-late packages
+ * (libc6 sits around #1000) become invisible. 4096 entries cost
+ * ~2.6 MB of static data - fine next to a 500 MB heap. */
+#define KILGET_MAX_PKGS 4096
 
 #define TERM_OUT(s) term_puts(s)
 
@@ -73,7 +78,31 @@ typedef struct {
     char     host[64];
     uint16_t port;
     char     base[160];   /* repo base path, no trailing slash */
+    char     suite[64];   /* dists suite (e.g. "jammy"); empty = flat repo */
+    char     comps[8][32];
+    int      ncomps;
 } repo_src_t;
+
+/* Tokenize one line in place: split on spaces/tabs but keep bracketed
+ * apt options ("[arch=amd64 trusted=yes]") as a single token. Returns
+ * the token count (at most maxv). */
+static int line_tokens(char* line, char** tokv, int maxv) {
+    int n = 0;
+    char* p = line;
+    while (*p && n < maxv) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+        tokv[n++] = p;
+        if (*p == '[') {
+            while (*p && *p != ']') p++;
+            if (*p == ']') p++;
+        } else {
+            while (*p && *p != ' ' && *p != '\t') p++;
+        }
+        if (*p) { *p = '\0'; p++; }
+    }
+    return n;
+}
 
 static int parse_sources(repo_src_t* src) {
     uint8_t* buf;
@@ -89,40 +118,70 @@ static int parse_sources(repo_src_t* src) {
     while (p && *p) {
         char* nl = strchr(p, '\n');
         if (nl) *nl = '\0';
-        if (*p == '#') { p = nl ? nl + 1 : NULL; continue; }
-        /* format: deb http://host[:port]/path . */
-        char* url = strstr(p, "http://");
-        if (url) {
-            url += 7;
-            const char* path_start = strchr(url, '/');
-            const char* colon = strchr(url, ':');
-            size_t hlen = (colon && (!path_start || colon < path_start))
-                          ? (size_t)(colon - url)
-                          : (path_start ? (size_t)(path_start - url) : strlen(url));
-            if (hlen == 0 || hlen >= sizeof(src->host)) { p = nl ? nl + 1 : NULL; continue; }
-            memcpy(src->host, url, hlen);
-            src->host[hlen] = '\0';
+        if (*p != '#') {
+            /* format (flat):   deb http://host[:port][/base] .
+             * format (dists):  deb http://host[:port]/base SUITE COMP... */
+            char* tokv[16];
+            int ntok = line_tokens(p, tokv, 16);
+            for (int i = 0; i < ntok; i++) {
+                char* url = strstr(tokv[i], "http://");
+                if (url == NULL) continue;
+                url += 7;
+                const char* path_start = strchr(url, '/');
+                const char* colon = strchr(url, ':');
+                size_t hlen = (colon && (!path_start || colon < path_start))
+                              ? (size_t)(colon - url)
+                              : (path_start ? (size_t)(path_start - url) : strlen(url));
+                if (hlen == 0 || hlen >= sizeof(src->host)) continue;
+                memcpy(src->host, url, hlen);
+                src->host[hlen] = '\0';
 
-            src->port = 80;
-            if (colon && (!path_start || colon < path_start)) {
-                src->port = (uint16_t)atoi(colon + 1);
-                if (src->port == 0) src->port = 80;
-            }
+                src->port = 80;
+                if (colon && (!path_start || colon < path_start)) {
+                    src->port = (uint16_t)atoi(colon + 1);
+                    if (src->port == 0) src->port = 80;
+                }
 
-            src->base[0] = '\0';
-            if (path_start) {
-                size_t plen = strlen(path_start);
-                while (plen > 0 && (path_start[plen-1] == ' ' ||
-                                    path_start[plen-1] == '\r')) plen--;
-                /* strip the trailing "dist-style" component ("." or "./") */
-                while (plen > 0 && (path_start[plen-1] == '.')) plen--;
-                while (plen > 0 && path_start[plen-1] == '/') plen--;
-                if (plen >= sizeof(src->base)) plen = sizeof(src->base) - 1;
-                memcpy(src->base, path_start, plen);
-                src->base[plen] = '\0';
+                src->base[0] = '\0';
+                if (path_start) {
+                    size_t plen = strlen(path_start);
+                    while (plen > 0 && (path_start[plen-1] == ' ' ||
+                                        path_start[plen-1] == '\r')) plen--;
+                    /* strip the trailing "dist-style" component ("." or "./") */
+                    while (plen > 0 && (path_start[plen-1] == '.')) plen--;
+                    while (plen > 0 && path_start[plen-1] == '/') plen--;
+                    if (plen >= sizeof(src->base)) plen = sizeof(src->base) - 1;
+                    memcpy(src->base, path_start, plen);
+                    src->base[plen] = '\0';
+                }
+
+                /* suite + components: tokens after the URL, skipping
+                 * bracketed options like [arch=amd64 trusted=yes].
+                 * A "." suite means flat-repo style (old format). */
+                src->suite[0] = '\0';
+                src->ncomps = 0;
+                int j = i + 1;
+                while (j < ntok && tokv[j][0] == '[') j++;
+                if (j < ntok && strcmp(tokv[j], ".") != 0) {
+                    size_t slen = strlen(tokv[j]);
+                    if (slen >= sizeof(src->suite)) slen = sizeof(src->suite) - 1;
+                    memcpy(src->suite, tokv[j], slen);
+                    src->suite[slen] = '\0';
+                    j++;
+                    while (j < ntok && src->ncomps < 8) {
+                        if (tokv[j][0] == '[') break;
+                        size_t clen = strlen(tokv[j]);
+                        if (clen >= sizeof(src->comps[0])) clen = sizeof(src->comps[0]) - 1;
+                        memcpy(src->comps[src->ncomps], tokv[j], clen);
+                        src->comps[src->ncomps][clen] = '\0';
+                        src->ncomps++;
+                        j++;
+                    }
+                }
+                rc = 0;
+                break;
             }
-            rc = 0;
-            break;
+            if (rc == 0) break;   /* first valid deb line wins (one source) */
         }
         p = nl ? nl + 1 : NULL;
     }
@@ -160,6 +219,83 @@ static void index_field(const char* para, size_t plen, const char* key,
     }
 }
 
+/* Extract one Packages paragraph (Debian RFC822-ish format) into the
+ * record table. Shared by the streaming feeder and index_load. */
+static void parse_record(const char* para, size_t plen) {
+    if (nrecs >= KILGET_MAX_PKGS) return;
+    pkg_rec_t* r = &recs[nrecs];
+    memset(r, 0, sizeof(*r));
+    index_field(para, plen, "Package", r->package, sizeof(r->package));
+    index_field(para, plen, "Version", r->version, sizeof(r->version));
+    index_field(para, plen, "Filename", r->filename, sizeof(r->filename));
+    index_field(para, plen, "SHA256", r->sha, sizeof(r->sha));
+    index_field(para, plen, "Depends", r->depends, sizeof(r->depends));
+    char sizebuf[16];
+    index_field(para, plen, "Size", sizebuf, sizeof(sizebuf));
+    r->size = (uint32_t)strtoul(sizebuf, NULL, 10);
+    if (r->package[0] && r->filename[0]) nrecs++;
+}
+
+/* Streaming feeder: assembles paragraphs from inflate chunks. Real
+ * mirrors ship ~48 MB of plain Packages text (jammy main); buffering
+ * that whole output is impossible on this kernel, so records are
+ * parsed as they stream past and only the extracted fields are kept. */
+typedef struct {
+    char*  buf;      /* current paragraph */
+    size_t len, cap;
+    int    nl_run;   /* consecutive newlines seen (paragraph separator) */
+    int    overflow; /* paragraph larger than the cap: skip it */
+} index_feed_t;
+
+#define FEED_PARA_MAX (256 * 1024)
+
+static void feed_append(index_feed_t* f, char c) {
+    if (f->len + 1 >= f->cap) {
+        if (f->cap >= FEED_PARA_MAX) { f->overflow = 1; return; }
+        size_t ncap = f->cap ? f->cap * 2 : 8192;
+        char* nb = (char*)krealloc(f->buf, ncap);
+        if (nb == NULL) { f->overflow = 1; return; }
+        f->buf = nb;
+        f->cap = ncap;
+    }
+    f->buf[f->len++] = c;
+}
+
+static int index_feed(void* ctx, const uint8_t* d, size_t n) {
+    index_feed_t* f = (index_feed_t*)ctx;
+    for (size_t i = 0; i < n; i++) {
+        char c = (char)d[i];
+        if (c == '\n') {
+            if (f->nl_run >= 1) {
+                f->nl_run++;
+                if (f->nl_run == 2) {   /* blank line = record separator */
+                    if (!f->overflow && f->len > 0) parse_record(f->buf, f->len);
+                    f->len = 0;
+                    f->overflow = 0;
+                }
+                /* runs of 3+ newlines stay in separator state */
+            } else {
+                f->nl_run = 1;
+                feed_append(f, c);   /* line terminator inside a record */
+            }
+        } else {
+            f->nl_run = 0;
+            feed_append(f, c);
+        }
+    }
+    return 0;
+}
+
+/* Flush the trailing paragraph that has no blank line after it. */
+static void index_feed_finish(index_feed_t* f) {
+    if (!f->overflow && f->len > 0) parse_record(f->buf, f->len);
+    if (f->buf) kfree(f->buf);
+    f->buf = NULL;
+    f->len = f->cap = 0;
+    f->nl_run = 0;
+    f->overflow = 0;
+}
+
 /* Reload /var/lib/kilget/Packages into the record array. */
 static int index_load(void) {
     nrecs = 0;
@@ -177,18 +313,7 @@ static int index_load(void) {
         size_t plen = next ? (size_t)(next - p) : (size_t)(end - p);
         if (plen == 0) break;
 
-        pkg_rec_t* r = &recs[nrecs];
-        memset(r, 0, sizeof(*r));
-        index_field(p, plen, "Package", r->package, sizeof(r->package));
-        index_field(p, plen, "Version", r->version, sizeof(r->version));
-        index_field(p, plen, "Filename", r->filename, sizeof(r->filename));
-        index_field(p, plen, "SHA256", r->sha, sizeof(r->sha));
-        index_field(p, plen, "Depends", r->depends, sizeof(r->depends));
-        char sizebuf[16];
-        index_field(p, plen, "Size", sizebuf, sizeof(sizebuf));
-        r->size = (uint32_t)strtoul(sizebuf, NULL, 10);
-
-        if (r->package[0] && r->filename[0]) nrecs++;
+        parse_record(p, plen);
 
         p = next ? next + 2 : end;
     }
@@ -385,11 +510,157 @@ static int fetch_and_install(const repo_src_t* src, int idx) {
 
 /* ---------- public API ---------- */
 
+/* Persist the parsed record table as a compact Packages-format index.
+ * The raw dists index is far too large for the FAT ramdisk (jammy main
+ * is ~48 MB plain), but we only ever need the extracted fields, and the
+ * regenerated text (~0.9 MB) parses back through index_load unchanged. */
+static int index_store_compact(void) {
+    size_t cap = 768 * (size_t)nrecs + 64;
+    char* buf = (char*)kmalloc(cap);
+    if (buf == NULL) {
+        klog("[kilget] compact index alloc failed\n");
+        return -1;
+    }
+    size_t off = 0;
+    char tmp[768];
+    for (int i = 0; i < nrecs; i++) {
+        pkg_rec_t* r = &recs[i];
+        ksprintf(tmp, sizeof(tmp),
+                 "Package: %s\nVersion: %s\nFilename: %s\nSize: %u\n",
+                 r->package, r->version, r->filename, r->size);
+        size_t tlen = strlen(tmp);
+        if (r->sha[0]) {
+            ksprintf(tmp + tlen, sizeof(tmp) - tlen, "SHA256: %s\n", r->sha);
+            tlen += strlen(tmp + tlen);
+        }
+        if (r->depends[0]) {
+            ksprintf(tmp + tlen, sizeof(tmp) - tlen, "Depends: %s\n", r->depends);
+            tlen += strlen(tmp + tlen);
+        }
+        ksprintf(tmp + tlen, sizeof(tmp) - tlen, "\n");
+        tlen += strlen(tmp + tlen);
+        if (off + tlen > cap) break;
+        memcpy(buf + off, tmp, tlen);
+        off += tlen;
+    }
+    int rc = fs_write_all(KILGET_INDEX, (const uint8_t*)buf, off);
+    kfree(buf);
+    if (rc != 0) klog("[kilget] compact index store failed\n");
+    return rc;
+}
+
+/* Fetch one component's Packages index for a dists-layout repo and
+ * stream-parse it straight into the record table. Tries Packages.gz
+ * first (kernel-side streaming gunzip), falls back to plain Packages
+ * for servers without compression. Returns 0 on success. */
+static int fetch_component_index(const repo_src_t* src, const char* comp) {
+    char gzpath[256];
+    if (src->base[0])
+        ksprintf(gzpath, sizeof(gzpath), "/%s/dists/%s/%s/binary-amd64/Packages.gz",
+                 src->base, src->suite, comp);
+    else
+        ksprintf(gzpath, sizeof(gzpath), "/dists/%s/%s/binary-amd64/Packages.gz",
+                 src->suite, comp);
+
+    uint8_t* body = NULL;
+    size_t blen = 0;
+    int is_gz = 0;
+    if (http_download(&g_netif, src->host, src->port, gzpath, &body, &blen) != 0) {
+        /* plain fallback: same path minus the .gz suffix */
+        char plain[256];
+        strncpy(plain, gzpath, sizeof(plain) - 1);
+        plain[sizeof(plain) - 1] = '\0';
+        size_t plen_ = strlen(plain);
+        if (plen_ > 3 && strcmp(plain + plen_ - 3, ".gz") == 0) plain[plen_ - 3] = '\0';
+        if (http_download(&g_netif, src->host, src->port, plain, &body, &blen) != 0) {
+            TERM_OUT("kilget: component '");
+            TERM_OUT(comp);
+            TERM_OUT("' has no index (tried .gz and plain), skipped\n");
+            klog("[kilget] component index fetch failed: ");
+            klog(comp);
+            klog("\n");
+            return -1;
+        }
+    } else {
+        is_gz = 1;
+    }
+
+    index_feed_t f;
+    memset(&f, 0, sizeof(f));
+    int rc = 0;
+    if (is_gz) {
+        size_t out_len = 0;
+        if (gzip_inflate_cb(body, blen, index_feed, &f, &out_len) != 0) {
+            TERM_OUT("kilget: gunzip failed for ");
+            TERM_OUT(comp);
+            TERM_OUT("\n");
+            klog("[kilget] bad gzip index: ");
+            klog(comp);
+            klog("\n");
+            rc = -1;
+        }
+    } else {
+        if (index_feed(&f, body, blen) != 0) rc = -1;
+    }
+    index_feed_finish(&f);
+    kfree(body);
+    return rc;
+}
+
 int kilget_update(void) {
     repo_src_t src;
     if (parse_sources(&src) != 0) return -1;
 
     char path[256];
+    if (src.suite[0]) {
+        /* dists layout: stream-parse dists/<suite>/<comp>/binary-amd64/
+         * Packages.gz for every component into the record table, then
+         * persist a compact regenerated index */
+        nrecs = 0;
+        int ok = 0;
+        for (int c = 0; c < src.ncomps; c++)
+            if (fetch_component_index(&src, src.comps[c]) == 0)
+                ok++;
+        if (ok == 0 || nrecs == 0) {
+            TERM_OUT("kilget: update failed - no component index available\n");
+            klog("[kilget] index download failed (dists)\n");
+            return -1;
+        }
+        TERM_OUT("kilget: update from http://");
+        TERM_OUT(src.host);
+        TERM_OUT(":");
+        char pb[8];
+        itoa(src.port, pb, 10, sizeof(pb));
+        TERM_OUT(pb);
+        TERM_OUT(src.base[0] ? src.base : "/");
+        TERM_OUT(" ");
+        TERM_OUT(src.suite);
+        TERM_OUT(" (");
+        char cb[8];
+        itoa(ok, cb, 10, sizeof(cb));
+        TERM_OUT(cb);
+        TERM_OUT(" components)\n");
+
+        if (index_store_compact() != 0) {
+            TERM_OUT("kilget: failed to store index\n");
+            return -1;
+        }
+        TERM_OUT("kilget: index updated (");
+        char nb[12];
+        itoa(nrecs, nb, 10, sizeof(nb));
+        TERM_OUT(nb);
+        TERM_OUT(" packages, ");
+        TERM_OUT(cb);
+        TERM_OUT(" components)\n");
+        klog("[kilget] index updated (");
+        klog(nb);
+        klog(" packages, dists ");
+        klog(src.suite);
+        klog(")\n");
+        return 0;
+    }
+
+    /* flat layout: <base>/Packages */
     if (src.base[0])
         ksprintf(path, sizeof(path), "/%s/Packages", src.base);
     else
@@ -411,18 +682,32 @@ int kilget_update(void) {
         klog("[kilget] index download failed\n");
         return -1;
     }
-    if (fs_write_all(KILGET_INDEX, body, blen) != 0) {
-        kfree(body);
+    nrecs = 0;
+    index_feed_t f;
+    memset(&f, 0, sizeof(f));
+    size_t isz = blen;
+    if (blen > 2 && body[0] == 0x1F && body[1] == 0x8B) {
+        if (gzip_inflate_cb(body, blen, index_feed, &f, &isz) != 0) {
+            kfree(body);
+            index_feed_finish(&f);
+            TERM_OUT("kilget: gunzip failed\n");
+            return -1;
+        }
+    } else {
+        index_feed(&f, body, blen);
+    }
+    index_feed_finish(&f);
+    kfree(body);
+    if (nrecs == 0 || index_store_compact() != 0) {
         TERM_OUT("kilget: failed to store index\n");
         return -1;
     }
-    kfree(body);
     TERM_OUT("kilget: index updated\n");
     klog("[kilget] index updated (");
     char nb[12];
-    itoa((int)blen, nb, 10, sizeof(nb));
+    itoa(nrecs, nb, 10, sizeof(nb));
     klog(nb);
-    klog(" bytes)\n");
+    klog(" packages)\n");
     return 0;
 }
 
@@ -442,7 +727,9 @@ int kilget_install(const char* package) {
         return -1;
     }
 
-    plan_t plan;
+    /* plan_t with KILGET_MAX_PKGS=4096 is ~20 KB - far beyond the 16 KB
+     * kernel stack, so it lives in static storage (shell context only). */
+    static plan_t plan;
     memset(&plan, 0, sizeof(plan));
     plan_visit(&plan, idx, 0);
     if (plan.failed || plan.norder == 0) {

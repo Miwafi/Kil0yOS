@@ -16,6 +16,7 @@
 
 #define OPT_SUBNET_MASK  1
 #define OPT_ROUTER       3
+#define OPT_DNS          6
 #define OPT_MSG_TYPE     53
 #define OPT_REQ_IP       50
 #define OPT_SERVER_ID    54
@@ -121,7 +122,7 @@ static int dhcp_wait(netif_t* iface, udp_socket_t* sock, uint8_t expect_type,
 
             /* walk options */
             uint8_t msg = 0, over = 0;
-            uint32_t opt_subnet = 0, opt_router = 0, opt_server = 0;
+            uint32_t opt_subnet = 0, opt_router = 0, opt_server = 0, opt_dns = 0;
             const uint8_t* o = d->options;
             const uint8_t* end = buf + len;
             /* option overload (52) handling: only file/sname skipped for simplicity */
@@ -135,6 +136,7 @@ static int dhcp_wait(netif_t* iface, udp_socket_t* sock, uint8_t expect_type,
                 if (code == OPT_SUBNET_MASK && olen == 4)  memcpy(&opt_subnet, o, 4);
                 if (code == OPT_ROUTER && olen >= 4)       memcpy(&opt_router, o, 4);
                 if (code == OPT_SERVER_ID && olen == 4)    memcpy(&opt_server, o, 4);
+                if (code == OPT_DNS && olen >= 4)          memcpy(&opt_dns, o, 4);
                 if (code == 52 && olen >= 1)               over = o[0];
                 o += olen;
             }
@@ -147,6 +149,8 @@ static int dhcp_wait(netif_t* iface, udp_socket_t* sock, uint8_t expect_type,
             if (opt_subnet) { opt_subnet = net_ntohl(opt_subnet); memcpy(subnet, &opt_subnet, 4); }
             if (opt_router) { opt_router = net_ntohl(opt_router); memcpy(router, &opt_router, 4); }
             if (opt_server) { opt_server = net_ntohl(opt_server); memcpy(server_id, &opt_server, 4); }
+            /* DNS server (option 6): first server only, host order */
+            if (opt_dns && iface) iface->dns = net_ntohl(opt_dns);
             found = (int)len;
             break;
         }

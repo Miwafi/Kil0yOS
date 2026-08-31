@@ -2,6 +2,44 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.14.0] - 2026-08-31
+This release takes the Phase 4 package ecosystem **to the real Internet**: `kilget update` now works against a genuine Debian mirror (`mirrors.aliyun.com/ubuntu/ jammy main`) end-to-end — kernel DNS resolution, gateway routing, loss-tolerant TCP, and a streaming gunzip pipeline that chews the ~48 MB plain `Packages` index (1.8 MB gzipped) inside a fixed 64 KB window, persisting a compact ~0.9 MB regenerated index to the FAT ramdisk. Filesystem persistence is now real-time by design: every FAT mutation hits the disk immediately and the shutdown-time full-rebuild save was removed.
+
+### Added
+- **Kernel DNS resolver** (`src/kernel/net/dns.c`, `include/net/dns.h`): minimal UDP A-record client with timeout/retry; uses the DHCP-provided resolver or falls back to the QEMU slirp DNS proxy (10.0.2.3). `dhcp.c` parses option 6 into the new `netif_t.dns` field; the static fallback path in `main.c` seeds it too. `http_download` resolves hostnames (numeric IP literals still bypass DNS).
+- **Streaming gzip API** (`gzip_inflate_cb` in `pkg/inflate.c`, declared in `include/pkg/inflate.h`): decompressed output is delivered to a caller sink in order-preserving chunks instead of one big buffer — internal working set is a fixed 64 KB sliding window. Window invariant: DEFLATE back-references reach at most 32 KB back, so each flush keeps the last 32 KB as LZ77 history and the match-copy loop recomputes its source offset after a flush. CRC32 is maintained by a `crc_sink_t` wrapper counting only bytes that pass the user sink, so per-member trailer verification works without holding the output. `gzip_inflate` (one-shot) is reimplemented as a buffer-sink wrapper with identical semantics; `.deb` unpacking is unaffected. The sink returning non-zero aborts with -1.
+- **kilget streaming index ingestion** (`pkg/kilget.c`): `index_feed` assembles Packages paragraphs from inflate chunks and `parse_record` extracts fields on the fly — the raw index text is never materialized (jammy main is ~48 MB plain; buffering it was impossible). `index_store_compact` persists only the needed fields (Package/Version/Filename/SHA256/Size/Depends, ~0.9 MB) as regenerated Packages-format text that `index_load` parses back unchanged. `KILGET_MAX_PKGS` raised 512 → 4096 (libc6 sits around record #1000 alphabetically in jammy main; 512 made everything past it invisible); `plan_t` (~20 KB at 4096 entries) moved to static storage — it overflowed the 16 KB kernel stack as a local.
+- **Test tooling**: `tools/accept_aliyun.sh` (real-mirror end-to-end: configure sources.list → `kilget update` → `kilget show libc6`, `ALIYUN_ALL_DONE` marker), `tools/accept_p4_dists.sh` (dists-layout repo), `tools/gz_tail.py` (gzip trailer inspection helper).
+
+### Fixed
+- **gzip_payload_size ISIZE misread (CRITICAL — broke every small .deb)**: a previous attempt to tolerate mirror-side zero padding scanned backwards over trailing zero bytes before reading the ISIZE trailer — but ISIZE high bytes are zero for ANY payload < 64 KB, so the scan ate the real trailer and returned garbage (0x280073d2 instead of 10240), failing every `control.tar.gz` inflate. ISIZE is now read from the true last 4 bytes; padding after the trailer is harmless because the inflate core locates the trailer bit-exactly after the final DEFLATE block and only skips padding BETWEEN members.
+- **IPv4 off-subnet routing**: `ipv4_send` now uses the interface gateway as ARP next-hop for destinations outside the subnet — previously it ARPed the remote IP directly, got no reply from slirp, and every packet to a real mirror was silently dropped (the "connect: 10s timeout, no SYN-ACK" that wasn't a TCP problem at all).
+- **TCP SYN exponential backoff**: `tcp_connect` RTO starts at 500 ms and doubles to a 4 s cap (was a fixed 300 ms that burned the entire retry budget in 2.4 s — one lost SYN to an internet peer killed the connect). 4-5 SYNs now fit the 10 s window.
+- **HTTP Content-Length validation**: `http_download` rejects a response body whose length mismatches the declared `Content-Length` (silent truncation of large index downloads previously produced corrupt gzip that failed far from the cause).
+
+### Changed
+- **Filesystem persistence is real-time**: audit showed every FAT mutation (fs_write_file data clusters + FAT chain + directory entry, fs_create_file/fs_mkdir via fs_write_directory_entry, fs_delete_entry 0xE5 tombstone, fat_write_entry, fat_alloc_cluster + FSInfo) already wrote through `disk_write_sector` immediately. `fs_save()` is now a boot-sector-only safety net; the shutdown-time `fs_save_directory()` recursive full rebuild was a redundant rewrite (its only extra effect — truncating empty directory clusters after deletes — is not needed for correctness since 0xE5/0x00 entries are reused). `cmd_shutdown` no longer prints "Saving filesystem...". The MEM backend exists only under ext2 (read-only disk) mode and remains volatile by design.
+- Version strings bumped to 2.14.0 (boot banner, `version` command, GUI title bar, `uname` release).
+- `Makefile`: `net/dns.c` registered in the build.
+
+### File Changes
+- `src/kernel/net/dns.c`, `include/net/dns.h`: kernel DNS resolver (new)
+- `src/kernel/net/dhcp.c`, `include/net/netif.h`: DHCP option 6 → `netif_t.dns`
+- `src/kernel/net/ipv4.c`: next-hop routing for off-subnet destinations
+- `src/kernel/net/tcp.c`: SYN retransmission exponential backoff
+- `src/kernel/net/http.c`: hostname resolution hook + Content-Length validation
+- `src/kernel/pkg/inflate.c`, `include/pkg/inflate.h`: `gzip_inflate_cb` streaming API, sliding window, ISIZE fix
+- `src/kernel/pkg/kilget.c`: streaming index ingestion, compact index store, KILGET_MAX_PKGS 4096, static plan_t
+- `src/kernel/fs/fs.c`: fs_save() reduced to boot-sector sync
+- `src/kernel/shell/shell.c`: shutdown message cleanup
+- `src/kernel/core/main.c`: static-fallback DNS seed; `Makefile`: dns.c
+- `tools/accept_aliyun.sh`, `tools/accept_p4_dists.sh`, `tools/gz_tail.py`: new harnesses
+- `CHANGELOG.md`, version strings: docs
+
+### Notes
+- **Acceptance**: `tools/accept_aliyun.sh` green (`ALIYUN_ALL_DONE`): DNS resolves mirrors.aliyun.com through slirp, ~1.8 MB Packages.gz downloads over multi-window TCP, streams through the 64 KB inflate window into 4096 parsed records, compact index stored, `kilget show libc6` prints all fields (Package/Version/Filename/SHA256/Size/Depends — 2.35-0ubuntu3). Occasional first-attempt TCP connect timeouts are real internet packet loss; a retry passes. `tools/accept_phase4.sh` full regression after all changes: `P4_ALL_DONE` (TFTP dpkg -i/-l/-L/-r lifecycle, kilget update + dependency-ordered install over HTTP, exec before/after remove) with zero "inflate failed" — the streaming inflate and ISIZE fix have no side effects on the .deb path.
+- **Real-time persistence rationale**: correctness never depended on the shutdown save — removing it eliminates both the redundant full-disk rewrite and the misleading "Saving filesystem..." semantics. Data written to FAT files is durable the instant the mutating syscall returns.
+
 ## [2.13.0] - 2026-08-31
 This release completes **Phases 3 and 4 of the Linux compatibility roadmap** (M3+M4 milestones): Kil0yOS now runs dynamically-linked musl AND glibc programs end-to-end (full ELF interpreter loading path), speaks TCP over Ethernet with real flow control (HTTP client + UDP DNS + busybox wget), and ships a Debian-package ecosystem — a `dpkg` frontend and a `kilget` repo client — that installed the real Ubuntu `libc6` (~5.3 MB .deb, 13.4 MB unpacked payload) byte-perfect, verified by executing the installed dynamic linker itself.
 

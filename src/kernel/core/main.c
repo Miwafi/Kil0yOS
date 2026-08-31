@@ -94,7 +94,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.13.0\n");
+    klog("Kil0yOS version 2.14.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -192,6 +192,7 @@ void kernel_main(uint64_t mb_info_phys) {
             g_netif.ip      = 0x0A00020F; /* 10.0.2.15 */
             g_netif.netmask = 0xFFFFFF00; /* 255.255.255.0 */
             g_netif.gateway = 0x0A000202; /* 10.0.2.2 */
+            g_netif.dns     = 0x0A000203; /* 10.0.2.3 (slirp DNS proxy) */
             klog("net: DHCP failed, using static fallback\n");
         }
         klog("net: configured\n");

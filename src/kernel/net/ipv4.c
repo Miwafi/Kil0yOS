@@ -96,8 +96,19 @@ int ipv4_transmit(netif_t* iface, uint32_t dst_ip, uint8_t proto,
     if (dst_ip == 0xFFFFFFFF) {
         /* IP broadcast - no ARP lookup */
         memset(dst_mac, 0xFF, 6);
-    } else if (arp_resolve(iface, dst_ip, dst_mac) < 0) {
-        return -1;
+    } else {
+        /* Next-hop routing: on-link destinations are ARPed directly;
+         * anything outside the local subnet goes through the default
+         * gateway (real mirrors live far beyond 10.0.2.0/24, and slirp
+         * does not answer ARPs for arbitrary internet IPs). */
+        uint32_t next_hop = dst_ip;
+        if (iface->ip != 0 && iface->netmask != 0 &&
+            (dst_ip & iface->netmask) != (iface->ip & iface->netmask)) {
+            next_hop = iface->gateway ? iface->gateway : dst_ip;
+        }
+        if (arp_resolve(iface, next_hop, dst_mac) < 0) {
+            return -1;
+        }
     }
 
     return eth_transmit(iface, dst_mac, ETH_TYPE_IP, packet, total_len);

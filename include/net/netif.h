@@ -24,6 +24,7 @@ typedef struct netif {
     uint32_t ip;
     uint32_t netmask;
     uint32_t gateway;
+    uint32_t dns;       /* resolver address (host order); 0 = unset */
     int      flags;
     int      (*send)(const uint8_t* data, uint16_t len);
     void     (*poll)(void);
