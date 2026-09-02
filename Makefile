@@ -52,6 +52,7 @@ FS_SRCS = $(SRCDIR)/kernel/fs/fs.c \
 PKG_SRCS = $(SRCDIR)/kernel/pkg/inflate.c \
            $(SRCDIR)/kernel/pkg/tar.c \
            $(SRCDIR)/kernel/pkg/sha256.c \
+           $(SRCDIR)/kernel/pkg/zstd.c \
            $(SRCDIR)/kernel/pkg/deb.c \
            $(SRCDIR)/kernel/pkg/dpkg.c \
            $(SRCDIR)/kernel/pkg/kilget.c

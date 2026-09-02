@@ -16,11 +16,13 @@
 #define KILGET_INDEX   "/var/lib/kilget/Packages"
 #define KILGET_SOURCES "/etc/kilget/sources.list"
 #define KILGET_CACHE   "/var/cache/kilget"
-/* Real dists indexes (e.g. jammy main) carry ~2600 paragraphs; the
- * record table must hold them all or alphabetically-late packages
- * (libc6 sits around #1000) become invisible. 4096 entries cost
- * ~2.6 MB of static data - fine next to a 500 MB heap. */
-#define KILGET_MAX_PKGS 4096
+/* Real dists indexes (e.g. jammy main) carry ~53000 paragraphs; the
+ * record table must hold them ALL or alphabetically-late packages
+ * silently vanish - at 4096 entries the table cut off right between
+ * libx11-6 (~#4000) and libxcb1, breaking "apt-get install libx11-dev"
+ * with "depends on 'libxcb1' which is not in the index". 65536 entries
+ * cost ~59 MB of static bss - fine next to a 500 MB heap. */
+#define KILGET_MAX_PKGS 65536
 
 #define TERM_OUT(s) term_puts(s)
 
@@ -30,7 +32,7 @@ typedef struct {
     char filename[192];
     char sha[65];
     uint32_t size;
-    char depends[256];
+    char depends[512];
 } pkg_rec_t;
 
 static pkg_rec_t recs[KILGET_MAX_PKGS];
@@ -346,7 +348,7 @@ typedef struct {
  * (observed: 'depends on status' - a token scan across buffers). */
 static int plan_dep_names(const char* depends, char out[][64], int max) {
     if (!depends || !depends[0]) return 0;
-    char deps[256];
+    char deps[512];
     strncpy(deps, depends, sizeof(deps) - 1);
     deps[sizeof(deps) - 1] = '\0';
     int n = 0;
@@ -727,8 +729,9 @@ int kilget_install(const char* package) {
         return -1;
     }
 
-    /* plan_t with KILGET_MAX_PKGS=4096 is ~20 KB - far beyond the 16 KB
-     * kernel stack, so it lives in static storage (shell context only). */
+    /* plan_t with KILGET_MAX_PKGS=65536 is ~320 KB - far beyond the
+     * 16 KB kernel stack, so it lives in static storage (shell context
+     * only). */
     static plan_t plan;
     memset(&plan, 0, sizeof(plan));
     plan_visit(&plan, idx, 0);

@@ -1,5 +1,6 @@
 #include "net/udp.h"
 #include "net/ipv4.h"
+#include "net/netif.h"
 #include "core/interrupts.h"
 #include "timer/pit.h"
 #include "lib/string.h"
@@ -134,6 +135,12 @@ int udp_recvfrom(udp_socket_t* sock, uint8_t* buf, uint16_t maxlen,
 
     uint32_t waited = 0;
     while (waited < timeout_ms) {
+        /* Drain the NIC RX ring ourselves: reply delivery must not rely
+         * solely on the IRQ - in polling mode (unknown IRQ line) or when
+         * the interrupt is lost, the wait loop is the only path that
+         * moves frames from the RX ring into socket buffers (same
+         * pattern as arp/dhcp/tcp wait loops). */
+        netif_poll();
         int enabled = irq_save();
         disable_interrupts();
         if (sock->rx_count > 0) {

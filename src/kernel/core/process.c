@@ -910,6 +910,32 @@ void user_programs_install(void) {
         }
     }
 
+    /* /etc/kilget/sources.list: default repo baked in so 'kilget update'
+     * works out of the box - Aliyun's Ubuntu jammy mirror over slirp. */
+    if (fs_resolve_path("/etc/kilget") == NULL) {
+        fs_entry_t* d = fs_resolve_path("/etc");
+        if (d != NULL && d->type == FS_TYPE_DIRECTORY) {
+            fs_entry_t* prev2 = fs_current();
+            fs_set_current(d);
+            fs_create_dir("kilget");
+            fs_set_current(prev2);
+        }
+    }
+    if (fs_resolve_path("/etc/kilget/sources.list") == NULL) {
+        static const char sources_list[] =
+            "deb http://mirrors.aliyun.com/ubuntu/ jammy main\n";
+        fs_entry_t* d = fs_resolve_path("/etc/kilget");
+        if (d != NULL && d->type == FS_TYPE_DIRECTORY) {
+            fs_entry_t* prev2 = fs_current();
+            fs_set_current(d);
+            fs_entry_t* f = fs_create_file("sources.list");
+            if (f != NULL)
+                fs_write_file(f, (const uint8_t*)sources_list,
+                              sizeof(sources_list) - 1);
+            fs_set_current(prev2);
+        }
+    }
+
     verify_hello_lnx();
 }
 

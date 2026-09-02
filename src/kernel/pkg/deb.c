@@ -3,6 +3,7 @@
 #include "pkg/deb.h"
 #include "pkg/inflate.h"
 #include "pkg/tar.h"
+#include "pkg/zstd.h"
 #include "lib/string.h"
 #include "mm/memory.h"
 #include "drivers/vga.h"
@@ -72,6 +73,14 @@ static int gunzip_to_heap(const uint8_t* gz, size_t gz_len,
     }
     *out = buf;
     *out_len = got;
+    return 0;
+}
+
+/* Decompress a zstd member into a heap buffer (whole-stream, may
+ * reallocate internally; caller kfrees *out). */
+static int zstd_to_heap(const uint8_t* z, size_t z_len,
+                        uint8_t** out, size_t* out_len) {
+    if (zstd_decompress_heap(z, z_len, out, out_len) != 0) return -1;
     return 0;
 }
 
@@ -149,6 +158,22 @@ int deb_unpack(const uint8_t* deb, size_t len, deb_result_t* out) {
                     klog("[deb] control file missing\n");
                 }
                 kfree(tar);
+            } else if (strcmp(ext, ".zst") == 0) {
+                uint8_t* tar = NULL;
+                size_t tar_len = 0;
+                if (zstd_to_heap(m.data, m.size, &tar, &tar_len) != 0) {
+                    klog("[deb] control.tar.zst decompress failed\n");
+                    return -1;
+                }
+                const uint8_t* body;
+                size_t blen;
+                if (tar_find_file(tar, tar_len, "control", &body, &blen) == 0) {
+                    deb_parse_control((const char*)body, blen, &out->control);
+                    have_control = 1;
+                } else {
+                    klog("[deb] control file missing\n");
+                }
+                kfree(tar);
             } else {
                 klog("[deb] unsupported control.tar compression: ");
                 klog(m.name);
@@ -164,6 +189,22 @@ int deb_unpack(const uint8_t* deb, size_t len, deb_result_t* out) {
                 size_t tar_len = 0;
                 if (gunzip_to_heap(m.data, m.size, &tar, &tar_len) != 0) {
                     klog("[deb] data.tar.gz inflate failed\n");
+                    return -1;
+                }
+                filelist_ctx_t fc = { out->installed_files, 0 };
+                int n = tar_extract(tar, tar_len, filelist_cb, &fc);
+                kfree(tar);
+                if (n < 0) {
+                    klog("[deb] data.tar extract failed\n");
+                    return -1;
+                }
+                out->nfiles = fc.nfiles;
+                have_data = 1;
+            } else if (strcmp(ext, ".zst") == 0) {
+                uint8_t* tar = NULL;
+                size_t tar_len = 0;
+                if (zstd_to_heap(m.data, m.size, &tar, &tar_len) != 0) {
+                    klog("[deb] data.tar.zst decompress failed\n");
                     return -1;
                 }
                 filelist_ctx_t fc = { out->installed_files, 0 };

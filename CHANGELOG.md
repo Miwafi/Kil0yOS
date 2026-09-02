@@ -2,6 +2,40 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.15.0] - 2026-09-02
+This release gives `dpkg` **native zstd decompression** — modern Debian/Ubuntu jammy packages ship `data.tar.zst`, which previously made every real-mirror install stop at the first unpack — and bakes the Aliyun mirror `sources.list` into fresh boots so `kilget update` works out of the box with zero manual setup. Two latent driver bugs (UDP reply polling, PIT timer mode) that skewed the whole timeout stack were fixed on the way.
+
+### Added
+- **zstd decoder** (`src/kernel/pkg/zstd.c`, `include/pkg/zstd.h`): self-contained RFC 8878 subset — regular + skippable frames, multi-frame streams, Raw/RLE/Compressed blocks, Raw/RLE/Huffman(1 or 4 streams)/Treeless literals, Predefined/RLE/FSE/Repeat sequence tables, repeat offsets, cross-block entropy reuse, optional XXH64 checksum. Entropy coding follows the zstd 1.5.5 reference bit-for-bit (64-bit reverse bitreader with STREAM_ACCUMULATOR guard, FSE dual-state interleaved decode with the spread rule, Huffman X1 tables with weight-0 symbol handling). Dictionaries and legacy frames are rejected (dpkg never emits them). `ZSTD_KTEST` builds the same source against a malloc/printf stub layer for host testing; kernel builds compile all debug output out.
+- **dpkg zstd members** (`pkg/deb.c`): `control.tar.zst` and `data.tar.zst` decompress via `zstd_decompress_heap` and feed the existing tar pipeline — real Ubuntu jammy `.deb`s now unpack without repacking.
+- **Baked-in default repo** (`core/process.c`): `user_programs_install` creates `/etc/kilget/sources.list` with `deb http://mirrors.aliyun.com/ubuntu/ jammy main` when absent (same pattern as resolv.conf/hosts) — fresh boots run `kilget update` with no manual setup; a user-written file persists and overrides.
+- **Test tooling**: `tools/test_zstd_host.py` + `test_zstd_host.c` (13-case byte-exact harness against the reference `zstandard` module: empty/tiny/RLE/random/level-1/level-19/no-checksum/no-content-size/multi-block/skippable+mixed/real .deb), `tools/fetch_gcc12base.py` + `cmp_gcc12.py` (byte-compare the previously-failing gcc-12-base control/data tarballs), `tools/accept_zst.sh` (QEMU end-to-end: kilget install libc6 dependency chain of zstd .debs + TFTP hello.deb → `ZST_ALL_DONE`), plus debug helpers (`zstd_dbg.sh`, `parse_zst.py`, `sim_fse.py`, `sim_seq.py`, `brute_seq.py`, `dump_zst_case.py`, `zstd_dbg_deb.py`, `check_gcc12.sh`). Also `tools/verify_dns_e1000.sh`/`verify_dns_rtl.sh` (NIC-paired DNS/TCP regression), `verify_full_index.sh`/`verify_sources_list.sh`, `analyze_pcap.py`.
+
+### Fixed
+- **zstd literals section layout (the gcc-12-base failure)**: `litCSize` covers the Huffman tree description PLUS the compressed stream(s); `huf_read_dtable` returns the tree bytes consumed and `decode_literals` must advance past them before `huf_decompress` — the 4-stream jump table sits at the start of the stream portion, and reading it from the section start produced "stream len overrun" on every stream whose weight table was FSE-compressed (>122 symbols, typical for large tarballs).
+- **fse_decompress return-value convention**: it returns consumed bytes (≥0) on success, so `huf_read_stats` must test `< 0` — the previous `!= 0` treated any non-empty FSE weight stream as failure (same bug class as the fs_write_file `== 0` check).
+- **UDP replies dropped in polling mode** (`net/udp.c`): `udp_recvfrom`'s wait loop now calls `netif_poll()` each iteration (same pattern as arp/dhcp/tcp) — reply delivery must not rely solely on the IRQ line, which is unknown for e1000 and lost under burst; this was the "[dns] resolve failed" that passed on rtl8139 but failed on e1000.
+- **PIT channel 0 in mode 2, not mode 3** (`timer/pit.c`): command byte 0x36 programmed square wave, where the counter decrements by 2 per cycle — `pit_delay_ms` elapsed in half the nominal time and `pit_uptime_us` interpolation ran 2× fast, skewing every RTO/timeout judgement (3×3 s DNS timeouts finishing in 4.5 s, TCP connect giving up after ~1 retransmit). Now 0x34 (rate generator).
+- **KILGET_MAX_PKGS 4096 → 65536**: jammy main binary-amd64 carries exactly 6090 paragraphs (host-verified), so the 4096-entry table cut the tail right between libx11-6 and libxcb1 — `kilget install libx11-dev` died with "depends on 'libxcb1' which is not in the index". `pkg_rec_t.depends` widened to 512 for long Depends lines; `plan_t` (~320 KB now) stays static to protect the 16 KB kernel stack.
+
+### Changed
+- `Makefile`: `pkg/zstd.c` registered in the build.
+- Version strings bumped to 2.15.0 (boot banner, `version`/`uname`, GUI title bar).
+
+### File Changes
+- `src/kernel/pkg/zstd.c`, `include/pkg/zstd.h`: zstd decoder (new)
+- `src/kernel/pkg/deb.c`: control/data `.zst` members
+- `src/kernel/core/process.c`: baked-in `/etc/kilget/sources.list`
+- `src/kernel/pkg/kilget.c`: KILGET_MAX_PKGS 65536, depends 512
+- `src/kernel/net/udp.c`: netif_poll in receive wait loop
+- `src/kernel/timer/pit.c`: PIT mode 2 command byte
+- `Makefile`, version strings: build + docs
+- `tools/*`: zstd host/acceptance/debug harnesses, DNS/PIC verify scripts, pcap summarizer
+
+### Notes
+- **Acceptance**: host suite 13/13 byte-exact; gcc-12-base `control.tar.zst` (10240 B) and `data.tar.zst` (81920 B) byte-identical to the reference decompressor. QEMU `tools/accept_zst.sh` against the real Aliyun mirror: gcc-12-base, libgcc-s1, libcrypt1 and hello (all zstd .debs) install through `kilget install libc6` / `dpkg -i`, and `/usr/bin/hello` prints "Hello, world!". Occasional `[tcp] connect: 10s timeout` after 2-3 successful internet downloads is mirror-side rate limiting / link flakiness, not a kernel regression — re-running gets further; the libc6 2.6 MB download itself remains best-effort.
+- **zstd scope**: decoder supports everything dpkg-deb can emit; dictionaries and legacy frames are rejected explicitly rather than mis-decoded.
+
 ## [2.14.0] - 2026-08-31
 This release takes the Phase 4 package ecosystem **to the real Internet**: `kilget update` now works against a genuine Debian mirror (`mirrors.aliyun.com/ubuntu/ jammy main`) end-to-end — kernel DNS resolution, gateway routing, loss-tolerant TCP, and a streaming gunzip pipeline that chews the ~48 MB plain `Packages` index (1.8 MB gzipped) inside a fixed 64 KB window, persisting a compact ~0.9 MB regenerated index to the FAT ramdisk. Filesystem persistence is now real-time by design: every FAT mutation hits the disk immediately and the shutdown-time full-rebuild save was removed.
 

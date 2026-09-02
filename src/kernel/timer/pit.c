@@ -118,8 +118,14 @@ void pit_init(uint32_t frequency) {
     pit_divisor = PIT_BASE_FREQ / frequency;
     if (pit_divisor == 0 || pit_divisor > 65535) pit_divisor = 1193;
 
-    // Channel 0, lobyte/hibyte, mode 2 (rate generator), 16-bit binary
-    outb(PIT_COMMAND, 0x36);
+    // Channel 0, lobyte/hibyte, mode 2 (rate generator), 16-bit binary.
+    // Mode 2, NOT mode 3 (0x36, square wave): in mode 3 the counter
+    // decrements by 2 per cycle, so the countdown register is consumed at
+    // 2x rate. pit_delay_ms and the poll-based uptime would then elapse in
+    // half the nominal time (3 x 3s DNS timeouts finishing in 4.5s), and
+    // the in-tick interpolation in pit_uptime_us runs 2x fast against the
+    // pit_ticks base - every RTO/timeout judgement was skewed.
+    outb(PIT_COMMAND, 0x34);
 
     // Send divisor (low byte then high byte)
     outb(PIT_CHANNEL0, pit_divisor & 0xFF);
