@@ -11,8 +11,10 @@ uint32_t strtoul(const char* str, char** endptr, int base);
 void itoa(int num, char* str, int base, int max_size);
 void utoa(uint32_t num, char* str, int base, int max_size);
 
-/* bounded snprintf subset: %s %d %u %x %c %%; NUL-terminates */
+/* bounded snprintf subset: %s %d %u %x %c %% (+ zero-pad width like
+ * %02x/%04x); NUL-terminates */
 void ksprintf(char* buf, size_t size, const char* fmt, ...);
+void kvsnprintf(char* buf, size_t size, const char* fmt, va_list ap);
 
 void srand(uint32_t seed);
 uint32_t rand();

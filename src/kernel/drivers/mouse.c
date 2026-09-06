@@ -89,8 +89,40 @@ static void mouse_controller_reset(void) {
     (void)ack;
 }
 
+/* Integrate one motion sample (shared by the PS/2 and USB HID paths).
+ * USB convention: positive dy = down = increasing y; the PS/2 handler
+ * negates dy before calling in. */
+void mouse_inject_delta(int dx, int dy, int buttons) {
+    mouse.x += dx;
+    mouse.y += dy;
+
+    if (mouse.x < 0) mouse.x = 0;
+    if (mouse.y < 0) mouse.y = 0;
+    /* keep cursor fully on-screen: guard in mouse_draw_cursor uses x+CURSOR_W > GFX_WIDTH */
+    if (mouse.x > GFX_WIDTH - CURSOR_W)  mouse.x = GFX_WIDTH - CURSOR_W;
+    if (mouse.y > GFX_HEIGHT - CURSOR_H) mouse.y = GFX_HEIGHT - CURSOR_H;
+
+    mouse.buttons = (uint8_t)(buttons & 0x07);
+    mouse.ready = 1;
+}
+
+static int ps2_enabled = 1;
+
+void mouse_set_ps2_enabled(int enabled) {
+    ps2_enabled = enabled;
+}
+
 void mouse_handler(interrupt_frame_t* frame) {
     (void)frame;
+
+    if (!ps2_enabled) {
+        /* USB mouse owns the pointer: drain any pending aux bytes */
+        while (inb(MOUSE_STATUS_PORT) & 0x01) {
+            (void)inb(MOUSE_DATA_PORT);
+        }
+        pic_send_eoi(MOUSE_IRQ);
+        return;
+    }
 
     uint8_t status = inb(MOUSE_STATUS_PORT);
     if ((status & 0x01) == 0) {
@@ -130,16 +162,8 @@ void mouse_handler(interrupt_frame_t* frame) {
             if (mouse_packet[0] & 0x10) dx -= 256;
             if (mouse_packet[0] & 0x20) dy -= 256;
 
-            mouse.x += dx;
-            mouse.y -= dy;
-
-            if (mouse.x < 0) mouse.x = 0;
-            if (mouse.y < 0) mouse.y = 0;
-            /* keep cursor fully on-screen: guard in mouse_draw_cursor uses x+CURSOR_W > GFX_WIDTH */
-            if (mouse.x > GFX_WIDTH - CURSOR_W)  mouse.x = GFX_WIDTH - CURSOR_W;
-            if (mouse.y > GFX_HEIGHT - CURSOR_H) mouse.y = GFX_HEIGHT - CURSOR_H;
-
-            mouse.buttons = mouse_packet[0] & 0x07;
+            /* PS/2: positive dy = up -> negate for the shared integrator */
+            mouse_inject_delta(dx, -dy, mouse_packet[0] & 0x07);
             mouse_cycle = 0;
             break;
     }

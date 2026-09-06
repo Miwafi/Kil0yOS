@@ -266,6 +266,7 @@ uint64_t irq_handler(interrupt_frame_t* frame) {
     if (irq_num == 0) {
         pit_ticks++;
         pic_send_eoi(0);
+        usb_tick();   /* UHCI report poll + root-hub hotplug (IF=0, gated) */
         return scheduler_tick((uint64_t)frame);
     }
 

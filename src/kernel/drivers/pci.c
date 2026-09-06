@@ -68,7 +68,11 @@ void pci_init() {
 
                 uint16_t device_id = pci_read_word(bus, device, function, PCI_DEVICE_ID_OFFSET);
                 uint8_t class_code = pci_read_byte(bus, device, function, PCI_CLASS_CODE_OFFSET);
-                uint8_t subclass_code = pci_read_byte(bus, device, function, PCI_CLASS_CODE_OFFSET + 1);
+                /* Subclass lives at 0x0A (one BELOW the base-class byte at
+                 * 0x0B): the old +1 read pulled the cache-line-size
+                 * register (always 0), so every device reported subclass 0
+                 * and pci_find_class() could never match. */
+                uint8_t subclass_code = pci_read_byte(bus, device, function, PCI_CLASS_CODE_OFFSET - 1);
                 uint32_t bar0 = pci_read_dword(bus, device, function, PCI_BAR0_OFFSET);
                 uint8_t irq = pci_read_byte(bus, device, function, PCI_INTERRUPT_LINE_OFFSET);
 

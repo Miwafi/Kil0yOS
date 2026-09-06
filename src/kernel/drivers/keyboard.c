@@ -37,6 +37,19 @@ static const char scancode_map_shift[] = {
     '1', '2', '3', '0', '.'
 };
 
+static void buf_push(char c) {
+    /* irq_save/restore (NOT disable/enable): this runs from the PS/2 IRQ,
+     * the UHCI IRQ and the IRQ0 tick - all of which must keep IF=0. */
+    int irqon = irq_save();
+    disable_interrupts();
+    if (buffer_count < BUFFER_SIZE) {
+        keyboard_buffer[buffer_head] = c;
+        buffer_head = (buffer_head + 1) % BUFFER_SIZE;
+        buffer_count++;
+    }
+    irq_restore(irqon);
+}
+
 static void process_scancode(uint8_t scancode) {
     if (scancode == 42 || scancode == 54) {
         shift_pressed = 1;
@@ -50,11 +63,11 @@ static void process_scancode(uint8_t scancode) {
         ctrl_pressed = 1;
         return;
     }
-    
+
     if (scancode >= sizeof(scancode_map)) {
         return;
     }
-    
+
     char c = scancode_map[scancode];
     if (c != 0) {
         if (ctrl_pressed && c >= 'a' && c <= 'z') {
@@ -69,90 +82,66 @@ static void process_scancode(uint8_t scancode) {
             char sc = scancode_map_shift[scancode];
             if (sc != 0) c = sc;
         }
-        
-        if (buffer_count < BUFFER_SIZE) {
-            disable_interrupts();
-            keyboard_buffer[buffer_head] = c;
-            buffer_head = (buffer_head + 1) % BUFFER_SIZE;
-            buffer_count++;
-            enable_interrupts();
-        }
+
+        buf_push(c);
     }
 }
 
+void keyboard_feed_scancode(uint8_t sc, int ext) {
+    if (ext) {
+        /* extended make/release block (0xE0-prefixed on PS/2; the USB HID
+         * driver feeds these directly with ext=1) */
+        if (sc & 0x80) return;             /* extended releases are unused */
+        if (sc == 0x53)      buf_push('\b');
+        else if (sc == 0x48) buf_push(0x80);
+        else if (sc == 0x50) buf_push(0x81);
+        else if (sc == 0x4B) buf_push(0x82);
+        else if (sc == 0x4D) buf_push(0x83);
+        return;
+    }
+    if (sc & 0x80) {
+        sc &= ~0x80;
+        if (sc == 42 || sc == 54) shift_pressed = 0;
+        if (sc == 29)             ctrl_pressed = 0;
+        return;
+    }
+    process_scancode(sc);
+}
+
+static int ps2_enabled = 1;
+
+void keyboard_set_ps2_enabled(int enabled) {
+    ps2_enabled = enabled;
+}
+
 void keyboard_handler(interrupt_frame_t* frame) {
+    (void)frame;
+    if (!ps2_enabled) {
+        /* USB keyboard owns the console: drain the 8042 output buffer and
+         * discard, but keep the IRQ serviced */
+        while (inb(KEYBOARD_STATUS_PORT) & 0x01) {
+            (void)inb(KEYBOARD_PORT);
+        }
+        pic_send_eoi(KEYBOARD_IRQ);
+        return;
+    }
+
     uint8_t scancode = inb(KEYBOARD_PORT);
-    
+
     if (scancode == 0xE0) {
         extended = 1;
         pic_send_eoi(KEYBOARD_IRQ);
         return;
     }
-    
-    if (scancode & 0x80) {
-        scancode &= ~0x80;
-        if (scancode == 42 || scancode == 54) {
-            shift_pressed = 0;
-        }
-        if (scancode == 29) {
-            ctrl_pressed = 0;
-        }
-        /* Only clear extended flag for extended key releases */
-        if (scancode == 0xE0) {
-            extended = 0;
-        }
-        pic_send_eoi(KEYBOARD_IRQ);
-        return;
-    }
-    
+
     if (extended) {
-        if (scancode == 0x53) {
-            if (buffer_count < BUFFER_SIZE) {
-                disable_interrupts();
-                keyboard_buffer[buffer_head] = '\b';
-                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
-                buffer_count++;
-                enable_interrupts();
-            }
-        } else if (scancode == 0x48) {
-            if (buffer_count < BUFFER_SIZE) {
-                disable_interrupts();
-                keyboard_buffer[buffer_head] = 0x80;
-                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
-                buffer_count++;
-                enable_interrupts();
-            }
-        } else if (scancode == 0x50) {
-            if (buffer_count < BUFFER_SIZE) {
-                disable_interrupts();
-                keyboard_buffer[buffer_head] = 0x81;
-                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
-                buffer_count++;
-                enable_interrupts();
-            }
-        } else if (scancode == 0x4B) {
-            if (buffer_count < BUFFER_SIZE) {
-                disable_interrupts();
-                keyboard_buffer[buffer_head] = 0x82;
-                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
-                buffer_count++;
-                enable_interrupts();
-            }
-        } else if (scancode == 0x4D) {
-            if (buffer_count < BUFFER_SIZE) {
-                disable_interrupts();
-                keyboard_buffer[buffer_head] = 0x83;
-                buffer_head = (buffer_head + 1) % BUFFER_SIZE;
-                buffer_count++;
-                enable_interrupts();
-            }
-        }
         extended = 0;
+        keyboard_feed_scancode(scancode, 1);
         pic_send_eoi(KEYBOARD_IRQ);
         return;
     }
-    
-    process_scancode(scancode);
+
+    keyboard_feed_scancode(scancode, 0);
     pic_send_eoi(KEYBOARD_IRQ);
 }
 

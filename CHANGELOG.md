@@ -2,6 +2,41 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.16.0] - 2026-09-06
+This release adds **USB plug-and-play**: a UHCI (USB 1.1) host controller driver, a USB core with a device-tree model, a class-09 hub driver (needed because QEMU 8.2 hot-add wraps every `device_add`-ed device in a virtual hub), and HID boot-protocol keyboard/mouse with hotplug and automatic PS/2 fallback. While a USB HID device is bound, its PS/2 counterpart is suppressed; unplug restores it — no user-visible switch needed.
+
+### Added
+- **UHCI host controller driver** (`src/kernel/usb/uhci.c`, `include/usb/usb.h`): PCI class 0x0C/03/00 detection, registers live in I/O space on **BAR4** (BAR0 is memory BAR — the initial BAR0 read found nothing); global + host controller reset with timeout, frame list + QH/TD pool from PMM pages (identity-mapped, hardware needs 16-byte alignment, kmalloc only guarantees 8). Schedule skeleton is fully static — `int_qh[0..3] -> ctrl_qh -> bulk_qh -> TERM`, so binding a device only swaps its slot QH's elink with one aligned 32-bit store. Control transfers chain SETUP (DATA0) -> n x DATA (DATA1 alternating) -> STATUS into `ctrl_qh` with a single atomic publish and poll to completion (NAK retry bounded); interrupt IN endpoints run as one TD per device polled from `usb_tick` at 100 Hz with `USBINTR=0` (IOC on a TD that completes every frame — NAKs included — would raise a ~1 kHz IRQ storm; the registered IRQ handler stays as a safety net only).
+- **USB core + hotplug** (`src/kernel/usb/usb.c`): device table as a **tree** (`parent` device slot + `hub_port`, root = USB_ROOT_PARENT), standard enumeration (GET_DESCRIPTOR(8) -> SET_ADDRESS -> GET_DESCRIPTOR(18) -> config chain walk -> SET_CONFIGURATION) executing with IF=0 in both boot mainline and IRQ0 tick context (`pit_delay_ms` is pure counter-polling, safe inside IRQ0). Root-hub ports are polled at ~1 s (UHCI has no port-change IRQ): connect -> reset -> enumerate; disconnect -> recursive unbind (a hub detach takes its downstream devices with it). Ports holding a device we cannot drive are marked "ignored" so the poll does not re-enumerate it every second; the mark clears when the port goes empty.
+- **Hub class driver** (in usb.c): devices with bDeviceClass 9 (or a class-09 interface) attach as hubs — GET_DESCRIPTOR(Hub) for the port count, then per-port GET_STATUS polling each tick; connect triggers SET_FEATURE(PORT_RESET) + wait + clear C_PORT_RESET/C_CONNECTION + child enumeration behind the hub (device address space is flat: transfers behind a full-speed hub use the device's own address, so nothing changes downstream). Required for QEMU 8.2, which auto-creates a virtual hub ("Device 0.2 Port 2, QEMU USB Hub") between the root port and every hot-added device.
+- **HID boot-protocol drivers** (`src/kernel/usb/hid.c`): keyboard (usage-ID -> set-1 scancode table incl. modifiers/extended keys, edge-diffed against the previous report and replayed through `keyboard_feed_scancode`) and mouse (boot 3-byte reports through `mouse_inject_delta`). `usb_hid_attach/detach` suppress the PS/2 counterpart while bound (`usb_ps2_suppressed` / `usb_ps2_resumed`) — first USB keyboard report prints `usb_kbd_ok`.
+- **Shell `usb` command** (`shell.c`): controller registers, root-port states, device tree with hub topology, HID stats (nak/report counters).
+- **IRQ0 hook** (`core/isr.c`): `usb_tick()` runs after `pit_ticks++` with IF=0 — all USB contexts (boot mainline, tick, UHCI IRQ) are serialised on the single CPU.
+
+### Fixed
+- **QEMU advances the QH elink on TD completion (the one-report-then-death bug)**: on `TD_RESULT_COMPLETE` QEMU writes `qh.el_link = td.link` back into guest memory — with a self-terminating interrupt TD that TERMINATEs the queue, so the re-armed TD was never fetched again and only the first report ever arrived (mouse "worked" only because acceptance moved it once before the queue died; NAK completions never touch the elink, masking the bug). `int_td_service` now restores `int_qh[slot]->elink = td_phys` on every re-arm (idempotent for the NAK case).
+- **Hub PORT_RESET feature selector**: SET/CLEAR_FEATURE wValue uses selector **4** for PORT_RESET while **20** is C_PORT_RESET (change-clear) — conflating them made QEMU STALL the reset and every hub-port enumeration died at `hub_reset`.
+- **PCI subclass byte read** (`drivers/pci.c`): subclass lives at 0x0A, one BELOW the base-class byte — the old `+1` read pulled the cache-line-size register (always 0) so `pci_find_class(0x0C, 0x03)` could never match.
+- **Keyboard/mouse driver refactor** (`drivers/keyboard.c`, `drivers/mouse.c`): added `keyboard_feed_scancode(sc, ext)` + `keyboard_set_ps2_enabled` and `mouse_inject_delta` + `mouse_set_ps2_enabled` so the PS/2 IRQ path and the USB HID path feed the same line discipline; PS/2 IRQs are drained-and-discarded while suppressed.
+
+### Changed
+- `Makefile`: `usb/usb.c`, `usb/uhci.c`, `usb/hid.c` registered in the build.
+- Version strings bumped to 2.16.0 (boot banner, `version`, `uname`, GUI title bar).
+
+### File Changes
+- `src/kernel/usb/usb.c`, `uhci.c`, `hid.c`, `include/usb/usb.h`: UHCI HCD + USB core/hub + HID (new)
+- `src/kernel/drivers/keyboard.c`, `mouse.c` (+headers): input injection + PS/2 suppression API
+- `src/kernel/core/isr.c`: `usb_tick()` in the IRQ0 handler
+- `src/kernel/core/main.c`: `usb_init()` after PCI init
+- `src/kernel/drivers/pci.c`: subclass byte offset fix
+- `src/kernel/shell/shell.c`: `usb` command + version
+- `tools/accept_usb.sh`, `tools/mon_cmd.py`: six-step USB acceptance (boot-enumerate -> mouse report -> hot-plug kbd via monitor -> type through USB only -> `device_del` -> PS/2 resumes)
+
+### Notes
+- **Acceptance** (`tools/accept_usb.sh` -> `USB_ALL_OK`): boot with built-in usb-mouse (init/enumerate/bind), `mouse_move` delta delivery, hot-plug `usb-kbd` via the QEMU monitor (picked up through the auto-created virtual hub in ~2 s), sendkey typing delivered **only** through USB (`usb_kbd_once` appears exactly twice: echo + output), `device_del` restores PS/2 typing (`usb_all_done` executes). Phase 4 network/package regression (`accept_phase4.sh`) still ends `P4_ALL_DONE`.
+- **QEMU**: the `pc` machine has no built-in UHCI — start with `-device piix3-usb-uhci`. `USBINTR` stays 0; reports arrive via the IRQ0 tick poll at 100 Hz, which caps report throughput at ~100/s (drain rate) — typing bursts beyond that rely on the device queue.
+- **Scope**: control/bulk/interrupt transfers + class-09 hubs + HID boot kbd/mouse. Devices outside that set are enumerated, logged (`unsupported device ... - ignored`) and parked until disconnect; no MSC/ mass-storage support yet.
+
 ## [2.15.0] - 2026-09-02
 This release gives `dpkg` **native zstd decompression** — modern Debian/Ubuntu jammy packages ship `data.tar.zst`, which previously made every real-mirror install stop at the first unpack — and bakes the Aliyun mirror `sources.list` into fresh boots so `kilget update` works out of the box with zero manual setup. Two latent driver bugs (UDP reply polling, PIT timer mode) that skewed the whole timeout stack were fixed on the way.
 

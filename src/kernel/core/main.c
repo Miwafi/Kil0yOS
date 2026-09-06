@@ -24,6 +24,7 @@
 #include "net/udp.h"
 #include "net/tcp.h"
 #include "net/dhcp.h"
+#include "usb/usb.h"
 
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -94,7 +95,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.15.0\n");
+    klog("Kil0yOS version 2.16.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -201,6 +202,11 @@ void kernel_main(uint64_t mb_info_phys) {
     }
     klog("[init] net done\n");
     heap_verify("net");
+
+    klog("USB: initializing (UHCI + HID)...\n");
+    usb_init();
+    heap_verify("usb");
+    klog("[init] usb_init done\n");
 
     klog("SMP: initializing multiprocessor...\n");
     smp_init();

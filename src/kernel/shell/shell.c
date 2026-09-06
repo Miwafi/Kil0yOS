@@ -22,6 +22,7 @@
 #include "net/tftp.h"
 #include "pkg/dpkg.h"
 #include "pkg/kilget.h"
+#include "usb/usb.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -54,6 +55,7 @@ static int cmd_ping(int argc, char** argv);
 static int cmd_ifconfig(int argc, char** argv);
 static int cmd_netstat(int argc, char** argv);
 static int cmd_net(int argc, char** argv);
+static int cmd_usb(int argc, char** argv);
 static int cmd_exec(int argc, char** argv);
 static int cmd_tftp(int argc, char** argv);
 static int cmd_dpkg(int argc, char** argv);
@@ -78,6 +80,7 @@ static shell_command_t commands[] = {
     {"ifconfig", "Show network configuration", cmd_ifconfig},
     {"netstat", "Show network status", cmd_netstat},
     {"net", "Network info / subcommand (ping|ifconfig|netstat)", cmd_net},
+    {"usb", "USB controller/port/device status", cmd_usb},
     {"tftp", "Download a file via TFTP (installs to /bin)", cmd_tftp},
     {"dpkg", "Package tool: dpkg -i file.deb | -r pkg | -l | -L pkg", cmd_dpkg},
     {"kilget", "Repo client: kilget update|install|show|list|installed", cmd_kilget},
@@ -437,7 +440,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.15.0\n");
+    vga_puts("Kil0yOS v2.16.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -796,7 +799,7 @@ static int cmd_gui(int argc, char** argv) {
     /* top header bar */
     vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
     vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.15.0", 0x0F);
+    vga_draw_string(4, 2, "Kil0yOS v2.16.0", 0x0F);
 
     /* left panel */
     vga_fill_rect(0, header_h, left_w, content_h, 0x00);
@@ -1092,6 +1095,15 @@ static int cmd_net(int argc, char** argv) {
 
     vga_puts("Usage: net [ping <ip> | ifconfig | netstat]\n");
     return 1;
+}
+
+static int cmd_usb(int argc, char** argv) {
+    (void)argc; (void)argv;
+    /* serialise against the IRQ0 usb_tick context */
+    int irqon = irq_save();
+    usb_dump();
+    irq_restore(irqon);
+    return 0;
 }
 
 /* Shared launch path: load `file` with the given argv and run it until

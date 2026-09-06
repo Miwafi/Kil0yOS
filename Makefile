@@ -86,6 +86,11 @@ NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
            $(SRCDIR)/kernel/net/rtl8139.c \
            $(SRCDIR)/kernel/net/e1000.c
 
+# --- USB (UHCI + core + HID) ---
+USB_SRCS = $(SRCDIR)/kernel/usb/usb.c \
+           $(SRCDIR)/kernel/usb/uhci.c \
+           $(SRCDIR)/kernel/usb/hid.c
+
 # --- All kernel sources ---
 KERNEL_SRCS = $(CORE_SRCS) \
               $(MM_SRCS) \
@@ -96,7 +101,8 @@ KERNEL_SRCS = $(CORE_SRCS) \
               $(SHELL_SRCS) \
               $(SCHED_SRCS) \
               $(TIMER_SRCS) \
-              $(NET_SRCS)
+              $(NET_SRCS) \
+              $(USB_SRCS)
 
 KERNEL_OBJS = $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(KERNEL_SRCS))
 KERNEL_ASM_OBJS = $(BUILDDIR)/kernel/core/isr_asm.o

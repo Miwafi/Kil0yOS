@@ -3,47 +3,76 @@
 #include <stdarg.h>
 
 /* Phase 4: tiny bounded formatter for kernel-side string building.
- * Supports %s %d %u %x %c %%; always NUL-terminates and truncates. */
-void ksprintf(char* buf, size_t size, const char* fmt, ...) {
+ * Supports %s %d %u %x %c %% plus optional zero/space pad width for the
+ * numeric forms (%02d, %04x, %08u, ...); always NUL-terminates. */
+void kvsnprintf(char* buf, size_t size, const char* fmt, va_list ap_copy) {
     if (size == 0) return;
     size_t off = 0;
     va_list ap;
-    va_start(ap, fmt);
+    va_copy(ap, ap_copy);
+
+#define KSP_EMIT(c) do { if (off + 1 < size) buf[off++] = (char)(c); } while (0)
 
     for (const char* p = fmt; *p; p++) {
         if (*p != '%') {
-            if (off + 1 < size) buf[off++] = *p;
+            KSP_EMIT(*p);
             continue;
         }
         p++;
         if (*p == '%') {
-            if (off + 1 < size) buf[off++] = '%';
+            KSP_EMIT('%');
             continue;
         }
         if (*p == 's') {
             const char* s = va_arg(ap, const char*);
             if (s == NULL) s = "(null)";
-            while (*s && off + 1 < size) buf[off++] = *s++;
+            while (*s) KSP_EMIT(*s++);
             continue;
         }
-        if (*p == 'd' || *p == 'u' || *p == 'x') {
+        /* optional zero-pad flag + decimal width, e.g. %02x %08x %5d */
+        const char* wstart = p;
+        int zeropad = (*p == '0');
+        if (zeropad) p++;
+        int width = 0;
+        while (*p >= '0' && *p <= '9') {
+            width = width * 10 + (*p - '0');
+            p++;
+        }
+        char spec = *p;
+        if (spec == 'd' || spec == 'u' || spec == 'x') {
             char num[24];
-            if (*p == 'd') itoa(va_arg(ap, int), num, 10, sizeof(num));
-            else utoa(va_arg(ap, uint32_t), num, *p == 'x' ? 16 : 10, sizeof(num));
-            for (char* q = num; *q && off + 1 < size; q++) buf[off++] = *q;
+            if (spec == 'd') itoa(va_arg(ap, int), num, 10, sizeof(num));
+            else utoa(va_arg(ap, uint32_t), num, spec == 'x' ? 16 : 10, sizeof(num));
+            char* q = num;
+            if (*q == '-') {                    /* sign first, then pad */
+                KSP_EMIT('-');
+                q++;
+            }
+            int len = 0;
+            for (char* r = q; *r; r++) len++;
+            for (int i = len; i < width; i++) KSP_EMIT(zeropad ? '0' : ' ');
+            while (*q) KSP_EMIT(*q++);
             continue;
         }
-        if (*p == 'c') {
+        if (spec == 'c') {
             char c = (char)va_arg(ap, int);
-            if (off + 1 < size) buf[off++] = c;
+            KSP_EMIT(c);
             continue;
         }
-        /* unknown specifier: emit literally */
-        if (off + 1 < size) buf[off++] = '%';
-        if (*p && off + 1 < size) buf[off++] = *p;
+        /* unknown specifier: emit the raw text verbatim */
+        KSP_EMIT('%');
+        for (const char* q = wstart; q <= p; q++) KSP_EMIT(*q);
     }
     va_end(ap);
     buf[off] = '\0';
+#undef KSP_EMIT
+}
+
+void ksprintf(char* buf, size_t size, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    kvsnprintf(buf, size, fmt, ap);
+    va_end(ap);
 }
 
 static uint32_t rand_seed = 1;
