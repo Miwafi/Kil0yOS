@@ -7,6 +7,8 @@
 #include "core/process.h"
 #include "mm/memory.h"
 #include "drivers/vga.h"
+#include "drivers/fb.h"
+#include "drivers/efi_gop.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "drivers/pci.h"
@@ -61,8 +63,13 @@ static void serial_puts(const char* s) {
 void klog(const char* s) {
     char ts[24];
     pit_format_time(ts, sizeof(ts));
-    /* in graphics mode the text VRAM window is not mapped as text - keep logs serial-only */
-    if (!vga_is_graphics()) {
+    /* fb terminal takes priority when GOP grabbed the display; in VGA
+     * graphics mode the text VRAM window is not mapped as text - keep
+     * those logs serial-only (BIOS path behaviour unchanged) */
+    if (fb_is_active()) {
+        fb_puts(ts);
+        fb_puts(s);
+    } else if (!vga_is_graphics()) {
         vga_puts(ts);
         vga_puts(s);
     }
@@ -87,6 +94,11 @@ void kernel_main(uint64_t mb_info_phys) {
     serial_init();
     serial_puts("kernel_main entered\n");
 
+    /* UEFI boots: locate GOP, pick 1024x768x32, snapshot the EFI memory
+     * map and ExitBootServices - all before PMM needs the memory map.
+     * BIOS boots bail out here with a single serial line, VGA untouched. */
+    efi_gop_init(mb_info_phys);
+
     /* Start the timestamp clock before any klog() so early boot logs get
      * monotonic timestamps. IRQ0 delivery is unmasked separately right
      * after the PIC remap below. */
@@ -95,7 +107,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 2.16.0\n");
+    klog("Kil0yOS version 2.17.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 

@@ -1,5 +1,6 @@
 #include "shell/terminal.h"
 #include "drivers/vga.h"
+#include "drivers/fb.h"
 #include "drivers/io.h"
 #include "lib/string.h"
 
@@ -43,8 +44,37 @@ static terminal_t g_text_term = {
     .priv    = NULL
 };
 
-/* ========== GUI terminal implementation ========== */
+/* ========== Framebuffer terminal implementation (UEFI GOP) ========== */
 
+static void fbterm_putchar(terminal_t* t, char c) {
+    (void)t;
+    fb_putchar(c);
+}
+
+static void fbterm_puts(terminal_t* t, const char* str) {
+    (void)t;
+    fb_puts(str);
+}
+
+static void fbterm_set_color(terminal_t* t, uint8_t color) {
+    (void)t;
+    fb_set_color(color);
+}
+
+static void fbterm_clear(terminal_t* t) {
+    (void)t;
+    fb_clear();
+}
+
+static terminal_t g_fb_term = {
+    .putchar = fbterm_putchar,
+    .puts    = fbterm_puts,
+    .set_color = fbterm_set_color,
+    .clear   = fbterm_clear,
+    .priv    = NULL
+};
+
+/* ========== GUI terminal implementation ========== */
 #define GUI_TERM_COLS 35
 #define GUI_TERM_ROWS 19
 
@@ -139,7 +169,9 @@ static terminal_t g_gui_term = {
 /* ========== Public API ========== */
 
 void term_init_text(void) {
-    g_current_term = &g_text_term;
+    /* GOP path: the fb terminal replaces the VGA text terminal (vga.c
+     * already neutered itself via the vga_buffer sentinel). */
+    g_current_term = fb_is_active() ? &g_fb_term : &g_text_term;
 }
 
 void term_init_gui(int left_w, int header_h, int content_h) {

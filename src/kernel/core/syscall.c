@@ -2,6 +2,7 @@
 #include "core/syscall_lnx.h"
 #include "core/process.h"
 #include "drivers/vga.h"
+#include "drivers/fb.h"
 #include "drivers/keyboard.h"
 #include "lib/string.h"
 
@@ -171,6 +172,10 @@ uint64_t sys_gfx_mode(uint64_t mode, uint64_t unused1, uint64_t unused2,
                       uint64_t unused3, uint64_t unused4, uint64_t unused5) {
     (void)unused1; (void)unused2; (void)unused3;
     (void)unused4; (void)unused5;
+
+    /* mode13h is a legacy VGA facility; the GOP framebuffer must not be
+     * clobbered by ring-3 gfx clients (draw calls below stay no-ops) */
+    if (fb_is_active()) return (uint64_t)-1;
 
     if (mode) {
         vga_set_mode_13h();

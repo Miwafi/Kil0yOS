@@ -8,3 +8,5 @@ disk.img
 *.log
 *.img
 LinuxSample/
+.trae/
+desktop.ini

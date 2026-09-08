@@ -41,7 +41,9 @@ DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
                $(SRCDIR)/kernel/drivers/power.c \
                $(SRCDIR)/kernel/drivers/pci.c \
                $(SRCDIR)/kernel/drivers/rtc.c \
-               $(SRCDIR)/kernel/drivers/speaker.c
+               $(SRCDIR)/kernel/drivers/speaker.c \
+               $(SRCDIR)/kernel/drivers/efi_gop.c \
+               $(SRCDIR)/kernel/drivers/fb.c
 
 # --- Filesystem ---
 FS_SRCS = $(SRCDIR)/kernel/fs/fs.c \

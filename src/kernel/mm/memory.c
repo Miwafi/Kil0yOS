@@ -4,6 +4,7 @@
 #include "lib/stdlib.h"
 #include "drivers/io.h"
 #include "drivers/vga.h"
+#include "drivers/efi_gop.h"
 #include "core/interrupts.h"
 
 /* ======================================================================== */
@@ -395,6 +396,8 @@ void pmm_init(uint64_t mb_info_phys) {
     /* Everything reserved by default */
     memset(pmm_bitmap, 0xFF, sizeof(pmm_bitmap));
 
+    int have_mmap = 0;
+
     /* Parse multiboot2 mmap if present */
     if (mb_info_phys != 0) {
         uint8_t* info = (uint8_t*)mb_info_phys;
@@ -406,6 +409,7 @@ void pmm_init(uint64_t mb_info_phys) {
             if (t->type == MB2_TAG_END) break;
 
             if (t->type == MB2_TAG_MMAP) {
+                have_mmap = 1;
                 uint32_t entry_size = *(uint32_t*)(tag + 8);
                 uint32_t entry_ver  = *(uint32_t*)(tag + 12);
                 (void)entry_ver;
@@ -433,6 +437,29 @@ void pmm_init(uint64_t mb_info_phys) {
         }
     }
 
+    /* GRUB keep_boot_services boots (UEFI GOP path) carry no multiboot2
+     * mmap tag - feed the PMM from the EFI memory map snapshot taken just
+     * before ExitBootServices instead. */
+    if (!have_mmap && efi_memory_map_available()) {
+        const uint8_t* map = efi_memory_map_ptr();
+        uint32_t size = efi_memory_map_size();
+        uint32_t dsz  = efi_memory_map_desc_size();
+        if (dsz < 40) dsz = 40;
+        for (uint32_t off = 0; off + dsz <= size; off += dsz) {
+            uint32_t etype = *(const uint32_t*)(map + off);
+            uint64_t base  = *(const uint64_t*)(map + off + 8);
+            uint64_t pages = *(const uint64_t*)(map + off + 24);
+            /* EfiConventionalMemory = free usable RAM */
+            if (etype == 7 && base < (PMM_MAX_PAGES * PAGE_SIZE)) {
+                uint64_t len = pages * PAGE_SIZE;
+                if (base + len > (PMM_MAX_PAGES * PAGE_SIZE))
+                    len = (PMM_MAX_PAGES * PAGE_SIZE) - base;
+                pmm_mark_region(base, len, 0);
+            }
+        }
+        klog("PMM: using EFI memory map fallback\n");
+    }
+
     /* Reserve kernel image area */
     extern char kernel_start[];
     extern char kernel_end[];
@@ -445,6 +472,18 @@ void pmm_init(uint64_t mb_info_phys) {
 
     /* Reserve first 2 MiB (real-mode/BIOS stuff, boot page tables, etc.) */
     pmm_mark_region(0, 0x200000, 1);
+
+    /* Reserve the multiboot2 boot-info body itself (0.9 spec: free-for-reuse
+     * after ExitBootServices, but we still read tags late - e.g. UEFI boot
+     * passes it to usb/pci logs; reserving is safe on both boot paths) */
+    if (mb_info_phys != 0) {
+        pmm_mark_region(mb_info_phys, *(uint32_t*)mb_info_phys, 1);
+    }
+
+    /* GOP framebuffer must never be handed out as RAM */
+    if (fb_base() != 0 && fb_size() != 0) {
+        pmm_mark_region(fb_base(), fb_size(), 1);
+    }
 }
 
 uint64_t pmm_alloc_page(void) {

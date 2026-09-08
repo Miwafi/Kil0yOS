@@ -2,6 +2,7 @@
 #include "core/idt.h"
 #include "drivers/io.h"
 #include "drivers/vga.h"
+#include "drivers/fb.h"
 #include "core/interrupts.h"
 #include "sched/scheduler.h"
 #include "timer/pit.h"
@@ -212,6 +213,29 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
         vga_puthex(cr2);
     }
     vga_puts("\n");
+
+    /* GOP path: vga_* is inert (vga_buffer sentinel) - echo the exception
+     * summary straight into the fb terminal so it is visible on screen */
+    if (fb_is_active()) {
+        char fbuf[24];
+        fb_puts("\n[EXCEPTION] ISR #");
+        utohex(frame->interrupt_number, fbuf);
+        fb_puts(fbuf);
+        fb_puts(" at RIP: ");
+        utohex(frame->rip, fbuf);
+        fb_puts(fbuf);
+        fb_puts(" err: ");
+        utohex(frame->error_code, fbuf);
+        fb_puts(fbuf);
+        if (frame->interrupt_number == 14) {
+            uint64_t cr2;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            fb_puts(" CR2: ");
+            utohex(cr2, fbuf);
+            fb_puts(fbuf);
+        }
+        fb_puts("\n");
+    }
 
     /* TEMPORARY Phase 0 debug: hardware single-step tracer for ring 3.
      * jump_to_user() sets TF; each #DB logs the user RIP to serial and

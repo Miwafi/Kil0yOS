@@ -1,4 +1,5 @@
 #include "drivers/vga.h"
+#include "drivers/fb.h"
 #include "drivers/io.h"
 #include "gfx/88front.h"
 
@@ -25,6 +26,7 @@ static int vga_snapshot_valid = 0;
 /* Wait for start of vertical retrace before large repaints (anti-tear).
    Bounded so a non-toggling status register can never hang the caller. */
 void vga_wait_vsync(void) {
+    if (fb_is_active()) return;      /* no legacy VGA regs under GOP */
     int guard = 200000;
     while ((inb(0x3DA) & 0x08)) {
         if (--guard == 0) return;
@@ -50,11 +52,19 @@ static uint8_t vga_read_reg(uint16_t port, uint8_t idx) {
 }
 
 void vga_init() {
+    /* UEFI GOP path: the firmware owns the display and 0xB8000 may not be
+     * mapped at all - leave the sentinel NULL so every text op becomes a
+     * no-op and the fb terminal takes over.  BIOS boots are unchanged. */
+    if (fb_is_active()) {
+        vga_buffer = 0;
+        return;
+    }
     vga_buffer = (uint16_t*)VGA_ADDR;
     vga_clear();
 }
 
 void vga_clear() {
+    if (!vga_buffer) return;
     for (int i = 0; i < VGA_HEIGHT; i++) {
         for (int j = 0; j < VGA_WIDTH; j++) {
             vga_buffer[i * VGA_WIDTH + j] = vga_entry(' ', vga_color);
@@ -69,6 +79,7 @@ void vga_set_color(uint8_t color) {
 }
 
 void vga_putchar(char c) {
+    if (!vga_buffer) return;
     if (c == '\n') {
         vga_x = 0;
         vga_y++;
@@ -113,6 +124,7 @@ void vga_puts(const char* str) {
 }
 
 void vga_puthex(uint64_t value) {
+    if (!vga_buffer) return;
     const char hex_chars[] = "0123456789ABCDEF";
     char buffer[17];
     buffer[16] = '\0';
@@ -126,6 +138,7 @@ void vga_puthex(uint64_t value) {
 }
 
 void vga_set_cursor(int x, int y) {
+    if (!vga_buffer) return;
     uint16_t pos = y * VGA_WIDTH + x;
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
@@ -220,6 +233,7 @@ static void vga_snapshot_restore(void) {
 }
 
 void vga_set_mode_13h() {
+    if (fb_is_active()) return;      /* mode13h desktop is VGA-only; GOP path keeps fb */
     /* save font plane + DAC while still in text mode; mode 13h repaints
        would otherwise destroy the character generator */
     vga_snapshot_save();
@@ -310,6 +324,7 @@ void vga_set_mode_13h() {
 }
 
 void vga_set_text_mode() {
+    if (fb_is_active()) return;
     vga_buffer = (uint16_t*)VGA_ADDR;
     vga_in_gfx_mode = 0;
 
@@ -424,6 +439,7 @@ void vga_draw_color_bars() {
 }
 
 void vga_fill_rect(int x, int y, int w, int h, uint8_t color) {
+    if (!vga_gfx_buffer) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > GFX_WIDTH)  w = GFX_WIDTH - x;

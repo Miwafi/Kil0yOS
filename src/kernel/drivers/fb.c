@@ -1,0 +1,171 @@
+/* 32bpp linear framebuffer text terminal for the UEFI GOP path.
+ *
+ * The framebuffer lives at the GOP FrameBufferBase (identity-mapped by the
+ * boot page tables for the first 4 GiB).  All entry points are inert until
+ * fb_set_info() runs from efi_gop_init, so BIOS boots never touch this
+ * code and the legacy VGA terminal stays the only display. */
+#include "drivers/fb.h"
+#include "drivers/vga.h"
+#include "gfx/88front.h"
+#include "lib/string.h"
+
+static uint32_t* fb   = NULL;   /* linear 32bpp surface      */
+static uint32_t  pitch_ = 0;    /* bytes per scanline        */
+static uint32_t  w_     = 0;    /* pixels                    */
+static uint32_t  h_     = 0;    /* pixels                    */
+static int       rgbx_  = 0;    /* 1: RGBX, 0: BGRX (bytes)  */
+static int       active = 0;
+
+static int cur_x = 0;           /* glyph column              */
+static int cur_y = 0;           /* glyph row                 */
+static int cursor_drawn = 0;    /* software cursor on screen */
+static uint32_t fg_rgb = 0xAAAAAA;   /* EGA 7 light grey */
+static uint32_t bg_rgb = 0x000000;   /* EGA 0 black      */
+
+/* EGA 16-color palette (matches the vga_color numbering) -> 0xRRGGBB */
+static const uint32_t ega_rgb[16] = {
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+    0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+    0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+};
+
+/* EGA palette index -> current fg/bg RGB (clamped input like vga_set_color) */
+void fb_set_color(uint8_t ega_index) {
+    fg_rgb = ega_rgb[ega_index & 0x0F];
+}
+
+void fb_set_info(uint64_t base, uint32_t pitch, uint32_t w, uint32_t h,
+                 int rgbx) {
+    fb     = (uint32_t*)(uint64_t)base;
+    pitch_ = pitch;
+    w_     = w;
+    h_     = h;
+    rgbx_  = rgbx;
+    active = (fb != NULL && pitch_ >= w_ * 4 && w_ >= 8 && h_ >= 8);
+    cur_x  = 0;
+    cur_y  = 0;
+    cursor_drawn = 0;
+}
+
+int fb_is_active(void) { return active; }
+int fb_cols(void)      { return active ? (int)(w_ / 8) : 0; }
+int fb_rows(void)      { return active ? (int)(h_ / 8) : 0; }
+
+static inline void set_pixel(int x, int y, uint32_t rgb) {
+    uint32_t word;
+    if (rgbx_) {
+        word = 0xFF000000u |
+               ((rgb & 0x0000FF) << 16) |      /* B <- blue  */
+               (rgb & 0x00FF00)        |       /* G <- green */
+               ((rgb & 0xFF0000) >> 16);       /* R <- red   */
+    } else {
+        word = 0xFF000000u | rgb;              /* X R G B little-endian */
+    }
+    fb[y * (pitch_ / 4) + x] = word;
+}
+
+/* 8x8 glyph from matrix_font; the whole cell is repainted with the
+ * background so overwrites never leave trails.  Clamps at the edges. */
+static void fb_draw_char(int gx, int gy, char c) {
+    if (gx < 0 || gy < 0 ||
+        gx + 8 > (int)w_ || gy + 8 > (int)h_) return;
+    if (c < 0x20 || c > 0x7E) c = 0x20;
+
+    int x0 = gx, y0 = gy;
+    for (int row = 0; row < 8; row++) {
+        uint8_t bits = matrix_font[c - 0x20][row];
+        for (int col = 0; col < 8; col++) {
+            set_pixel(x0 + col, y0 + row,
+                      (bits & (0x80 >> col)) ? fg_rgb : bg_rgb);
+        }
+    }
+}
+
+/* software cursor: 8x2 underline in the current cell */
+static void cursor_erase(void) {
+    if (!cursor_drawn) return;
+    cursor_drawn = 0;
+    int px = cur_x * 8;
+    int py = cur_y * 8 + 6;
+    if (px + 8 > (int)w_ || py + 2 > (int)h_) return;
+    for (int y = py; y < py + 2; y++)
+        for (int x = px; x < px + 8; x++)
+            set_pixel(x, y, bg_rgb);
+}
+
+static void cursor_draw(void) {
+    int px = cur_x * 8;
+    int py = cur_y * 8 + 6;
+    if (px + 8 > (int)w_ || py + 2 > (int)h_) return;
+    for (int y = py; y < py + 2; y++)
+        for (int x = px; x < px + 8; x++)
+            set_pixel(x, y, fg_rgb);
+    cursor_drawn = 1;
+}
+
+void fb_scroll(void) {
+    if (!active) return;
+    uint32_t stride = pitch_ / 4;
+    uint32_t rows_px = h_ / 8 * 8;
+    for (uint32_t y = 8; y < rows_px; y++) {
+        memcpy((uint8_t*)(fb + (y - 8) * stride),
+               (const uint8_t*)(fb + y * stride), w_ * 4);
+    }
+    for (uint32_t y = rows_px - 8; y < rows_px; y++)
+        for (uint32_t x = 0; x < w_; x++)
+            set_pixel((int)x, (int)y, bg_rgb);
+    if (cur_y > 0) cur_y--;
+    cursor_drawn = 0;
+}
+
+void fb_clear(void) {
+    if (!active) return;
+    uint32_t stride = pitch_ / 4;
+    for (uint32_t y = 0; y < h_; y++)
+        for (uint32_t x = 0; x < w_; x++)
+            fb[y * stride + x] =
+                rgbx_ ? (0xFF000000u | (bg_rgb & 0xFF) << 16 |
+                         (bg_rgb & 0xFF00) | (bg_rgb >> 16))
+                      : (0xFF000000u | bg_rgb);
+    cur_x = 0;
+    cur_y = 0;
+    cursor_drawn = 0;
+}
+
+void fb_putchar(char c) {
+    if (!active) return;
+    cursor_erase();
+
+    if (c == '\n') {
+        cur_x = 0;
+        cur_y++;
+    } else if (c == '\r') {
+        cur_x = 0;
+    } else if (c == '\t') {
+        cur_x = (cur_x + 4) & ~3;
+    } else if (c == '\b') {
+        if (cur_x > 0) {
+            cur_x--;
+            fb_draw_char(cur_x * 8, cur_y * 8, ' ');
+        }
+    } else {
+        fb_draw_char(cur_x * 8, cur_y * 8, c);
+        cur_x++;
+    }
+
+    if (cur_x >= (int)(w_ / 8)) {
+        cur_x = 0;
+        cur_y++;
+    }
+    if (cur_y >= (int)(h_ / 8)) {
+        fb_scroll();
+        cur_y = (int)(h_ / 8) - 1;
+    }
+
+    cursor_draw();
+}
+
+void fb_puts(const char* s) {
+    while (s && *s) fb_putchar(*s++);
+}

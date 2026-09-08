@@ -2,6 +2,41 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.17.0] - 2026-09-08
+This release adds **native UEFI framebuffer output (GOP)** alongside the classic VGA text path: on EFI boots the kernel itself locates the Graphics Output Protocol through the boot services GRUB kept alive (multiboot2 EFI_BS header tag), selects a 1024x768x32 mode, snapshots the EFI memory map and calls ExitBootServices — and then prints through a 32bpp framebuffer terminal, while BIOS boots keep the untouched VGA text console.
+
+### Added
+- **UEFI boot-services boot path** (`src/boot/boot.asm`): multiboot2 header gains the EFI boot-services tag (type 7) and an entry-address tag — BIOS builds of GRUB ignore both (verified in grub-2.12 `multiboot_mbi2.c`, the case body compiles empty under `GRUB_MACHINE_PCBIOS`). The EFI path enters already in long mode, so `_start` is written mode-agnostic (imm32-into-register + register-indirect only; `moffs`/`disp32` encodings change meaning in long mode) and the long-mode far jump uses `jmp far qword [eax]` with the `efi_farptr` operand layout offset-then-selector (without the REX.W prefix the CPU decodes m16:32 and reads the high dword as a selector — the original `#GP(0x10)`). Both PICs are fully masked at entry: on the keep_bs path GRUB enters with `IF=1` and EDK2 re-asserts `sti` inside every boot-services call when it restores TPL.
+- **Kernel-side GOP driver** (`src/kernel/drivers/efi_gop.c`, `include/drivers/efi_gop.h`): parses the multiboot2 EFI64 system-table / boot-services / image-handle tags, validates the "IBI SYST"/"BOOTSERV" signatures, locates GOP via `LocateProtocol`, enumerates modes through `QueryMode` (first pass wants exactly 1024x768x32, second pass any 32bpp linear mode), `SetMode`s it, snapshots the EFI memory map and calls `ExitBootServices` with retry on stale MapKey. All EFI calls go through hand-written `efi_call2..5` thunks marshalling SysV args into the Microsoft x64 ABI; table/protocol function pointers are dereferenced before the call (passing the struct slot address itself made the CPU execute GOP-struct bytes as code — the bring-up `#UD`). GUIDs are spelled as little-endian memory images (GOP `9042a9de-23dc-...` → `de a9 42 90 | dc 23 | 38 4a | ...`; writing the string halves verbatim was exactly why every ByProtocol search returned `EFI_NOT_FOUND`).
+- **Stray-interrupt shield** (`efi_gop.c`): before the first boot-services call the kernel installs a flat 256-gate stub IDT (every vector lands on one `iretq` stub that EOIs both 8259s and the LAPIC; error-code vectors get a stub that drops the code) and re-masks both PICs. Rationale: the firmware IDT gates reference the firmware's CS (0x38), which does not exist in the kernel GDT (limit 0x27) — one PIT tick arriving under the kernel GDT triple-faulted as `#GP(sel 0x38) → #DF → triple` (QEMU `-d int` showed the tick vectoring through the firmware IDT at kernel context; the 8259 masks set in boot.asm stayed `0xff` yet delivery still happened via the LAPIC route).
+- **32bpp framebuffer terminal** (`src/kernel/drivers/fb.c`, `include/drivers/fb.h`): linear framebuffer text console (8x8 matrix font, RGBX/BGRX pixel orders, pitch handling, clear/scroll/putc) used in place of the VGA text buffer whenever GOP set a mode.
+- **EFI memory map fallback for the PMM** (`src/kernel/mm/memory.c`): keep_bs boots carry no multiboot2 mmap tag, so the PMM now feeds off the pre-EBS EFI memory-map snapshot (conventional-memory regions only, firmware/reclaim regions reserved); the framebuffer range is reserved against page allocation.
+- **fb-aware routing**: `terminal.c` routes console output to the fb terminal when active; `vga.c` gains a `vga_buffer == 0` sentinel + `fb_is_active()` guards so VGA writes become no-ops on GOP boots; `isr.c` exception dump mirrors to the fb console; `shell.c`/GUI guard their VGA-text assumptions.
+
+### Fixed
+- **GOP GUID byte order (every ByProtocol search returned 0x800000000000000e)**: Data2/Data3 are u16 fields and must be byte-swapped into the memory image — `0x23dc → dc 23`, `0x4a38 → 38 4a`; the same class of bug hit the SimpleTextOut GUID (`38747777-...` → `77 77 74 38`, not `38 77 77 87`).
+- **SetMode call executed the GOP struct as code (`#UD`)**: `efi_call2((void**)(gop + 0x08), ...)` passed the slot ADDRESS as the entry point; it must be `efi_call2(*(void**)(gop + 0x08), ...)`.
+- **Triple fault during EFI calls (PIT tick through the firmware IDT)**: masked both PICs in `boot.asm` at entry AND installed the stub IDT (see above) — `check_exception` count went from thousands to **0**.
+- **QEMU `-d int` decode**: with the firmware IDT still loaded, interrupts logged `IP=0038:...`; the crash chain `v=20 → v=0d e=0038 → v=08 → v=0d` identified the firmware-selector #GP that text-only debugging had attributed to far-jump/encoding issues.
+
+### Changed
+- `Makefile`: `drivers/efi_gop.c`, `drivers/fb.c` registered in the build.
+- Version strings bumped to 2.17.0 (boot banner, `version`, `uname`, GUI title bar).
+
+### File Changes
+- `src/boot/boot.asm`: EFI_BS + entry tags, mode-agnostic entry, long-mode far-jump fix, PIC masking
+- `src/kernel/drivers/efi_gop.c`, `include/drivers/efi_gop.h`: GOP/EBS driver + MS-x64 thunks + stub IDT shield (new)
+- `src/kernel/drivers/fb.c`, `include/drivers/fb.h`: 32bpp text console (new)
+- `src/kernel/mm/memory.c`: PMM EFI-mmap fallback + fb reservation
+- `src/kernel/core/main.c`, `terminal.c`, `isr.c`, `drivers/vga.c`, `drivers/fb.h`: fb routing + VGA guards
+- `tools/accept_gop.sh`: dual-path acceptance (UEFI GOP + fb visual + fb shell + BIOS regression)
+- `tools/_diag_exit.sh`: QEMU crash-vs-hang diagnostic (int-log + serial tail)
+
+### Notes
+- **Acceptance** (`tools/accept_gop.sh` → `GOP_ALL_OK`): UEFI boot shows `gop_ok mode=1024x768x32` + `ebs_ok` + `PMM: using EFI memory map fallback` + 2.17.0 banner; monitor `screendump` proves 1024x768 fb content (bright-pixel estimate in range); typed `echo gop_fb_shell_ok` round-trips through the fb terminal; the same ISO under SeaBIOS prints `[gop] no EFI ST (BIOS boot)` and keeps the VGA console with zero exceptions.
+- **Boot services lifetime**: the kernel calls boot services only in `efi_gop_init` (before its own `ExitBootServices`); after `ebs_ok` nothing touches the EFI tables, so the keep_bs requirement is satisfied by construction.
+- **Not in scope**: efibootmgr/NVRAM, UEFI variable services, runtime services at OS time (the runtime-services table is validated but never called), and multi-head GOP (first located GOP wins).
+
 ## [2.16.0] - 2026-09-06
 This release adds **USB plug-and-play**: a UHCI (USB 1.1) host controller driver, a USB core with a device-tree model, a class-09 hub driver (needed because QEMU 8.2 hot-add wraps every `device_add`-ed device in a virtual hub), and HID boot-protocol keyboard/mouse with hotplug and automatic PS/2 fallback. While a USB HID device is bound, its PS/2 counterpart is suppressed; unplug restores it — no user-visible switch needed.
 
