@@ -21,89 +21,67 @@
   </p>
 </div>
 
+## What is this
+
+A hobby operating system for x86-64, written from scratch in C and assembly. GRUB2 boots it on BIOS and UEFI firmware, in QEMU or a real VM like VMware. It has its own kernel, drivers, network stack, filesystems, a small GUI, and a Linux compatibility layer that runs real Linux ELF binaries.
+
 ## Features
 
-### Core kernel
-- **x86-64 long mode** with 4-level page tables and identity-mapped first 4 GiB
-- **Physical Memory Manager (PMM)** — bitmap-based 4 KiB page frame allocator with Multiboot2 mmap parsing
-- **Virtual Memory Manager (VMM)** — on-demand 4-level page table mapping, unmapping, and address translation, plus per-process address spaces (private CR3 roots, fork/exec lifecycle)
-- **Kernel panic & assert** (`PANIC`, `ASSERT`) with serial + VGA output and CPU halt
-- Heap allocation with integrity canaries and free-list verification
-- 64-bit interrupt handling with PIC, ISRs, and IDT; GDT with proper long-mode descriptors
-- Round-robin task scheduler with 64-bit context switching
-- VGA text mode display and a **TempleOS-style tiling GUI desktop** (320x200 mode 13h)
-- PS/2 keyboard and mouse input handling
+Kernel:
 
-### Linux compatibility (Linux-ABI)
-- **Runs real Linux x86-64 ELF binaries** — static, dynamic PIE, and full ELF interpreter loading (`PT_INTERP`): busybox 1.36.1 (musl static, all ~390 applets), musl dynamic PIE, and glibc dynamic PIE programs all run
-- **Process model**: `fork`/`vfork`/`clone`, `wait4`, `execve` with per-process address spaces; TTY line discipline with canonical-mode input
-- **Linux syscall layer** (`syscall_lnx`): ~60 syscalls including `openat`, `statx`, `getdents64`, `mmap` (fd-backed), `brk`, `readv`/`writev`, `poll`, `futex`/`rseq` stubs, `arch_prctl(SET_FS)`, and the socket family
-- **Linux VFS shim** (`lnxvfs`): fd tables, `/proc`-style basics, stat/dirent translation onto the internal filesystem
-- **Unified multi-backend VFS**: persistent ext2 read-only root (`/`), FAT32 RAM disk, and an in-memory write overlay — `/bin` survives reboots
-- **Debian package ecosystem**: `dpkg` frontend (status database, `-i/-l/-L/-r`, dependency checking with transaction mode) and `kilget` repo client (`sources.list`, RFC822 `Packages` index, SHA256 verification, topological dependency-ordered installs) — the real Ubuntu `libc6` installs and runs (verified by executing the installed `ld-linux-x86-64.so.2`)
+- x86-64 long mode, 4-level paging (5-level detected automatically), per-process address spaces
+- Bitmap PMM, on-demand VMM, heap with canary checks
+- Round-robin scheduler, ring 3 user programs with their own syscalls
+- PS/2 keyboard and mouse, PIT/RTC, ACPI power-off
+- VGA text console on BIOS, GOP framebuffer console (1024x768x32) on UEFI
 
-### Network stack
-- Intel E1000 and Realtek RTL8139 NIC drivers (PCI Vendor/Device ID matching)
-- Ethernet / ARP / IPv4 / ICMP / UDP / **TCP** with sliding-window flow control, retransmission timers, and a 64 KiB receive ring
-- DHCP auto-configuration with static fallback
-- **TFTP client** (RFC 1350), **UDP DNS** resolution (`nslookup`), **HTTP/1.1 client** (busybox `wget` works)
+Linux compatibility:
 
-### User programs
-- **Ring 3 user programs** loaded from `/bin` with graphics + keyboard syscall interfaces
-- Built-in **Pong game** (`exec /bin/pong.bin`) with AI opponent, flicker-free incremental rendering
+- Runs real Linux x86-64 ELF binaries: static, dynamic PIE, and `PT_INTERP` interpreter loading
+- busybox 1.36.1 (musl static, ~390 applets), musl dynamic PIE, and glibc dynamic PIE all work
+- ~60 Linux syscalls: `openat`, `statx`, `getdents64`, `mmap`, `brk`, `readv`/`writev`, `poll`, the socket family, ...
+- `fork`/`vfork`/`clone`/`wait4`/`execve` with a TTY line discipline
+- ext2 read-only root + FAT32 RAM disk + write overlay, so `/bin` survives reboots
+- `dpkg` and `kilget` install real Debian packages; Ubuntu's `libc6` installs and runs
 
-## Prerequisites
+Network:
 
-- gcc (x86-64 cross-compilation support)
-- nasm
-- ld (GNU linker)
-- grub-mkrescue
-- qemu-system-x86_64
+- E1000 and RTL8139 NIC drivers
+- Ethernet, ARP, IPv4, ICMP, UDP, TCP (sliding window, retransmission, flow control)
+- DHCP, TFTP, DNS, HTTP/1.1 (busybox `wget` works)
 
-> **Note:** This is a 64-bit kernel. Ensure your toolchain supports `-m64` and your emulator/VM is configured for a 64-bit guest.
-> For the Linux-ABI test programs (busybox, musl/glibc builds) a **WSL/Debian host toolchain** is used — see `tools/` scripts.
+GUI:
 
-## Build
+- TempleOS-style tiling desktop in mode 13h, with a shell, a system panel, and a cat
+- A Pong game running as a ring 3 program through the graphics syscalls
+
+## Build and run
+
+You need gcc, nasm, ld, grub-mkrescue, and qemu-system-x86_64. The Linux-ABI test programs (busybox, musl/glibc builds) are built on a WSL/Debian host; see `tools/`.
 
 ```bash
-make
+make        # produces build/kil0yos.iso
+make run    # headless boot, serial console on stdio
+qemu-system-x86_64 -cdrom build/kil0yos.iso -m 512M   # with a window
 ```
 
-## Run
+The ISO also boots in VMware/VirtualBox; enable EFI firmware for the UEFI path.
 
-```bash
-make run
-```
+## Shell
 
-## Commands
+Basic file and system commands: `ls`, `cd`, `pwd`, `mkdir`, `rm`, `touch`, `cat`, `edit`, `clear`, `echo` (`>` redirect), `whoami`, `date`, `time`, `version`, `help`, `shutdown` (ACPI S5).
 
-Built-in shell commands:
+The interesting ones:
 
-- ls - List directory contents
-- cd - Change directory
-- pwd - Print working directory
-- mkdir - Create directory (supports path like `mkdir subdir/file`)
-- rm - Remove file or directory
-- touch - Create empty file
-- cat - Display file contents
-- edit - Edit file contents
-- clear - Clear screen
-- echo - Print text (supports redirect to file with >)
-- whoami - Print current user
-- date / time - Show current date / time
-- version - Show OS version
-- help - Show help information
-- shutdown - Shut down the system (ACPI S5)
-- net - Network info / subcommand (ping|ifconfig|netstat)
-- ping - Send ICMP echo requests
-- tftp - Download a file via TFTP (installs to /bin)
-- dpkg - Package tool: `dpkg -i file.deb` | `-r pkg` | `-l` | `-L pkg`
-- kilget - Repo client (apt-get equivalent): `kilget update|install|show|list|installed` (`apt-get` is an alias)
-- exec - Run a user program from `/bin` (e.g. `exec /bin/hello.bin`, `exec /bin/pong.bin`)
+- `net`, `ping` — network info (`net ifconfig`, `net netstat`) and ICMP echo
+- `tftp` — pull a file over TFTP and install it to `/bin`
+- `dpkg` — `dpkg -i file.deb`, `-r pkg`, `-l`, `-L pkg`
+- `kilget` — repo client, apt-get equivalent: `update`, `install`, `show`, `list`, `installed` (`apt-get` is an alias)
+- `exec` — run a user program, e.g. `exec /bin/pong.bin`
 
-Unknown commands are dispatched to **busybox** (`/bin/busybox <cmd>`), so the full applet set works: `find`, `grep`, `wget`, `nslookup`, `vi`, `ps`, `head`, `wc`, ...
+Unknown commands fall through to busybox (`/bin/busybox <cmd>`), so `find`, `grep`, `wget`, `nslookup`, `vi`, `ps`, ... all work.
 
-### Packaging example
+Packaging, end to end:
 
 ```text
 $ echo deb http://10.0.2.2:8000 . > /etc/kilget/sources.list
@@ -115,87 +93,50 @@ $ exec /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 ...usage banner from the real glibc dynamic linker...
 ```
 
-## GUI Desktop
+## GUI
 
-Run the `gui` command to enter the graphical tiling desktop. Navigate the left menu with **arrow keys** and press **Enter** to switch panels.
+Run `gui` to enter the tiling desktop. Arrow keys navigate the left menu, Enter switches panels.
 
 ### Interactive Shell
 
-The **Shell** panel provides a fully interactive graphical shell supporting `ls`, `cd`, `mkdir`, `touch`, `pwd`, `shutdown`, and more.
+A graphical shell supporting `ls`, `cd`, `mkdir`, `touch`, `pwd`, `shutdown`, and more.
 
 ![Shell GUI](assets/shellgui.png)
 
-### CAT Viewer
+### Cat
 
-Because every OS needs a cat.
+Because every OS needs one.
 
 ![=^._.^=](assets/mew.png)
 
-### System GUI
-
-Wanna check the system status?
+### System panel
 
 ![System GUI](assets/systemgui.png)
 
-### Pong Game
+### Pong
 
-Run `exec /bin/pong.bin` for a game of Pong against the AI (first to 5 wins). Move with **W/S**, press **ESC** to return to the shell. Rendered through ring 3 graphics syscalls with incremental (flicker-free) updates.
+`exec /bin/pong.bin` plays against the AI, first to 5 wins. W/S to move, ESC returns to the shell. Rendered through ring 3 graphics syscalls with incremental, flicker-free updates.
 
-## Project Structure
+## Project structure
 
 ```
-src/
-  boot/               - Bootloader (Multiboot2 + long mode entry, Assembly)
-  kernel/
-    core/             - Kernel core (main, gdt, idt, isr, tss, smp)
-      elf.c           - ELF loader (static + dynamic PIE, PT_INTERP interpreter loading)
-      process.c       - Process model (fork/wait4/execve, per-process CR3)
-      syscall.c       - Ring 3 syscall interface (graphics/keyboard)
-      syscall_lnx.c   - Linux syscall table (Linux-ABI)
-      lnxvfs.c        - Linux VFS shim (fd tables, statx, getdents64, ...)
-      tty.c           - TTY line discipline
-      uvm.c           - User virtual memory management
-    drivers/          - Device drivers (disk, keyboard, mouse, pci, pit, power, rtc, vga, speaker)
-    fs/               - Filesystems
-      fs.c            - Multi-backend VFS (FAT RAM disk + ext2 root + MEM write overlay)
-      ext2.c          - ext2 read-only driver
-      edit.c          - Text editor
-    lib/              - Kernel standard library (string.c, stdlib.c)
-    mm/               - Memory management (memory.c: PMM/VMM/heap)
-    net/              - Network stack
-      netif.c         - Interface abstraction (NIC dispatch)
-      ethernet.c      - Ethernet framing
-      arp.c           - ARP
-      ipv4.c          - IPv4
-      icmp.c          - ICMP (ping)
-      udp.c           - UDP
-      tcp.c           - TCP (sliding window, retransmission, flow control)
-      dhcp.c          - DHCP client
-      tftp.c          - TFTP client (RFC 1350)
-      http.c          - HTTP/1.1 GET client
-      e1000.c         - Intel E1000 NIC driver
-      rtl8139.c       - Realtek RTL8139 NIC driver
-    pkg/              - Debian package ecosystem
-      deb.c           - ar archive + .deb member extraction
-      tar.c           - ustar unpacking
-      inflate.c       - DEFLATE/gzip decompression
-      sha256.c        - SHA-256
-      dpkg.c          - dpkg frontend (status database, install/remove/list)
-      kilget.c        - repo client (apt-get equivalent)
-    sched/            - Task scheduler
-    shell/            - Command-line shell (shell.c) + terminal (terminal.c)
-    timer/            - Timer management (pit.c)
-
-user/                 - Linux-ABI test programs (hello, nettest, probe_ld, hello_pthread)
-tools/                - Build + acceptance tooling (busybox build, disk images, QEMU headless harnesses)
-include/              - Header files
-Makefile              - Build configuration
-grub.cfg              - GRUB2 boot configuration
-linker.ld             - 64-bit linker script
-ROADMAP_LINUX_COMPAT.md - Linux compatibility roadmap (phases 0-4)
-CHANGELOG.md          - Release notes
+src/boot/             Boot entry (Multiboot2, long mode, UEFI, assembly)
+src/kernel/core/      Kernel core: processes, ELF loader, Linux syscall table, VFS shim, TTY
+src/kernel/drivers/   Device drivers (keyboard, mouse, disk, PCI, VGA, power, ...)
+src/kernel/fs/        Multi-backend VFS: FAT RAM disk + ext2 root + write overlay
+src/kernel/mm/        PMM / VMM / heap
+src/kernel/net/       TCP/IP stack, DHCP, TFTP, DNS, HTTP, E1000 + RTL8139 drivers
+src/kernel/pkg/       Debian packages: dpkg, kilget, ar/tar/gzip/sha256
+src/kernel/sched/     Scheduler
+src/kernel/shell/     Shell and terminal
+src/kernel/timer/     PIT
+src/kernel/usb/       UHCI host controller + USB HID
+user/                 Linux-ABI test programs
+tools/                Build and acceptance tooling (busybox build, QEMU headless harnesses)
+CHANGELOG.md          Release notes
+ROADMAP_LINUX_COMPAT.md   Linux compatibility roadmap (phases 0-4)
 ```
 
 ## License
 
-GPL2.0
+GPL-2.0
