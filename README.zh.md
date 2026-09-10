@@ -113,7 +113,7 @@ $ exec /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 
 ### 乒乓球
 
-`exec /bin/pong.bin` 和 AI 对打，先拿 5 分的赢。W/S 移动挡板，ESC 回 shell。走 Ring 3 图形系统调用渲染，增量刷新不闪屏。
+`exec /bin/pong.bin` 和AI顶级智斗，5分赢。W/S移动挡板，ESC回shell
 
 ## 项目结构
 
