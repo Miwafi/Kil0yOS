@@ -3,6 +3,7 @@
 #include "core/isr.h"
 #include "core/interrupts.h"
 #include "drivers/device.h"
+#include "drivers/vga.h"
 
 #define BUFFER_SIZE 256
 #define KEYBOARD_STATUS_PORT 0x64
@@ -116,6 +117,16 @@ void keyboard_set_ps2_enabled(int enabled) {
 
 void keyboard_handler(interrupt_frame_t* frame) {
     (void)frame;
+    static int dbg_n = 0;
+    uint8_t scancode = inb(KEYBOARD_PORT);
+
+    /* remote-debug: proves IRQ1 delivery through the LAPIC virtual wire
+     * (UEFI firmware masks LINT0 and silently kills all 8259 IRQs) */
+    if (dbg_n < 2) {
+        dbg_n++;
+        klog_hex("[kbd] irq1 sc=", scancode);
+    }
+
     if (!ps2_enabled) {
         /* USB keyboard owns the console: drain the 8042 output buffer and
          * discard, but keep the IRQ serviced */
@@ -125,8 +136,6 @@ void keyboard_handler(interrupt_frame_t* frame) {
         pic_send_eoi(KEYBOARD_IRQ);
         return;
     }
-
-    uint8_t scancode = inb(KEYBOARD_PORT);
 
     if (scancode == 0xE0) {
         extended = 1;

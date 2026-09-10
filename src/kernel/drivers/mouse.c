@@ -34,28 +34,40 @@ static int saved_x = -1;
 static int saved_y = -1;
 static int cursor_visible = 0;
 
-static void mouse_wait(uint8_t type) {
+/* Bounded waits: an EFI firmware may leave the aux channel owned by its
+ * own (vmmouse) driver in a state that never ACKs, so every poll must
+ * time out instead of hanging the boot.  Threshold >= 1000000 per the
+ * mouse bring-up rule (ISA port reads ~1us each, 2M is ~2s worst case). */
+#define MOUSE_WAIT_LOOPS 2000000
+
+static int mouse_wait_timeout(uint8_t type) {
+    uint32_t n = MOUSE_WAIT_LOOPS;
     if (type == 0) {
         while ((inb(MOUSE_STATUS_PORT) & 0x01) == 0) {
+            if (--n == 0) return 0;
             __asm__ volatile("nop");
         }
     } else {
         while (inb(MOUSE_STATUS_PORT) & 0x02) {
+            if (--n == 0) return 0;
             __asm__ volatile("nop");
         }
     }
+    return 1;
 }
 
-static void mouse_write(uint8_t data) {
-    mouse_wait(1);
+static int mouse_write(uint8_t data) {
+    if (!mouse_wait_timeout(1)) return 0;
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_SEND_TO_MOUSE);
-    mouse_wait(1);
+    if (!mouse_wait_timeout(1)) return 0;
     outb(MOUSE_DATA_PORT, data);
+    return 1;
 }
 
-static uint8_t mouse_read(void) {
-    mouse_wait(0);
-    return inb(MOUSE_DATA_PORT);
+static int mouse_read(uint8_t* out) {
+    if (!mouse_wait_timeout(0)) return 0;
+    *out = inb(MOUSE_DATA_PORT);
+    return 1;
 }
 
 static void mouse_flush(void) {
@@ -64,29 +76,76 @@ static void mouse_flush(void) {
     }
 }
 
-static void mouse_controller_reset(void) {
+/* Device-level reset: FF -> ACK(FA) -> self-test AA 00.  This is what
+ * recovers a device that a firmware driver left in its own mode. */
+static int mouse_reset_device(void) {
+    uint8_t b;
+    if (!mouse_write(0xFF)) return 0;
+    if (!mouse_read(&b) || b != MOUSE_ACK) return 0;
+    if (!mouse_read(&b) || b != 0xAA) return 0;
+    if (!mouse_read(&b) || b != 0x00) return 0;
+    return 1;
+}
+
+/* Returns 1 when the aux channel is live and reporting; 0 leaves the
+ * channel disabled (IRQ12 masked by the caller) so the boot continues. */
+static int mouse_controller_reset(void) {
+    uint8_t status, ack;
+
     mouse_flush();
 
+    /* start from a known controller state: disable aux, enable the aux
+     * interrupt (IRQ12 bit) and the aux clock in the config byte */
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_DISABLE);
     io_wait();
 
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_READ_CFG);
-    mouse_wait(0);
-    uint8_t status = inb(MOUSE_DATA_PORT);
+    if (!mouse_read(&status)) {
+        klog("[mouse] 8042 config read timeout\n");
+        return 0;
+    }
     status |= 0x02;
     status &= ~0x20;
 
-    mouse_wait(1);
+    if (!mouse_wait_timeout(1)) {
+        klog("[mouse] 8042 ibf stuck\n");
+        return 0;
+    }
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_WRITE_CFG);
-    mouse_wait(1);
+    if (!mouse_wait_timeout(1)) {
+        klog("[mouse] 8042 cfg write stuck\n");
+        return 0;
+    }
     outb(MOUSE_DATA_PORT, status);
 
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_ENABLE);
     io_wait();
+    mouse_flush();
 
-    mouse_write(MOUSE_CMD_ENABLE_REPORTING);
-    uint8_t ack = mouse_read();
-    (void)ack;
+    if (!mouse_reset_device()) {
+        klog("[mouse] device reset failed (firmware-owned aux?)\n");
+        goto fail;
+    }
+    if (!mouse_write(MOUSE_CMD_ENABLE_REPORTING)) {
+        klog("[mouse] enable write timeout\n");
+        goto fail;
+    }
+    if (!mouse_read(&ack)) {
+        klog("[mouse] enable ack timeout\n");
+        goto fail;
+    }
+    if (ack != MOUSE_ACK) {
+        klog_hex("[mouse] enable ack=0x", ack);
+        klog("\n");
+        goto fail;
+    }
+    return 1;
+fail:
+    /* park the aux channel: no IRQ12 storm from stray firmware bytes */
+    mouse_flush();
+    outb(MOUSE_COMMAND_PORT, MOUSE_CMD_DISABLE);
+    io_wait();
+    return 0;
 }
 
 /* Integrate one motion sample (shared by the PS/2 and USB HID paths).
@@ -172,9 +231,15 @@ void mouse_handler(interrupt_frame_t* frame) {
 }
 
 void mouse_init() {
-    mouse_controller_reset();
-    register_irq_handler(MOUSE_IRQ, mouse_handler);
-    pic_enable_irq(MOUSE_IRQ);
+    if (mouse_controller_reset()) {
+        register_irq_handler(MOUSE_IRQ, mouse_handler);
+        pic_enable_irq(MOUSE_IRQ);
+    } else {
+        /* aux channel unusable (e.g. firmware vmmouse left it wedged):
+         * IRQ12 stays masked, the boot continues without a PS/2 mouse
+         * (USB HID can still claim the pointer via mouse_set_ps2_enabled) */
+        mouse_set_ps2_enabled(0);
+    }
 }
 
 void mouse_get_state(mouse_state_t* out) {

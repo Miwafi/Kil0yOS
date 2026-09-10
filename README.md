@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/banner.svg" alt="kil0yOSnotCtOS" width="100%" />
   <h1>kil0yOS</h1>
-  <p><strong>A 64-bit x86-64 microkernel operating system with a Linux compatibility layer</strong></p>
+  <p><strong>A 64-bit x86-64 operating system</strong></p>
 
   <p>
     <a href="#">

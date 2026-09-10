@@ -2,7 +2,7 @@
 # GOP (UEFI framebuffer) acceptance:
 #   1) UEFI boot (OVMF): kernel calls GOP itself via the EFI boot services
 #      GRUB kept alive -> gop_ok mode=1024x768x32, ebs_ok, EFI-mmap PMM
-#      fallback, 2.17.0 banner; no gop_fail / ebs_fail / EXCEPTION.
+#      fallback, 2.17.1 banner; no gop_fail / ebs_fail / EXCEPTION.
 #   2) fb visual: monitor screendump -> PPM is 1024x768 and carries text
 #      (bright pixel count in a plausible range).
 #   3) fb shell: typing lands in the fb terminal (serial mirror shows the
@@ -54,7 +54,7 @@ QPID=$!
 check "$TDIR/serial_gop_uefi.log" "gop_ok" "gop_ok mode=1024x768x32" 60 || true
 check "$TDIR/serial_gop_uefi.log" "ebs_ok" "ebs_ok" 30 || true
 check "$TDIR/serial_gop_uefi.log" "pmm_efi" "PMM: using EFI memory map fallback" 30 || true
-check "$TDIR/serial_gop_uefi.log" "version" "Kil0yOS version 2.17.0" 30 || true
+check "$TDIR/serial_gop_uefi.log" "version" "Kil0yOS version 2.17.1" 30 || true
 
 echo "--- 2) fb visual: screendump ---"
 sleep 4
@@ -104,7 +104,7 @@ qemu-system-x86_64 -cdrom build/kil0yos.iso -m 512M -display none \
 QPID2=$!
 
 check "$TDIR/serial_gop_bios.log" "no_efi_st" "no EFI ST" 60 || true
-check "$TDIR/serial_gop_bios.log" "bios_version" "Kil0yOS version 2.17.0" 30 || true
+check "$TDIR/serial_gop_bios.log" "bios_version" "Kil0yOS version 2.17.1" 30 || true
 
 sleep 3
 kill "$QPID2" 2>/dev/null

@@ -87,12 +87,29 @@ __asm__(
 "efi_stub_plain:\n\t"
     "push %rax\n\t"
     "push %rcx\n\t"
+    "push %rdx\n\t"
     "mov $0x20,%al\n\t"
     "out %al,$0x20\n\t"        /* EOI master (spurious-safe) */
     "out %al,$0xA0\n\t"        /* EOI slave  */
+    /* LAPIC EOI - mode probed at runtime, never unconditionally:
+     * in x2APIC mode (VMware firmware) touching the xAPIC MMIO window
+     * raises #GP, which re-enters this stub forever until the stack
+     * blows up -> triple fault -> reset loop. */
+    "mov $0x1b,%ecx\n\t"
+    "rdmsr\n\t"
+    "test $0x400,%eax\n\t"     /* EXT bit -> x2APIC: EOI via MSR 0x80B */
+    "jnz 6f\n\t"
     "movabs $0xfee000b0,%rcx\n\t"
     "xor %eax,%eax\n\t"
-    "mov %eax,(%rcx)\n\t"      /* LAPIC EOI (delivery may route via LAPIC) */
+    "mov %eax,(%rcx)\n\t"      /* xAPIC: MMIO EOI */
+    "jmp 5f\n\t"
+"6:\n\t"
+    "xor %eax,%eax\n\t"
+    "xor %edx,%edx\n\t"
+    "mov $0x80b,%ecx\n\t"
+    "wrmsr\n\t"                /* x2APIC: EOI MSR */
+"5:\n\t"
+    "pop %rdx\n\t"
     "pop %rcx\n\t"
     "pop %rax\n\t"
     "iretq\n"
@@ -152,6 +169,39 @@ static void efi_log_hex(const char* prefix, uint64_t v) {
     efi_log("\n");
 }
 
+/* --- bounded-wait serial (post-EBS diagnostics) --------------------------
+ * ExitBootServices runs the firmware's EVT_SIGNAL_EXIT_BOOT_SERVICES
+ * notifications, and a firmware serial-console driver may reconfigure
+ * COM1 there (flow control, FIFO).  The plain LSR forever-poll would then
+ * hang AFTER ExitBootServices already returned.  These variants give up
+ * after ~0.1M polls (~100 ms at 1 MHz ISA port rate) so the caller can
+ * mark the outcome on the framebuffer and keep going. */
+static int efi_putc_b(char c) {
+    uint64_t n = 0;
+    while ((inb(0x3F8 + 5) & 0x20) == 0)
+        if (++n > 0x100000ULL) return 0;
+    outb(0x3F8, (uint8_t)c);
+    return 1;
+}
+
+static int efi_log_b(const char* s) {
+    for (; *s; s++) {
+        char c = *s;
+        if (c == '\n' && !efi_putc_b('\r')) return 0;
+        if (!efi_putc_b(c)) return 0;
+    }
+    return 1;
+}
+
+static int efi_log_hex_b(const char* prefix, uint64_t v) {
+    static const char hex[] = "0123456789abcdef";
+    if (!efi_log_b(prefix)) return 0;
+    if (!efi_putc_b('0') || !efi_putc_b('x')) return 0;
+    for (int i = 0; i < 16; i++)
+        if (!efi_putc_b(hex[(v >> (60 - i * 4)) & 0xF])) return 0;
+    return efi_putc_b('\r') && efi_putc_b('\n');
+}
+
 /* --- static state (no heap: bss only) ----------------------------------- */
 
 /* GOP GUID 9042a9de-23dc-4a38-96fb-7aded080516a, little-endian memory image:
@@ -189,6 +239,42 @@ static void* mb2_find_tag(uint64_t mbi_phys, uint32_t type) {
         tag += advance;
     }
     return NULL;
+}
+
+/* Firmware vendor: EFI_SYSTEM_TABLE.FirmwareVendor is at st+0x18 (the
+ * EFI_TABLE_HEADER Hdr occupies 0x00-0x17), a CHAR16* string ("VMware,
+ * Inc.", "EDK II", ...).  VMware's firmware deadlocks inside
+ * ExitBootServices when called from a multiboot2 keep_bs context (OVMF/
+ * EDK II does not), so the caller parks the firmware instead of exiting
+ * boot services there. */
+static int fw_is_vmware(uint64_t st) {
+    static const uint16_t pat[6] = { 'V', 'M', 'w', 'a', 'r', 'e' };
+    uint64_t p = *(uint64_t*)(st + 0x18);
+    if (p == 0 || p + 256 >= 0x100000000ULL) return 0;
+    uint16_t* s = (uint16_t*)p;
+    for (unsigned i = 0; i < 120 && s[i]; i++) {
+        unsigned j = 0;
+        while (j < 6 && s[i + j] == pat[j]) j++;
+        if (j == 6) return 1;
+    }
+    return 0;
+}
+
+/* ASCII-echo the firmware vendor string so a missed "VMware" match is
+ * immediately visible in the serial log */
+static void fw_log_vendor(uint64_t st) {
+    uint64_t p = *(uint64_t*)(st + 0x18);
+    if (p == 0 || p + 256 >= 0x100000000ULL) {
+        efi_log("[gop] fw vendor=<none>\n");
+        return;
+    }
+    uint16_t* s = (uint16_t*)p;
+    efi_log("[gop] fw vendor=");
+    for (unsigned i = 0; i < 96 && s[i]; i++) {
+        uint16_t c = s[i];
+        efi_putc((c >= 0x20 && c < 0x7F) ? (char)c : '?');
+    }
+    efi_log("\n");
 }
 
 static void efi_snapshot_mmap(uint64_t bs, uint64_t* map_key_out) {
@@ -251,8 +337,8 @@ void efi_gop_init(uint64_t mb) {
     efi_log_hex("[gop] st=", st);
     efi_log_hex("[gop] st sig=", *(uint64_t*)st);
     uint64_t bs = *(uint64_t*)(st + 0x60);
-    if (bs == 0) {
-        efi_log("[gop] null boot services\n");
+    if (bs == 0 || bs + 0x148 >= 0x100000000ULL) {
+        efi_log_hex("[gop] bad boot services ", bs);
         return;
     }
     efi_log_hex("[gop] bs=", bs);
@@ -260,7 +346,9 @@ void efi_gop_init(uint64_t mb) {
     efi_log_hex("[gop] locate fn=", (uint64_t)(*(void**)(bs + 0x140)));
 
     /* probe 1: GetMemoryMap size-query must return BUFFER_TOO_SMALL when
-     * boot services are really alive (post-EBS they are gone) */
+     * boot services are really alive (post-EBS they are gone).  Anything
+     * else means GRUB did NOT keep them (or the firmware already recycled
+     * them): calling further just jumps into recycled memory. */
     {
         uint64_t sz = 0, key = 0, dsz = 0, dver = 0;
         uint64_t rc1 = efi_call5(*(void**)(bs + 0x38), (uint64_t)&sz, 0,
@@ -268,6 +356,10 @@ void efi_gop_init(uint64_t mb) {
                                  (uint64_t)&dver);
         efi_log_hex("[gop] mmap probe rc=", rc1);
         efi_log_hex("[gop] mmap need sz=", sz);
+        if (rc1 != EFI_BUFFER_TOO_SMALL) {
+            efi_log("[gop] boot services not alive, abort gop\n");
+            return;
+        }
     }
 
     /* probe 2: LocateHandleBuffer(ByProtocol, GOP, NULL, &n, &buf) */
@@ -370,7 +462,7 @@ void efi_gop_init(uint64_t mb) {
     uint64_t gop = 0;
     uint64_t rc = efi_call3(*(void**)(bs + 0x140),
                             (uint64_t)gop_guid, 0, (uint64_t)&gop);
-    if (rc != EFI_SUCCESS || gop == 0) {
+    if (rc != EFI_SUCCESS || gop == 0 || gop + 0x20 >= 0x100000000ULL) {
         efi_log_hex("[gop] gop_fail reason=locate rc=", rc);
         return;
     }
@@ -378,7 +470,7 @@ void efi_gop_init(uint64_t mb) {
     /* enumerate modes: first pass wants exactly 1024x768x32, second pass
      * accepts any 32bpp linear mode */
     uint64_t mode_ptr = *(uint64_t*)(gop + 0x18);
-    if (mode_ptr == 0) {
+    if (mode_ptr == 0 || mode_ptr + 8 >= 0x100000000ULL) {
         efi_log("[gop] gop_fail reason=modeptr\n");
         return;
     }
@@ -422,9 +514,12 @@ void efi_gop_init(uint64_t mb) {
 
     /* re-read the active mode: SetMode may refresh Mode->Info */
     mode_ptr = *(uint64_t*)(gop + 0x18);
-    uint64_t info = *(uint64_t*)(mode_ptr + 0x08);
-    uint64_t fbb  = *(uint64_t*)(mode_ptr + 0x18);
-    uint64_t fbs  = *(uint64_t*)(mode_ptr + 0x20);
+    uint64_t info = (mode_ptr == 0 || mode_ptr + 0x20 >= 0x100000000ULL)
+                        ? 0 : *(uint64_t*)(mode_ptr + 0x08);
+    uint64_t fbb  = (info == 0 || info + 36 >= 0x100000000ULL)
+                        ? 0 : *(uint64_t*)(mode_ptr + 0x18);
+    uint64_t fbs  = (mode_ptr == 0 || mode_ptr + 0x20 >= 0x100000000ULL)
+                        ? 0 : *(uint64_t*)(mode_ptr + 0x20);
     if (info == 0 || fbb == 0) {
         efi_log("[gop] gop_fail reason=info\n");
         return;
@@ -486,10 +581,76 @@ void efi_gop_init(uint64_t mb) {
     uint64_t ih = 0;
     uint8_t* ih_tag = mb2_find_tag(mb, MB2_TAG_EFI64_IH);
     if (ih_tag != NULL) ih = *(uint64_t*)(ih_tag + 8);
+    efi_log_hex("[gop] ebs map_key=", map_key);
+    efi_log_hex("[gop] ebs ih=", ih);
 
+    /* TPL probe: RaiseTPL(TPL_HIGH_LEVEL=31) is always a legal raise and
+     * returns the PREVIOUS (= current) level; RestoreTPL puts it back
+     * exactly.  ExitBootServices terminates the exit-boot-services event
+     * group, which deadlocks when the loader left TPL raised - force the
+     * level down to TPL_APPLICATION (4) in that case. */
+    uint64_t tpl = efi_call2(*(void**)(bs + 0x18), 31, 0);
+    efi_log_hex("[gop] current tpl=", tpl);
+    efi_call2(*(void**)(bs + 0x20), tpl, 0);
+    if (tpl > 4) {
+        efi_log("[gop] tpl raised, forcing TPL_APPLICATION\n");
+        efi_call2(*(void**)(bs + 0x20), 4, 0);
+        efi_log("[gop] tpl forced to 4\n");
+    }
+
+    /* VMware firmware: ExitBootServices deadlocks inside the firmware's
+     * own teardown when called from a multiboot2 keep_bs context (red
+     * block only, no fault marker - silent spin in DxeCore).  Every other
+     * boot service works, so PARK the firmware instead of exiting:
+     *   1. SetWatchdogTimer(0) - GRUB's launch armed the 5-minute EFI
+     *      watchdog; without EBS it never gets cancelled and would reset
+     *      the VM mid-run.
+     *   2. Timer Arch SetTimerPeriod(0) - stops the firmware's periodic
+     *      interrupt source (watchdog ticks, console/key polling).
+     * The memory-map snapshot above was taken BEFORE this point, so the
+     * PMM path is identical to the ebs_ok flow. */
+    fw_log_vendor(st);
+    if (fw_is_vmware(st)) {
+        efi_log("[gop] vmware firmware: skipping ebs, parking firmware\n");
+        uint64_t wrc = efi_call4(*(void**)(bs + 0x100), 0, 0x10000, 0, 0);
+        efi_log_hex("[gop] watchdog disarm rc=", wrc);
+        uint64_t tproto = 0;
+        /* gEfiTimerArchProtocolGuid 26BACCB1-6F42-11D4-BCE7-0080C73C8881,
+         * little-endian memory image */
+        static const uint8_t timer_guid[16] = {
+            0xB1, 0xCC, 0xBA, 0x26, 0x42, 0x6F, 0xD4, 0x11,
+            0xBC, 0xE7, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81
+        };
+        uint64_t trc = efi_call3(*(void**)(bs + 0x140), (uint64_t)timer_guid,
+                                 0, (uint64_t)&tproto);
+        efi_log_hex("[gop] timer proto rc=", trc);
+        if (trc == EFI_SUCCESS && tproto != 0) {
+            uint64_t trc2 = efi_call2(*(void**)(tproto + 0x08), tproto, 0);
+            efi_log_hex("[gop] timer stop rc=", trc2);
+        }
+        efi_log("[gop] ebs skipped (firmware parked)\n");
+        fb_debug_block(16, 64, 16, 16, 0xFFFF00);   /* yellow: parked */
+        fb_clear();
+        return;
+    }
+
+    /* Screen markers survive a serial outage (the firmware may reconfigure
+     * COM1 inside its exit-boot-services notifications).  Legend:
+     *   row1 x=16/64/112  EBS attempt 1/2/3 ENTERED (red/yellow/cyan)
+     *   row2 same x       attempt RETURNED
+     *   row3 x=16         green=ebs_ok, magenta=ebs_ok but UART wedged,
+     *                     blue=ebs_fail (read rc on serial),
+     *                     yellow=vmware firmware parked (ebs skipped)
+     */
+    static const uint32_t try_rgb[3] = { 0xFF0000, 0xFFFF00, 0x00FFFF };
     int ebs_done = 0;
     for (int attempt = 0; attempt < 3; attempt++) {
+        fb_debug_block(16 + attempt * 48, 16, 16, 16, try_rgb[attempt]);
+        char tbuf[17] = "[gop] ebs try= \n";
+        tbuf[14] = (char)('0' + attempt);
+        efi_log_b(tbuf);
         rc = efi_call2(*(void**)(bs + 0xE8), ih, map_key);
+        fb_debug_block(16 + attempt * 48, 40, 16, 16, try_rgb[attempt]);
         if (rc == EFI_SUCCESS) { ebs_done = 1; break; }
         /* stale MapKey: re-snapshot and retry */
         map_key = 0;
@@ -497,10 +658,14 @@ void efi_gop_init(uint64_t mb) {
         if (rc == EFI_INVALID_PARAMETER && efi_mmap_ok) continue;
         break;
     }
+    int uart_ok;
     if (ebs_done) {
-        efi_log("[gop] ebs_ok\n");
+        uart_ok = efi_log_b("[gop] ebs_ok\n");
+        fb_debug_block(16, 64, 16, 16, uart_ok ? 0x00FF00 : 0xFF00FF);
     } else {
-        efi_log_hex("[gop] ebs_fail rc=", rc);
+        uart_ok = efi_log_b("[gop] ebs_fail rc=") &&
+                  efi_log_hex_b("", rc);
+        fb_debug_block(16, 64, 16, 16, 0x0000FF);
     }
 
     fb_clear();

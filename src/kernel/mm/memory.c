@@ -555,15 +555,33 @@ void pmm_get_stats(uint64_t* total_pages, uint64_t* used_pages, uint64_t* free_p
 
 static uint64_t* vmm_pml4 = NULL;
 
+/* 5-level paging support: firmware may hand us CR4.LA57=1 (VMware UEFI).
+ * Then CR3 names a PML5, not a PML4, so every "root" this VMM hands out
+ * (proc->cr3, vmm_boot_root, vmm_active_root) is a CR3 VALUE - the PML4
+ * it actually edits is derived via mm_root_to_pml4(). Each address space
+ * owns a private PML5 shell whose [0] points at its PML4, so per-CPU CR3
+ * loads never alias. */
+static int vmm_la57 = 0;
+static uint64_t vmm_active_root = 0;   /* CR3 value of the active space */
+
 /* Boot address space (recorded in vmm_init): shared kernel mappings */
 static uint64_t vmm_boot_root = 0;
 static uint64_t* vmm_boot_pml4 = 0;   /* boot PML4 pointer */
 
+static uint64_t* mm_root_to_pml4(uint64_t root) {
+    uint64_t* page = (uint64_t*)(root & ~0xFFFULL);
+    if (vmm_la57) page = (uint64_t*)(page[0] & ~0xFFFULL);  /* PML5[0] */
+    return page;
+}
+
 void vmm_init(void) {
-    uint64_t cr3;
+    uint64_t cr3, cr4;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    vmm_pml4 = (uint64_t*)(cr3 & ~0xFFF);
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    vmm_la57 = (int)((cr4 >> 12) & 1);
     vmm_boot_root = cr3 & ~0xFFF;
+    vmm_active_root = vmm_boot_root;
+    vmm_pml4 = mm_root_to_pml4(vmm_boot_root);
     vmm_boot_pml4 = vmm_pml4;
 
     /* Enable EFER.NXE: user mappings set NX (PTE bit 63) on non-executable
@@ -754,17 +772,19 @@ uint64_t vmm_get_phys(uint64_t virt) {
 /* ======================================================================== */
 
 uint64_t vmm_current_root(void) {
-    return (uint64_t)vmm_pml4 & ~0xFFF;
+    return vmm_active_root;
 }
 
 void vmm_set_root_ptr(uint64_t phys) {
-    vmm_pml4 = (uint64_t*)(phys & ~0xFFF);
+    vmm_active_root = phys & ~0xFFF;
+    vmm_pml4 = mm_root_to_pml4(phys);
 }
 
 void vmm_switch_cr3(uint64_t phys) {
     static uint64_t active = 0;   /* dedupe: CR3 reload flushes the TLB */
     phys &= ~0xFFF;
-    vmm_pml4 = (uint64_t*)phys;
+    vmm_active_root = phys;
+    vmm_pml4 = mm_root_to_pml4(phys);
     if (active != phys) {
         active = phys;
         __asm__ volatile("mov %0, %%cr3" :: "r"(phys));
@@ -829,6 +849,24 @@ uint64_t vmm_create_address_space(void) {
     }
 
     pml4[0] = pdpt_phys | VMM_PRESENT | VMM_WRITABLE;
+
+    /* 5-level paging: wrap the PML4 in a private PML5 shell so the caller
+     * can load the returned value straight into CR3. */
+    if (vmm_la57) {
+        uint64_t pml5_phys = pmm_alloc_page();
+        if (!pml5_phys) {
+            pmm_free_page(pdpt_phys);
+            pmm_free_page(pml4_phys);
+            return 0;
+        }
+        uint64_t* pml5 = (uint64_t*)pml5_phys;
+        memset(pml5, 0, PAGE_SIZE);
+        /* USER is required here: the chain ANDs U/S across every level, so
+         * a supervisor-only PML5[0] would block ring-3 from the user half
+         * even though PML4[0] carries USER. */
+        pml5[0] = pml4_phys | VMM_PRESENT | VMM_WRITABLE | VMM_USER;
+        return pml5_phys;
+    }
     return pml4_phys;
 }
 
@@ -836,7 +874,7 @@ uint64_t vmm_create_address_space(void) {
  * pages (uvm_release_all) first. */
 void vmm_destroy_address_space(uint64_t root) {
     if (root == 0 || (root & ~0xFFF) == vmm_boot_root) return;
-    uint64_t* pml4 = (uint64_t*)(root & ~0xFFF);
+    uint64_t* pml4 = mm_root_to_pml4(root);
     uint64_t old = vmm_current_root();
 
     if (!(pml4[0] & VMM_PRESENT)) return;
@@ -854,7 +892,8 @@ void vmm_destroy_address_space(uint64_t root) {
         pmm_free_page(pdpt[i] & ~0xFFF);         /* the PD copy */
     }
     pmm_free_page(pml4[0] & ~0xFFF);             /* the PDPT copy */
-    pmm_free_page(root & ~0xFFF);                /* the PML4 */
+    pmm_free_page((uint64_t)pml4 & ~0xFFF);      /* the PML4 */
+    if (vmm_la57) pmm_free_page(root & ~0xFFF);  /* the PML5 shell */
 
     /* Restore the walk pointer if we just pulled it out */
     vmm_set_root_ptr(old);

@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/banner.svg" alt="kil0yOSnotCtOS" width="100%" />
   <h1>kil0yOS</h1>
-  <p><strong>一个带 Linux 兼容层的 64 位 x86-64 微内核操作系统</strong></p>
+  <p><strong>一个 64位 x86-64 操作系统</strong></p>
 
   <p>
     <a href="#">
@@ -35,7 +35,7 @@
 - PS/2 键盘和鼠标输入处理
 
 ### Linux 兼容层（Linux-ABI）
-- **可运行真实的 Linux x86-64 ELF 程序** — 静态、动态 PIE 及完整 ELF 解释器加载（`PT_INTERP`）：busybox 1.36.1（musl 静态，约 390 个 applet）、musl 动态 PIE、glibc 动态 PIE 程序均可运行
+- **可运行的 Linux x86-64 ELF 程序** — 静态、动态 PIE 及完整 ELF 解释器加载（`PT_INTERP`）：busybox 1.36.1（musl 静态，约 390 个 applet）、musl 动态 PIE、glibc 动态 PIE 程序均可运行
 - **进程模型**：`fork`/`vfork`/`clone`、`wait4`、`execve`，每进程独立地址空间；TTY 行规程（规范模式输入）
 - **Linux 系统调用层**（`syscall_lnx`）：约 60 个系统调用，含 `openat`、`statx`、`getdents64`、`mmap`（fd 映射）、`brk`、`readv`/`writev`、`poll`、`futex`/`rseq` 桩、`arch_prctl(SET_FS)` 及 socket 系列
 - **Linux VFS 垫片**（`lnxvfs`）：fd 表、stat/dirent 转换，桥接内部文件系统

@@ -104,6 +104,19 @@ static void cursor_draw(void) {
     cursor_drawn = 1;
 }
 
+/* solid color rectangle for boot-time diagnostics (EBS bring-up markers):
+ * usable before any terminal exists, survives as long as we don't clear */
+void fb_debug_block(int x, int y, int w, int h, uint32_t rgb) {
+    if (!active) return;
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= (int)h_) continue;
+        for (int xx = x; xx < x + w; xx++) {
+            if (xx < 0 || xx >= (int)w_) continue;
+            set_pixel(xx, yy, rgb);
+        }
+    }
+}
+
 void fb_scroll(void) {
     if (!active) return;
     uint32_t stride = pitch_ / 4;

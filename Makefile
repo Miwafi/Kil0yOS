@@ -312,7 +312,7 @@ $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 iso: $(BUILDDIR)/kil0yos.iso
 
 run: $(BUILDDIR)/kil0yos.iso
-	$(QEMU) -cdrom $(BUILDDIR)/kil0yos.iso -m 512M -nographic -serial stdio -netdev user,id=net0 -device rtl8139,netdev=net0
+	$(QEMU) -cdrom $(BUILDDIR)/kil0yos.iso -m 512M -display none -serial stdio -netdev user,id=net0 -device rtl8139,netdev=net0
 
 disk:
 	dd if=/dev/zero of=disk.img bs=512 count=4096
