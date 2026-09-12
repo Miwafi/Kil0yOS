@@ -2,6 +2,25 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.18.0] - 2026-09-12
+This release reshapes the GUI desktop into a **three-pane layout** with a Win-key start menu, replaces the PIT-rollover uptime with a **TSC-based monotonic clock**, and — the headline — boots from a **real USB stick on bare-metal BIOS machines** (`tools/make_usb.sh` writes a FAT16 MBR image; the VGA desktop runs unmodified on the stick-booted machine).
+
+### Added
+- **Three-pane desktop**: left function panel, right-top interactive shell, right-bottom kernel-log pane fed by a ring-buffer klog mirror (klog keeps working in graphics mode via serial-only output).
+- **Win-key start menu**: keyboard driver handles the E0-prefixed Win (E0 5B) and Menu (E0 5C/5D) make/break codes; Win opens the menu on the desktop, up/down + Enter switches panels.
+- **Bare-metal USB boot**: `tools/make_usb.sh` builds a FAT16 MBR USB image; headless QEMU screenshot harnesses (`tools/qemu_gfx_test.py`, `tools/gui_screentest.py`) verify the desktop visually; `BUILD.zh.md` documents the WSL build flow.
+- Real-machine photo (`assets/realmachine.jpg`) and refreshed screenshot assets (`textshell.png` replaces the removed `shellgui.png`).
+
+### Fixed
+- **Boot-time nested page fault**: the boot stack was enlarged and the page tables moved out of its overflow window (a stack overflow during boot used to walk over the heap/`.bss` page tables and nest #PFs).
+- **DHCP timeout stalls with IF=0**: uptime now comes from a PIT-calibrated TSC monotonic clock instead of the 32-bit PIT tick counter, so time never rolls over or stalls mid-lease.
+- **Recursive network poll stack overflow**: an `rx_busy` guard in `netif_poll` stops the ICMP-reply → ARP-resolve → poll-again recursion; DHCP/E1000 got progress logging along the way.
+- **Bounded RTC UIP wait**: the RTC read no longer spins forever if the update-in-progress flag sticks.
+- **8042 mouse init**: IRQ1 preemption shield so a keystroke during aux-init cannot corrupt the controller command sequence.
+
+### Changed
+- README/README.zh: GUI section rewritten for the three-pane desktop and USB-boot story; one-off debug scripts from finished bring-up sessions removed from `tools/`.
+
 ## [2.17.1] - 2026-09-10
 This release makes the keep_bs UEFI boot path survive **real VMware firmware**: the kernel now parks the firmware instead of calling ExitBootServices, recovers a PS/2 mouse left wedged by the firmware's own driver, and restores legacy (8259) interrupt delivery through the LAPIC so the keyboard works on UEFI boots. Every stage is observable through an extended serial heartbeat and visible fault markers.
 
