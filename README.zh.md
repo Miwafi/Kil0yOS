@@ -166,6 +166,7 @@ Kil0yOS 本身即 GPL-2.0，对上述 GPL 作品的参考在许可证上兼容�
 | QEMU | GPL-2.0 | 仅用于开发与无头验收测试。 |
 | [glibc](https://www.gnu.org/software/libc/) | LGPL-2.1 | 宿主机 `libc.so.6` / `ld-linux` 仅作为 Linux-ABI 兼容性测试（`hello-glibc`）的测试 blob 内嵌，不用于操作系统本体。 |
 | [musl libc](https://musl.libc.org/) | MIT | 构建期宿主机工具链的 libc，用于编译测试程序。 |
+
 ## 许可证
 
 GPL-2.0
