@@ -188,6 +188,35 @@ int ehci_init(pci_device_t* pci) {
     }
     op_base = cap + caplen;
 
+    /* ---- BIOS handoff: claim ownership from SMI firmware code ----
+     * HCCPARAMS (cap+8) bits 15:8 = first Extended Capability offset in
+     * bytes.  Capability ID 1 is USBLEGSUP: bit16 = BIOS owned (RO),
+     * bit24 = OS owned (write 1 to request).  Without this the BIOS's
+     * SMI handler fights our register writes and enumeration fails. */
+    {
+        uint32_t hccparams = *(volatile uint32_t*)(cap + 8);
+        uint32_t ecp = (hccparams >> 8) & 0xFF;
+        if (ecp) {
+            volatile uint32_t* lc = (volatile uint32_t*)(cap + ecp);
+            int guard = 32;                    /* capability chain bound */
+            while (guard-- > 0) {
+                uint32_t v = *lc;
+                if ((v & 0xFF) == 1) {         /* USBLEGSUP */
+                    if (v & (1u << 16)) {      /* BIOS owned */
+                        *lc = v | (1u << 24);  /* request OS ownership */
+                        int t = 5000;
+                        while ((*lc & (1u << 16)) && t-- > 0) pit_delay_ms(1);
+                        klog(t > 0 ? "[usb] EHCI: BIOS handoff ok\n"
+                                   : "[usb] EHCI: BIOS handoff timeout\n");
+                    }
+                    break;
+                }
+                uint32_t nx = (v >> 8) & 0xFF;
+                if (!nx) break;
+                lc += nx;
+            }
+        }
+    }
     /* stop, then reset the host controller */
     wr32(EHCI_USBCMD, rd32(EHCI_USBCMD) & ~EHCI_CMD_RUN);
     {

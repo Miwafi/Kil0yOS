@@ -340,6 +340,35 @@ int xhci_init(pci_device_t* pci) {
         xdb  = (volatile uint32_t*)(cap + dboff);
     }
 
+    /* ---- BIOS handoff: claim ownership from SMI firmware code ----
+     * Real firmware often leaves the controller BIOS-owned; our register
+     * writes then fight the SMI handler and every enumeration fails.
+     * Walk the extended capabilities for USB Legacy Support (ID 1) and,
+     * if the BIOS-owned semaphore is set, request OS ownership. */
+    {
+        uint32_t xecp = (hcc1 >> 16) & 0xFFFF;
+        if (xecp) {
+            volatile uint32_t* lc = (volatile uint32_t*)(cap + xecp * 4);
+            int guard = 32;                    /* extcap chain bound */
+            while (guard-- > 0) {
+                uint32_t v = *lc;
+                if ((v & 0xFF) == 1) {         /* USBLEGSUP */
+                    if (v & (1u << 16)) {      /* BIOS owned */
+                        *lc = v | (1u << 24);  /* request OS ownership */
+                        int t = 5000;
+                        while ((*lc & (1u << 16)) && t-- > 0) pit_delay_ms(1);
+                        klog(t > 0 ? "[usb] xHCI: BIOS handoff ok\n"
+                                   : "[usb] xHCI: BIOS handoff timeout\n");
+                    }
+                    break;
+                }
+                uint32_t nx = (v >> 8) & 0xFF;
+                if (!nx) break;
+                lc += nx;
+            }
+        }
+    }
+
     /* halt (if running) and reset the controller */
     w32(xop, XHCI_USBCMD, r32(xop, XHCI_USBCMD) & ~XHCI_CMD_RUN);
     {

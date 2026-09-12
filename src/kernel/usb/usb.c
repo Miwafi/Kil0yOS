@@ -171,11 +171,16 @@ static void clear_port_ignored(int parent, int port) {
 }
 
 static void enum_fail(usb_device_t* dev, const char* stage, int rc) {
-    klogf("[usb] enum failed at %s (rc=%d)\n", stage, rc);
+    klogf("[usb] enum failed at %s (rc=%d) - port ignored until replug\n",
+          stage, rc);
+    /* Remember the port, or usb_tick re-enumerates it every 10ms:
+     * each failed attempt burns seconds of IRQ0 time resetting the
+     * device - the whole machine appears hung and the keyboard
+     * power-cycles on every retry. */
+    mark_port_ignored(dev->parent, dev->hub_port);
     memset(dev, 0, sizeof(*dev));
     dev->state = USB_DEV_FREE;
 }
-
 static void unbind_device(usb_device_t* dev) {
     /* children first: a hub detach takes its downstream devices with it */
     for (int i = 0; i < USB_MAX_DEVICES; i++) {
