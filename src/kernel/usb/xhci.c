@@ -369,6 +369,23 @@ int xhci_init(pci_device_t* pci) {
         }
     }
 
+    /* ---- Intel PCH port routing: BIOSes boot with every USB2 port
+     * routed to EHCI, so full/high-speed devices never appear on the
+     * xHCI ports (they show up on the EHCI root instead, which we
+     * cannot drive without a companion).  Flip all switchable ports
+     * to xHCI (XUSB2PR, mask in USB2PRM) and enable SuperSpeed on the
+     * USB3 ports (USB3PSSEN, mask in USB3PRM) - the same handoff
+     * Linux does in usb_enable_intel_xhci_ports(). */
+    if (pci->vendor_id == 0x8086) {
+        uint16_t b = pci->bus, d = pci->device, f = pci->function;
+        uint32_t mask = pci_read_dword(b, d, f, 0xDC);
+        if (mask) pci_write_dword(b, d, f, 0xD8, mask);  /* USB3 SS en */
+        mask = pci_read_dword(b, d, f, 0xD4);
+        if (mask) {
+            pci_write_dword(b, d, f, 0xD0, mask);        /* to xHCI  */
+            klog("[usb] xHCI: Intel USB2 ports rerouted from EHCI\n");
+        }
+    }
     /* halt (if running) and reset the controller */
     w32(xop, XHCI_USBCMD, r32(xop, XHCI_USBCMD) & ~XHCI_CMD_RUN);
     {
