@@ -85,11 +85,14 @@ NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
            $(SRCDIR)/kernel/net/dhcp.c \
            $(SRCDIR)/kernel/net/tftp.c \
            $(SRCDIR)/kernel/net/rtl8139.c \
-           $(SRCDIR)/kernel/net/e1000.c
+           $(SRCDIR)/kernel/net/e1000.c \
+           $(SRCDIR)/kernel/net/mt7601u.c
 
-# --- USB (UHCI + core + HID) ---
+# --- USB (xHCI + EHCI + UHCI + core + HID + MT7601U Wi-Fi) ---
 USB_SRCS = $(SRCDIR)/kernel/usb/usb.c \
            $(SRCDIR)/kernel/usb/uhci.c \
+           $(SRCDIR)/kernel/usb/ehci.c \
+           $(SRCDIR)/kernel/usb/xhci.c \
            $(SRCDIR)/kernel/usb/hid.c
 
 # --- All kernel sources ---
@@ -230,6 +233,15 @@ $(BUILDDIR)/user_blob_mini.o: $(BUILDDIR)/user/mini
 .SECONDARY: $(BUILDDIR)/user/mmt
 MMT_BLOB_OBJ := $(BUILDDIR)/user_blob_mmt.o
 
+# --- mt7601u firmware blob (MediaTek, from linux-firmware; GPL-2.0
+# redistributable).  Embedded into .rodata for the USB Wi-Fi driver. ---
+MT_FW_SRC := assets/firmware/mt7601u.bin
+MT_FW_BLOB_OBJ := $(BUILDDIR)/mt7601u_fw_blob.o
+
+$(MT_FW_BLOB_OBJ): $(MT_FW_SRC)
+	printf 'section .rodata\nglobal mt7601u_fw_start\nmt7601u_fw_start:\nincbin "%s"\nglobal mt7601u_fw_end\nmt7601u_fw_end:\nsection .note.GNU-stack noalloc noexec nowrite progbits\n' '$<' > $(BUILDDIR)/mt7601u_fw_blob.s
+	$(AS) -f elf64 $(BUILDDIR)/mt7601u_fw_blob.s -o $@
+
 # --- nettest: freestanding TCP connect/GET probe (Phase 3.3, no libc) ---
 .SECONDARY: $(BUILDDIR)/user/nettest
 NETTEST_BLOB_OBJ := $(BUILDDIR)/user_blob_nettest.o
@@ -299,8 +311,8 @@ $(BUILDDIR)/kernel/core/ap_trampoline.o: $(BUILDDIR)/ap_trampoline.bin | $(BUILD
 # Dynamic-PIE acceptance program (musl-gcc) + ldso blob (musl libc.so)
 DYN_PROG_BLOB := $(if $(MUSL_GCC),$(BUILDDIR)/user_blob_hello-dyn.o,)
 
-$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB)
-	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) -o $@
+$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(MT_FW_BLOB_OBJ)
+	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(MT_FW_BLOB_OBJ) -o $@
 
 $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 	@mkdir -p $(BUILDDIR)/iso/boot/grub

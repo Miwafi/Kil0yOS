@@ -227,7 +227,9 @@ void usb_hid_probe_tick(void) {
         if (xfer != kbd_last_xfer) {
             kbd_last_xfer = xfer;
             kbd_silent = 0;
-        } else if (++kbd_silent >= HID_PROBE_TICKS) {
+        } else if (kbd_dev->hcd != USB_HCD_XHCI &&
+                   ++kbd_silent >= HID_PROBE_TICKS) {   /* xHCI: no NAK
+                     counting; an idle keyboard is normal, never unbind */
             klog("[usb] usb_kbd pipe silent - releasing bind\n");
             usb_hid_detach(kbd_dev);          /* restores the PS/2 keyboard */
         }
@@ -237,7 +239,8 @@ void usb_hid_probe_tick(void) {
         if (xfer != mouse_last_xfer) {
             mouse_last_xfer = xfer;
             mouse_silent = 0;
-        } else if (++mouse_silent >= HID_PROBE_TICKS) {
+        } else if (mouse_dev->hcd != USB_HCD_XHCI &&
+                   ++mouse_silent >= HID_PROBE_TICKS) {
             klog("[usb] usb_mouse pipe silent - releasing bind\n");
             usb_hid_detach(mouse_dev);        /* restores the PS/2 mouse */
         }

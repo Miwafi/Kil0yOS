@@ -22,6 +22,9 @@
  * every second; the mark is cleared when the port goes empty.
  */
 #include "usb/usb.h"
+#include "usb/ehci.h"
+#include "usb/xhci.h"
+#include "net/mt7601u.h"
 #include "drivers/pci.h"
 #include "timer/pit.h"
 #include "lib/string.h"
@@ -31,10 +34,33 @@
 #define USB_TICKS_PER_POLL 100      /* IRQ0 @100Hz -> poll ports ~1s */
 
 static usb_device_t devices[USB_MAX_DEVICES];
-static int usb_ready;               /* set only when a UHCI is present */
+static int usb_ready;               /* set when any HCD is present */
+static int uhci_up;
 static uint32_t tick_count;
-static int root_ignored;            /* bit(port-1): unsupported device on
-                                     * a root port - skip re-enumeration */
+static int root_ignored;            /* bit(port-1): unsupported UHCI device */
+static int root_ignored_ehci;       /* same for EHCI root ports */
+
+/* --- HCD-dispatched transfers ------------------------------------------- */
+
+int usb_control_xfer(usb_device_t* dev,
+                     uint8_t bmReq, uint8_t bReq,
+                     uint16_t wValue, uint16_t wIndex, int dir_in,
+                     uint8_t* data, uint16_t len, uint16_t* recv_len) {
+    if (dev->hcd == USB_HCD_EHCI)
+        return ehci_control_xfer(dev, bmReq, bReq, wValue, wIndex,
+                                 dir_in, data, len, recv_len);
+    if (dev->hcd == USB_HCD_XHCI)
+        return xhci_control_xfer(dev, bmReq, bReq, wValue, wIndex,
+                                 dir_in, data, len, recv_len);
+    return uhci_control_xfer(dev, bmReq, bReq, wValue, wIndex,
+                             dir_in, data, len, recv_len);
+}
+
+int usb_bulk_xfer(usb_device_t* dev, uint8_t ep_num, int dir_in,
+                  uint8_t* data, uint16_t len, uint16_t* recv_len) {
+    if (dev->hcd != USB_HCD_EHCI) return -5;    /* bulk is EHCI-only */
+    return ehci_bulk_xfer(dev, ep_num, dir_in, data, len, recv_len);
+}
 
 usb_device_t* usb_device_at(int slot) {
     if (slot < 0 || slot >= USB_MAX_DEVICES) return NULL;
@@ -125,6 +151,8 @@ static usb_device_t* device_on_parent(int parent, int port) {
 static void mark_port_ignored(int parent, int port) {
     if (parent == USB_ROOT_PARENT) {
         root_ignored |= 1u << (port - 1);
+    } else if (parent == USB_ROOT_EHCI) {
+        root_ignored_ehci |= 1u << (port - 1);
     } else {
         usb_device_t* hub = usb_device_at(parent);
         if (hub) hub->hub_ignored |= (uint16_t)(1u << (port - 1));
@@ -134,6 +162,8 @@ static void mark_port_ignored(int parent, int port) {
 static void clear_port_ignored(int parent, int port) {
     if (parent == USB_ROOT_PARENT) {
         root_ignored &= ~(1u << (port - 1));
+    } else if (parent == USB_ROOT_EHCI) {
+        root_ignored_ehci &= ~(1u << (port - 1));
     } else {
         usb_device_t* hub = usb_device_at(parent);
         if (hub) hub->hub_ignored &= (uint16_t)~(1u << (port - 1));
@@ -153,7 +183,9 @@ static void unbind_device(usb_device_t* dev) {
             unbind_device(&devices[i]);
     }
     if (dev->state == USB_DEV_RUNNING) {
-        uhci_unqueue_interrupt(dev);
+        if (dev->hcd == USB_HCD_UHCI) uhci_unqueue_interrupt(dev);
+        if (dev->hcd == USB_HCD_XHCI) xhci_stop_interrupt_in(dev);
+        if (dev->is_wifi) mt7601u_detach(dev);
         usb_hid_detach(dev);
     }
     if (dev->parent == USB_ROOT_PARENT) {
@@ -197,8 +229,8 @@ static int hub_get_status(usb_device_t* hub, int port,
                           uint16_t* status, uint16_t* change) {
     uint8_t buf[4];
     uint16_t got = 0;
-    int rc = uhci_control_xfer(hub, 0xA3, 0x00, 0x0000, (uint16_t)port,
-                               1, buf, 4, &got);
+    int rc = usb_control_xfer(hub, 0xA3, 0x00, 0x0000, (uint16_t)port,
+                              1, buf, 4, &got);
     if (rc != 0 || got < 4) return -1;
     *status = (uint16_t)(buf[0] | (buf[1] << 8));
     *change = (uint16_t)(buf[2] | (buf[3] << 8));
@@ -207,8 +239,8 @@ static int hub_get_status(usb_device_t* hub, int port,
 
 static int hub_feature(usb_device_t* hub, int port, uint8_t bReq,
                        uint16_t feature) {
-    return uhci_control_xfer(hub, 0x23, bReq, feature, (uint16_t)port,
-                             0, NULL, 0, NULL);
+    return usb_control_xfer(hub, 0x23, bReq, feature, (uint16_t)port,
+                            0, NULL, 0, NULL);
 }
 
 /* Reset one downstream hub port (blocking ~120 ms, IF=0 callers only). */
@@ -234,7 +266,7 @@ static int hub_port_reset(usb_device_t* hub, int port, uint8_t* low_speed) {
 static void hub_attach(usb_device_t* dev) {
     uint8_t hd[9];
     uint16_t got = 0;
-    int rc = uhci_control_xfer(dev, 0xA0, 0x06, 0x2900, 0, 1, hd, 9, &got);
+    int rc = usb_control_xfer(dev, 0xA0, 0x06, 0x2900, 0, 1, hd, 9, &got);
     if (rc != 0 || got < 3 || hd[1] != 0x29 || hd[2] == 0 || hd[2] > 15) {
         mark_port_ignored(dev->parent, dev->hub_port);
         klogf("[usb] hub descriptor failed (rc=%d got=%d) - ignored\n",
@@ -273,6 +305,11 @@ static void hub_poll(usb_device_t* hub) {
 
 /* --- enumeration -------------------------------------------------------- */
 
+/* bmAttributes == bulk */
+static inline int ep_is_bulk(const uint8_t* ep_desc) {
+    return (ep_desc[2] & 0x03) == 0x02;
+}
+
 /* Synchronous enumeration of a freshly (re)powered port.  Blocks for a
  * few hundred ms via pit_delay_ms (poll-based, safe inside IRQ0). */
 static void enumerate_port(int parent_slot, int port_no) {
@@ -293,12 +330,48 @@ static void enumerate_port(int parent_slot, int port_no) {
                       ? USB_ROOT_PARENT : (uint8_t)parent_slot;
     dev->hub_port = (uint8_t)port_no;
 
-    /* reset + speed detect (root: PORTSC, hub: SET_PORT_RESET) */
+    /* reset + speed detect (UHCI root: PORTSC, EHCI root: PORTSC +
+     * high-speed check, hub: SET_PORT_RESET) */
     if (parent_slot == USB_ROOT_PARENT) {
         uhci_port_reset(port_no);
         dev->low_speed = (uint8_t)uhci_port_low_speed(port_no);
+        dev->hcd = USB_HCD_UHCI;
+    } else if (parent_slot == USB_ROOT_EHCI) {
+        dev->hcd = USB_HCD_EHCI;
+        if (ehci_port_reset(port_no) != 0) {
+            /* full/low-speed device: no companion handoff, cannot drive */
+            mark_port_ignored(parent_slot, port_no);
+            klogf("[usb] non-high-speed device on EHCI port %d - ignored\n",
+                  port_no);
+            memset(dev, 0, sizeof(*dev));
+            dev->state = USB_DEV_FREE;
+            return;
+        }
+        dev->low_speed = 0;
+    } else if (parent_slot == USB_ROOT_XHCI) {
+        dev->hcd = USB_HCD_XHCI;
+        int speed = xhci_port_reset(port_no);
+        if (speed == 0 || speed >= 4) {
+            /* nothing connected, or a SuperSpeed device (no SS stack yet) */
+            mark_port_ignored(parent_slot, port_no);
+            klogf("[usb] unusable device on xHCI port %d (speed %d) - "
+                  "ignored\n", port_no, speed);
+            memset(dev, 0, sizeof(*dev));
+            dev->state = USB_DEV_FREE;
+            return;
+        }
+        dev->low_speed = (speed == 2) ? 1 : 0;
+        /* EnableSlot + AddressDevice: the device is addressed right here,
+         * steps 1-5 below then run against its (slot) address */
+        if (xhci_enumerate(dev, port_no, speed) != 0) {
+            mark_port_ignored(parent_slot, port_no);
+            memset(dev, 0, sizeof(*dev));
+            dev->state = USB_DEV_FREE;
+            return;
+        }
     } else {
         usb_device_t* hub = usb_device_at(parent_slot);
+        dev->hcd = hub ? hub->hcd : USB_HCD_UHCI;
         if (hub == NULL || hub->state != USB_DEV_RUNNING ||
             hub_port_reset(hub, port_no, &dev->low_speed) != 0) {
             enum_fail(dev, "hub_reset", -1);
@@ -312,40 +385,48 @@ static void enumerate_port(int parent_slot, int port_no) {
     int rc;
 
     /* 1. GET_DESCRIPTOR(Device, 8) at address 0 -> bMaxPacketSize0 */
-    rc = uhci_control_xfer(dev, 0x80, 0x06, 0x0100, 0, 1, buf, 8, &got);
+    rc = usb_control_xfer(dev, 0x80, 0x06, 0x0100, 0, 1, buf, 8, &got);
     if (rc != 0 || got < 8) { enum_fail(dev, "get_desc8", rc); return; }
     dev->ep_mps = buf[7];
     if (dev->ep_mps < 8)  dev->ep_mps = 8;
     if (dev->ep_mps > 64) dev->ep_mps = 64;
 
-    /* 2. SET_ADDRESS (unique 1..USB_MAX_DEVICES), then let it settle */
-    rc = uhci_control_xfer(dev, 0x00, 0x05, (uint16_t)(slot + 1), 0,
-                           0, NULL, 0, NULL);
-    if (rc != 0) { enum_fail(dev, "set_address", rc); return; }
-    dev->address = (uint8_t)(slot + 1);
-    pit_delay_ms(10);
+    /* 2. SET_ADDRESS (unique 1..USB_MAX_DEVICES), then let it settle.
+     *    xHCI: skipped - AddressDevice(BAA) already assigned the slot id. */
+    if (dev->hcd != USB_HCD_XHCI) {
+        rc = usb_control_xfer(dev, 0x00, 0x05, (uint16_t)(slot + 1), 0,
+                              0, NULL, 0, NULL);
+        if (rc != 0) { enum_fail(dev, "set_address", rc); return; }
+        dev->address = (uint8_t)(slot + 1);
+        pit_delay_ms(10);
+    }
 
     /* 3. GET_DESCRIPTOR(Device, 18) -> class + vid:pid */
-    rc = uhci_control_xfer(dev, 0x80, 0x06, 0x0100, 0, 1, buf, 18, &got);
+    rc = usb_control_xfer(dev, 0x80, 0x06, 0x0100, 0, 1, buf, 18, &got);
     if (rc != 0 || got < 18) { enum_fail(dev, "get_desc18", rc); return; }
     dev->device_class = buf[4];
     dev->vendor_id  = (uint16_t)(buf[8] | (buf[9] << 8));
     dev->product_id = (uint16_t)(buf[10] | (buf[11] << 8));
+    dev->is_wifi = (uint8_t)mt7601u_matches(dev->vendor_id, dev->product_id);
 
     /* 4. GET_DESCRIPTOR(Config): 9-byte header then the full chain */
-    rc = uhci_control_xfer(dev, 0x80, 0x06, 0x0200, 0, 1, buf, 9, &got);
+    rc = usb_control_xfer(dev, 0x80, 0x06, 0x0200, 0, 1, buf, 9, &got);
     if (rc != 0 || got < 9) { enum_fail(dev, "get_cfg9", rc); return; }
     uint16_t total =
         (uint16_t)(((usb_desc_config_t*)buf)->wTotalLength);
     if (total < 9) total = 9;
     if (total > sizeof(buf)) total = sizeof(buf);
-    rc = uhci_control_xfer(dev, 0x80, 0x06, 0x0200, 0, 1, buf, total, &got);
+    rc = usb_control_xfer(dev, 0x80, 0x06, 0x0200, 0, 1, buf, total, &got);
     if (rc != 0 || got < total) { enum_fail(dev, "get_cfg", rc); return; }
 
     /* 5. walk the descriptor chain: HID boot interface + its interrupt
-     *    IN endpoint (or a hub interface) */
+     *    IN endpoint (or a hub interface); Wi-Fi devices: their bulk
+     *    endpoint layout (descriptor order matches the Linux driver's
+     *    in_eps[]/out_eps[] indexing) */
     int matched = 0;
     int saw_hub = 0;
+    int wifi_iface = 0;
+    int in_i = 0, out_i = 0;
     int off = 0;
     while (off + 2 <= (int)got) {
         uint8_t len = buf[off];
@@ -363,6 +444,8 @@ static void enumerate_port(int parent_slot, int port_no) {
             } else {
                 matched = 0;
             }
+            wifi_iface = (dev->is_wifi &&
+                          ifc->bInterfaceClass == 0xFF);
             if (ifc->bInterfaceClass == 9) saw_hub = 1;
         } else if (type == DESC_ENDPOINT && matched && dev->ep_addr == 0) {
             usb_desc_endpoint_t* ep = (usb_desc_endpoint_t*)(buf + off);
@@ -375,15 +458,53 @@ static void enumerate_port(int parent_slot, int port_no) {
                 dev->ep_mps = (uint8_t)mps;
                 dev->ep_interval = ep->bInterval;
             }
+        } else if (type == DESC_ENDPOINT && wifi_iface &&
+                   (ep_is_bulk(buf + off))) {
+            usb_desc_endpoint_t* ep = (usb_desc_endpoint_t*)(buf + off);
+            uint16_t mps = ep->wMaxPacketSize & 0x7FF;
+            if (ep->bEndpointAddress & 0x80) {
+                if (in_i < USB_MAX_BULK_IN) {
+                    dev->bulk_in[in_i++] = ep->bEndpointAddress;
+                    if (mps > dev->bulk_in_mps) dev->bulk_in_mps = mps;
+                }
+            } else {
+                if (out_i < USB_MAX_BULK_OUT) {
+                    dev->bulk_out[out_i++] = ep->bEndpointAddress & 0x0F;
+                    if (mps > dev->bulk_out_mps) dev->bulk_out_mps = mps;
+                }
+            }
         }
         off += len;
     }
 
     /* 6a. hub dispatch: SET_CONFIGURATION, then read the hub descriptor */
     if (dev->device_class == 9 || saw_hub) {
-        rc = uhci_control_xfer(dev, 0x00, 0x09, 0x0001, 0, 0, NULL, 0, NULL);
+        rc = usb_control_xfer(dev, 0x00, 0x09, 0x0001, 0, 0, NULL, 0, NULL);
         if (rc != 0) { enum_fail(dev, "set_config", rc); return; }
         hub_attach(dev);
+        return;
+    }
+
+    /* 6a2. MT7601U Wi-Fi dongle: SET_CONFIGURATION then hand the device
+     *      to the driver (init + firmware upload run right here, in the
+     *      boot/IRQ0 context, IF=0) */
+    if (dev->is_wifi) {
+        if (dev->hcd != USB_HCD_EHCI) {
+            mark_port_ignored(parent_slot, port_no);
+            klog("[usb] wifi dongle on a UHCI path - USB 2.0 required\n");
+            memset(dev, 0, sizeof(*dev));
+            dev->state = USB_DEV_FREE;
+            return;
+        }
+        rc = usb_control_xfer(dev, 0x00, 0x09, 0x0001, 0, 0, NULL, 0, NULL);
+        if (rc != 0) { enum_fail(dev, "set_config", rc); return; }
+        dev->state = USB_DEV_RUNNING;
+        klogf("[usb] mt7601u wifi %04x:%04x (addr %d, in %02x/%02x out "
+              "%02x..%02x mps %d)\n",
+              dev->vendor_id, dev->product_id, dev->address,
+              dev->bulk_in[0], dev->bulk_in[1],
+              dev->bulk_out[0], dev->bulk_out[5], dev->bulk_out_mps);
+        mt7601u_attach(dev);
         return;
     }
 
@@ -401,14 +522,27 @@ static void enumerate_port(int parent_slot, int port_no) {
 
     /* 6c. SET_CONFIGURATION(1) + HID boot protocol (SET_PROTOCOL(0),
      *     SET_IDLE(0)); class requests carry bmRequestType 0x21 */
-    rc = uhci_control_xfer(dev, 0x00, 0x09, 0x0001, 0, 0, NULL, 0, NULL);
+    rc = usb_control_xfer(dev, 0x00, 0x09, 0x0001, 0, 0, NULL, 0, NULL);
     if (rc != 0) { enum_fail(dev, "set_config", rc); return; }
-    uhci_control_xfer(dev, 0x21, 0x0B, 0x0000, 0, 0, NULL, 0, NULL);
-    uhci_control_xfer(dev, 0x21, 0x0A, 0x0000, 0, 0, NULL, 0, NULL);
+    usb_control_xfer(dev, 0x21, 0x0B, 0x0000, 0, 0, NULL, 0, NULL);
+    usb_control_xfer(dev, 0x21, 0x0A, 0x0000, 0, 0, NULL, 0, NULL);
 
-    /* 7. bind the HID driver and start the interrupt IN pipe */
+    /* 7. bind the HID driver and start the interrupt IN pipe (UHCI and
+     *    xHCI; the EHCI HCD has no periodic schedule yet, so HID on an
+     *    EHCI port enumerates but delivers no reports) */
     usb_hid_attach(dev);
-    uhci_queue_interrupt(dev);
+    if (dev->hcd == USB_HCD_UHCI) {
+        uhci_queue_interrupt(dev);
+    } else if (dev->hcd == USB_HCD_XHCI) {
+        if (xhci_start_interrupt_in(dev, dev->ep_addr, dev->ep_mps,
+                                    dev->ep_interval) != 0) {
+            mark_port_ignored(parent_slot, port_no);
+            klog("[usb] xHCI interrupt IN setup failed\n");
+        }
+    } else {
+        mark_port_ignored(parent_slot, port_no);
+        klog("[usb] HID on EHCI: no interrupt schedule - reports off\n");
+    }
     dev->state = USB_DEV_RUNNING;
     klogf("[usb] %s plugged (addr %d, %04x:%04x, ep %02x mps %d, %s)\n",
           dev->if_protocol == 1 ? "usb_kbd" : "usb_mouse",
@@ -422,19 +556,60 @@ static void enumerate_port(int parent_slot, int port_no) {
 /* --- boot init ---------------------------------------------------------- */
 
 void usb_init(void) {
-    pci_device_t* pci = pci_find_class(0x0C, 0x03);
-    if (pci == NULL ||
-        pci_read_byte(pci->bus, pci->device, pci->function, 0x09) != 0x00) {
-        klog("[usb] no UHCI controller - USB disabled\n");
+    /* probe every PCI USB controller:
+     * PI byte 0x00 = UHCI, 0x20 = EHCI, 0x30 = xHCI */
+    pci_device_t* uhci_pci = NULL;
+    pci_device_t* ehci_pci = NULL;
+    pci_device_t* xhci_pci = NULL;
+    for (pci_device_t* d = pci_get_device_list(); d; d = d->next) {
+        if (d->class_code != 0x0C || d->subclass_code != 0x03) continue;
+        uint8_t pi = pci_read_byte(d->bus, d->device, d->function, 0x09);
+        if (pi == 0x00 && !uhci_pci) uhci_pci = d;
+        if (pi == 0x20 && !ehci_pci) ehci_pci = d;
+        if (pi == 0x30 && !xhci_pci) xhci_pci = d;
+    }
+
+    if (uhci_pci) {
+        if (uhci_init(uhci_pci) == 0) uhci_up = 1;
+    } else {
+        klog("[usb] no UHCI controller\n");
+    }
+    if (ehci_pci) {
+        if (ehci_init(ehci_pci) != 0) {
+            klog("[usb] EHCI init failed\n");
+        }
+    } else {
+        klog("[usb] no EHCI controller - USB 2.0 devices unavailable\n");
+    }
+    if (xhci_pci) {
+        if (xhci_init(xhci_pci) != 0) {
+            klog("[usb] xHCI init failed\n");
+        }
+    } else {
+        klog("[usb] no xHCI controller\n");
+    }
+    if (!uhci_up && !ehci_ready() && !xhci_ready()) {
+        klog("[usb] no usable HCD - USB disabled\n");
         return;
     }
-    if (uhci_init(pci) != 0) return;
 
     usb_ready = 1;
-    for (int port = 1; port <= 2; port++) {
-        uhci_clear_port_change(port);
-        if (!uhci_port_connected(port)) continue;
-        enumerate_port(USB_ROOT_PARENT, port);
+    if (uhci_up) {
+        for (int port = 1; port <= 2; port++) {
+            uhci_clear_port_change(port);
+            if (!uhci_port_connected(port)) continue;
+            enumerate_port(USB_ROOT_PARENT, port);
+        }
+    }
+    for (int port = 1; port <= ehci_port_count(); port++) {
+        ehci_clear_port_change(port);
+        if (!ehci_port_connected(port)) continue;
+        enumerate_port(USB_ROOT_EHCI, port);
+    }
+    for (int port = 1; port <= xhci_port_count(); port++) {
+        xhci_clear_port_change(port);
+        if (!xhci_port_connected(port)) continue;
+        enumerate_port(USB_ROOT_XHCI, port);
     }
     klog("[usb] usb_enumerated\n");
 }
@@ -444,8 +619,9 @@ void usb_init(void) {
 void usb_tick(void) {
     if (!usb_ready) return;
 
-    /* every tick: consume completed interrupt TDs (reports @ ~100Hz) */
-    uhci_idle_requeue();
+    /* every tick: consume completed interrupt TDs / event ring entries */
+    if (uhci_up) uhci_idle_requeue();
+    xhci_poll();
 
     /* ~1s cadence: root-hub + hub port polling (no port-change IRQ) */
     if (++tick_count < USB_TICKS_PER_POLL) return;
@@ -455,6 +631,7 @@ void usb_tick(void) {
     usb_hid_probe_tick();
 
     for (int port = 1; port <= 2; port++) {
+        if (!uhci_up) break;
         int conn = uhci_port_connected(port);
         uhci_clear_port_change(port);
         usb_device_t* dev = device_on_parent(USB_ROOT_PARENT, port);
@@ -465,6 +642,20 @@ void usb_tick(void) {
                    !(root_ignored & (1u << (port - 1)))) {
             klogf("[usb] device attached on port %d\n", port);
             enumerate_port(USB_ROOT_PARENT, port);
+        }
+    }
+
+    for (int port = 1; port <= ehci_port_count(); port++) {
+        int conn = ehci_port_connected(port);
+        ehci_clear_port_change(port);
+        usb_device_t* dev = device_on_parent(USB_ROOT_EHCI, port);
+        if (!conn) {
+            clear_port_ignored(USB_ROOT_EHCI, port);
+            if (dev != NULL) unbind_device(dev);
+        } else if (dev == NULL &&
+                   !(root_ignored_ehci & (1u << (port - 1)))) {
+            klogf("[usb] device attached on EHCI port %d\n", port);
+            enumerate_port(USB_ROOT_EHCI, port);
         }
     }
 
@@ -486,10 +677,12 @@ void usb_tick(void) {
 void usb_dump(void) {
     klog("[usb] ==== USB status ====\n");
     if (!usb_ready) {
-        klog("[usb] no UHCI controller (USB disabled)\n");
+        klog("[usb] no USB controller (USB disabled)\n");
         return;
     }
-    uhci_dump_controller();
+    if (uhci_up) uhci_dump_controller();
+    if (ehci_ready()) ehci_dump_controller();
+    if (xhci_ready()) xhci_dump_controller();
     for (int i = 0; i < USB_MAX_DEVICES; i++) {
         usb_device_t* dev = &devices[i];
         if (dev->state == USB_DEV_FREE) {
@@ -522,6 +715,9 @@ void usb_dump(void) {
             klogf("[usb]   nak %u reports %u %s\n",
                   dev->nak_count, dev->report_count,
                   dev->dead ? "DEAD" : "ok");
+        }
+        if (dev->is_wifi) {
+            mt7601u_dump(dev);
         }
     }
 }

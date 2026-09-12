@@ -96,6 +96,15 @@ typedef struct usb_qh {
 #define USB_MAX_DEVICES 4
 #define USB_MAX_INTERFACES 4
 #define USB_ROOT_PARENT 0xFF      /* dev->parent sentinel: UHCI root port */
+#define USB_ROOT_EHCI   0xFE      /* dev->parent sentinel: EHCI root port */
+#define USB_ROOT_XHCI   0xFD      /* dev->parent sentinel: xHCI root port */
+
+#define USB_HCD_UHCI 0
+#define USB_HCD_EHCI 1
+#define USB_HCD_XHCI 2
+
+#define USB_MAX_BULK_IN   2       /* MT7601U: pkt rx + cmd resp */
+#define USB_MAX_BULK_OUT  6       /* MT7601U: inband + 4 AC + HCCA */
 
 typedef struct usb_device usb_device_t;
 typedef void (*usb_report_fn)(usb_device_t* dev, const uint8_t* data, int len);
@@ -111,9 +120,10 @@ struct usb_device {
     int      slot;            /* 0..USB_MAX_DEVICES-1, index into int_qh[] */
     uint8_t  address;         /* 1..USB_MAX_DEVICES; 0 before SET_ADDRESS */
     uint8_t  parent;          /* device slot of parent hub (USB_ROOT_PARENT
-                               * = plugged into a UHCI root port) */
+                               * = UHCI root port, USB_ROOT_EHCI = EHCI) */
     uint8_t  hub_port;        /* port number on parent (root: 1..2) */
     uint8_t  low_speed;
+    uint8_t  hcd;             /* USB_HCD_*: which controller owns this dev */
     uint8_t  device_class;    /* bDeviceClass (9 = hub) */
     uint8_t  if_class;        /* 3 = HID */
     uint8_t  if_protocol;     /* HID bInterfaceProtocol: 1 kbd, 2 mouse */
@@ -134,6 +144,19 @@ struct usb_device {
     usb_report_fn on_report;
     usb_td_t* int_td;         /* interrupt IN TD (in the UHCI TD pool) */
     uint8_t  int_buf[8];      /* DMA buffer for the interrupt report */
+
+    /* --- vendor (Wi-Fi) device extensions (EHCI bulk pipes) --- */
+    uint8_t  is_wifi;         /* matched the MT7601U ID table */
+    uint8_t  bulk_in[USB_MAX_BULK_IN];    /* IN endpoint numbers (0x81...) */
+    uint8_t  bulk_out[USB_MAX_BULK_OUT];  /* OUT endpoint numbers (1..5) */
+    uint16_t bulk_in_mps;
+    uint16_t bulk_out_mps;
+    /* control-transfer request block (EHCI path builds SETUP from this) */
+    uint8_t  pending_bmReq, pending_bReq;
+    uint16_t pending_wValue, pending_wIndex;
+    /* --- xHCI extensions --- */
+    uint8_t  xhci_slot;       /* slot id (== USB address once addressed) */
+    uint8_t  xhci_in_ep;      /* interrupt IN endpoint address (0x81) */
 };
 
 /* core (usb.c) */
@@ -141,6 +164,18 @@ usb_device_t* usb_device_at(int slot);  /* device-table slot lookup (uhci.c) */
 void usb_init(void);
 void usb_tick(void);          /* IRQ0 context, every 10ms (isr.c) */
 void usb_dump(void);          /* shell `usb` command */
+
+/* HCD-dispatched control transfer: routes by dev->hcd to the UHCI or the
+ * EHCI queue.  Same semantics as uhci_control_xfer. */
+int usb_control_xfer(usb_device_t* dev,
+                     uint8_t bmReq, uint8_t bReq,
+                     uint16_t wValue, uint16_t wIndex,
+                     int dir_in,
+                     uint8_t* data, uint16_t len,
+                     uint16_t* recv_len);
+/* Blocking bulk transfer over the EHCI schedule (USB 2.0 devices only). */
+int usb_bulk_xfer(usb_device_t* dev, uint8_t ep_num, int dir_in,
+                  uint8_t* data, uint16_t len, uint16_t* recv_len);
 
 /* HID drivers (hid.c) */
 void usb_hid_attach(usb_device_t* dev);
