@@ -168,6 +168,7 @@ re-download the exact reference sources for auditability.
 | QEMU | GPL-2.0 | Development and headless acceptance testing only. |
 | [glibc](https://www.gnu.org/software/libc/) | LGPL-2.1 | Host `libc.so.6` / `ld-linux` are embedded as blobs **only** for Linux-ABI compatibility tests (`hello-glibc`), never for the OS itself. |
 | [musl libc](https://musl.libc.org/) | MIT | Host toolchain libc used to build test programs at build time. |
+
 ## License
 
 GPL-2.0
