@@ -35,6 +35,7 @@ extern netif_t g_netif;
 int  netif_init(void);
 const char* netif_probe(void);
 void netif_poll(void);
+int  netif_poll_busy(void);
 void netif_receive(const uint8_t* data, uint16_t len);
 int  netif_send(const uint8_t* data, uint16_t len);
 void netif_get_mac(uint8_t* out_mac);

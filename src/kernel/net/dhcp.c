@@ -101,8 +101,11 @@ static int dhcp_wait(netif_t* iface, udp_socket_t* sock, uint8_t expect_type,
     uint8_t buf[NET_MAX_PACKET];
     int found = -1;
 
-    /* Timeout driven by pit_uptime_us() - the same validated clock as the
-     * boot-log timestamps. (pit_delay_ms under-delays in this context.) */
+    /* Timeout driven by pit_uptime_us() (TSC-based: monotonic and
+     * IF-independent). The entry log marks the window start - if a boot
+     * ever freezes after this line, the stall is inside the poll loop. */
+    klog(expect_type == DHCP_OFFER ? "dhcp: waiting for OFFER\n"
+                                   : "dhcp: waiting for ACK\n");
     uint64_t deadline = pit_uptime_us() + (uint64_t)timeout_ms * 1000ULL;
     for (;;) {
         netif_poll();
@@ -165,6 +168,11 @@ check_deadline:
 #define DHCP_ATTEMPTS 2
 
 int dhcp_autoconfig(netif_t* iface) {
+    /* Checkpoint logs bisect the first-boot freeze window: the log used to
+     * end right after "net: E1000 found" with zero further output, so every
+     * step between socket setup and the ACK wait marks itself on serial. */
+    klog("dhcp: autoconfig start\n");
+
     /* xid: MAC-derived for uniqueness across reboots, mixed with the boot
      * uptime so a passive observer cannot precompute it. */
     dhcp_xid = ((uint32_t)iface->mac[2] << 24) | ((uint32_t)iface->mac[3] << 16) |
@@ -178,21 +186,27 @@ int dhcp_autoconfig(netif_t* iface) {
     udp_socket_t* sock = udp_socket_create();
     if (!sock) return -1;
     udp_bind(sock, DHCP_CLIENT_PORT);
+    klog("dhcp: socket bound\n");
 
     int rc = -1;
     uint32_t yiaddr = 0, subnet = 0, router = 0, server_id = 0;
 
     /* ---- DISCOVER -> OFFER (basic retry, same xid per RFC) ---- */
+    /* Per-attempt klog: DHCP_ATTEMPTS x 4s of silence on a cold VMware
+     * boot looks exactly like a hang - mark every attempt. */
     for (int attempt = 0; attempt < DHCP_ATTEMPTS; attempt++) {
+        if (attempt > 0) klog("dhcp: DISCOVER retry\n");
         if (dhcp_send(iface, sock, DHCP_DISCOVER, 0, 0) < 0) {
             klog("dhcp: send DISCOVER failed\n");
             goto out;
         }
+        klog("dhcp: DISCOVER sent\n");
         if (dhcp_wait(iface, sock, DHCP_OFFER, 4000,
                       &yiaddr, &subnet, &router, &server_id) >= 0) {
             heap_verify("dhcp-offer");
             break;
         }
+        klog("dhcp: OFFER wait timeout\n");
     }
     if (yiaddr == 0) {
         klog("dhcp: no OFFER received\n");
@@ -201,7 +215,9 @@ int dhcp_autoconfig(netif_t* iface) {
 
     /* ---- REQUEST -> ACK ---- */
     for (int attempt = 0; attempt < DHCP_ATTEMPTS; attempt++) {
+        if (attempt > 0) klog("dhcp: REQUEST retry\n");
         if (dhcp_send(iface, sock, DHCP_REQUEST, yiaddr, server_id) < 0) goto out;
+        klog("dhcp: REQUEST sent\n");
 
         uint32_t ack_yiaddr = 0, ack_subnet = 0, ack_router = 0, ack_server = 0;
         if (dhcp_wait(iface, sock, DHCP_ACK, 4000,
@@ -212,6 +228,7 @@ int dhcp_autoconfig(netif_t* iface) {
             rc = 0;
             break;
         }
+        klog("dhcp: ACK wait timeout\n");
     }
 
 out:

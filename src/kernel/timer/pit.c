@@ -13,37 +13,37 @@ volatile uint64_t pit_ticks = 0;
 
 static uint16_t pit_read_counter(void);
 static uint64_t pit_poll_elapsed_us(void);
+static void tsc_calibrate(void);
 
-/* Uptime in microseconds. Two regimes:
- *  - Once IRQ0 has ticked at least once (pit_ticks != 0), the tick clock
- *    is used everywhere - including interrupt context, where pushfq would
- *    report IF=0 and a dual-clock design would hand out a different time
- *    than mainline code (breaks ARP timestamps, deadlines...). One clock
- *    source after the switch point, always.
- *  - Before the first tick (boot/DHCP with IF=0), pure polling of the
- *    countdown register - accurate while sampled more often than a tick. */
+/* Uptime in microseconds, TSC-based.
+ *
+ * Why not PIT ticks: the old dual-regime design (tick count + in-period
+ * interpolation) had two failure modes, both observed on VMware:
+ *  - Sampling race: pit_ticks was read AFTER the countdown register, so a
+ *    tick landing between the two reads made uptime overshoot by ~one
+ *    period and snap back on the next call - the ~9-10ms BACKWARD jumps
+ *    visible throughout the boot log.
+ *  - Frozen ticks: with IF=0 (the whole boot until enable_interrupts)
+ *    IRQ0 never fires, pit_ticks stays at its last value and the
+ *    interpolated component sawtooths inside a 10ms window. dhcp_wait's
+ *    4s deadline then became unreachable - the first cold boot froze
+ *    forever inside the DHCP wait with zero further output.
+ * The TSC is monotonic, needs no interrupts, and has no sampling race.
+ * It is calibrated once against the polled PIT countdown (which only
+ * serves as the fallback if calibration fails). x86-64 guarantees RDTSC. */
+static uint64_t tsc_base   = 0;  /* TSC value at pit_init()          */
+static uint64_t tsc_per_us = 0;  /* calibrated TSC counts per us     */
+static int      tsc_ready  = 0;
+
+static inline uint64_t pit_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 uint64_t pit_uptime_us(void) {
-    uint64_t tick_us = ((uint64_t)pit_divisor * 1000000ULL) / PIT_BASE_FREQ;
-
-    if (pit_ticks != 0) {
-        /* First tick-mode call: anchor the tick clock to the polling clock
-         * so uptime does not jump backwards when the regime switches
-         * (pit_ticks only starts counting once IRQ0 is delivered). */
-        static uint64_t base_offset = 0;
-        static int base_valid = 0;
-        if (base_valid == 0) {
-            base_valid = 1; /* reentrancy guard: set before reading */
-            base_offset = pit_poll_elapsed_us() - pit_ticks * tick_us;
-        }
-        uint16_t cur = pit_read_counter();
-        /* Clamp: a count above the divisor would wrap the uint32
-         * subtraction below and jump uptime by hours. */
-        uint64_t sub = 0;
-        if (cur <= pit_divisor)
-            sub = ((uint64_t)(pit_divisor - cur)) * 1000000ULL / PIT_BASE_FREQ;
-        return pit_ticks * tick_us + base_offset + sub;
-    }
-
+    if (tsc_ready)
+        return (pit_rdtsc() - tsc_base) / tsc_per_us;
     return pit_poll_elapsed_us();
 }
 
@@ -131,10 +131,33 @@ void pit_init(uint32_t frequency) {
     outb(PIT_CHANNEL0, pit_divisor & 0xFF);
     outb(PIT_CHANNEL0, (pit_divisor >> 8) & 0xFF);
 
+    tsc_calibrate();
+
     // NOTE: IRQ0 is unmasked separately via pic_enable_irq(0) after the
     // PIC remap (pic_init masks all IRQ lines). pit_init itself may run
     // before interrupts_init() to start the timestamp clock as early as
     // possible - only the counter starts; IRQ0 delivery follows later.
+}
+
+/* Calibrate the TSC against the polled PIT countdown over a ~20ms window.
+ * The PIT poll clock only serves here (and as the pre-calibration clock);
+ * afterwards pit_uptime_us() is pure TSC - monotonic and IF-independent.
+ * Bounded: a dead/slow PIT bails out and the poll clock stays in use. */
+static void tsc_calibrate(void) {
+    tsc_base = pit_rdtsc();
+
+    uint64_t t0_us = pit_poll_elapsed_us();
+    uint32_t guard = 1000000;                       /* hard bound */
+    while (pit_poll_elapsed_us() - t0_us < 20000) {
+        if (--guard == 0) return;                   /* PIT broken: fallback */
+    }
+    uint64_t elapsed_us = pit_poll_elapsed_us() - t0_us;
+    uint64_t delta_tsc = pit_rdtsc() - tsc_base;
+
+    if (elapsed_us < 5000) return;                  /* window too short */
+    tsc_per_us = delta_tsc / elapsed_us;
+    if (tsc_per_us == 0) return;                    /* absurd: fallback */
+    tsc_ready = 1;
 }
 
 static uint16_t pit_read_counter(void) {

@@ -29,6 +29,35 @@ header_end:
 
 section .bss
 align 4096
+global stack_guard_bottom
+stack_guard_bottom:
+    resb 65536              ; 64 KiB sacrificial guard UNDER the boot stack:
+                            ; a run-away kernel stack burns this before it can
+                            ; reach anything below (the old layout had the
+                            ; boot page tables directly under the stack, so
+                            ; every overflow silently zeroed PDEs and killed
+                            ; 2 MiB identity windows -> random not-present
+                            ; #PFs on heap/.bss addresses minutes into boot).
+global stack_bottom
+stack_bottom:
+    resb 131072             ; 128 KiB boot kernel stack. The DHCP/net-init
+                            ; path alone measured ~49 KiB deep - the old
+                            ; 32 KiB stack overflowed ~17 KiB past its end.
+global stack_top
+stack_top:
+; 256-gate flat IDT: installed right after the far jump so stray vectors
+; between long-mode entry and the kernel's own interrupt init cannot hit
+; the firmware IDT (whose gates reference the firmware CS 0x38 - absent
+; from the kernel GDT -> #GP(0x38) -> #DF -> triple -> reset loop).
+align 16
+boot_idt:
+    resb 256 * 16
+
+; Boot page tables. They now sit ABOVE the boot stack (which grows down
+; from stack_top through its own guard) - a downward stack overflow can
+; never touch them again. Must stay contiguous pml5..pd3: the init code
+; clears all 7 pages with one rep stosd from pml5.
+align 4096
 pml5:
     resb 4096
 pml4:
@@ -43,16 +72,6 @@ pd2:
     resb 4096
 pd3:
     resb 4096
-stack_bottom:
-    resb 32768
-stack_top:
-; 256-gate flat IDT: installed right after the far jump so stray vectors
-; between long-mode entry and the kernel's own interrupt init cannot hit
-; the firmware IDT (whose gates reference the firmware CS 0x38 - absent
-; from the kernel GDT -> #GP(0x38) -> #DF -> triple -> reset loop).
-align 16
-boot_idt:
-    resb 256 * 16
 
 section .data
 mb_info_ptr:

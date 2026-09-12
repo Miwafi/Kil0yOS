@@ -145,6 +145,7 @@ void usb_dump(void);          /* shell `usb` command */
 /* HID drivers (hid.c) */
 void usb_hid_attach(usb_device_t* dev);
 void usb_hid_detach(usb_device_t* dev);
+void usb_hid_probe_tick(void);  /* ~1s: unbind silent HID pipes, resume PS/2 */
 
 /* UHCI HCD (uhci.c) */
 int  uhci_init(pci_device_t* pci);          /* 0 = ok */

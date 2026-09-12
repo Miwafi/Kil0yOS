@@ -298,7 +298,11 @@ int e1000_init(void) {
     /* Set link up */
     e1000_write(E1000_CTRL, e1000_read(E1000_CTRL) | CTRL_SLU);
 
-    /* Wait for link up (VirtualBox has 5s LinkUpDelay) */
+    /* Wait for link up (VirtualBox has 5s LinkUpDelay).  On a cold VMware
+     * boot the vnic link takes seconds; each poll is an MMIO VM-exit, so
+     * this loop alone can eat 10-20s of SILENT boot time - mark it on the
+     * serial log so a slow cold start is not mistaken for a hang. */
+    klog("[e1000] waiting for link...\n");
     {
         int link_timeout = 5000000;
         while (!(e1000_read(E1000_STATUS) & 2)) {
@@ -306,6 +310,8 @@ int e1000_init(void) {
             __asm__ volatile("pause");
         }
     }
+    klog((e1000_read(E1000_STATUS) & 2) ? "[e1000] link up\n"
+                                        : "[e1000] link down (continuing)\n");
 
     /* Read MAC and write back to RA with AV=1 */
     uint8_t mac[6];

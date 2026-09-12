@@ -9,12 +9,13 @@
 #define VGA_ADDR        0xB8000
 #define VGA_GFX_ADDR    0xA0000
 
-#define GFX_WIDTH       320
-#define GFX_HEIGHT      200
+/* VGA graphics desktop mode: mode 12h, 640x480, 16 colors, planar
+ * (4 bit planes at 0xA0000, one bit per pixel per plane). */
+#define GFX_WIDTH       640
+#define GFX_HEIGHT      480
 
 extern uint16_t* vga_buffer;
 extern uint8_t vga_color;
-extern uint8_t* vga_gfx_buffer;
 
 typedef enum {
     COLOR_BLACK         = 0,
@@ -53,9 +54,10 @@ void vga_set_cursor(int x, int y);
 int  vga_is_graphics(void);
 void vga_wait_vsync(void);
 
-void vga_set_mode_13h();
+void vga_set_gfx_mode(void);   /* mode 12h: 640x480x16, planar */
 void vga_set_text_mode();
 void vga_plot_pixel(int x, int y, uint8_t color);
+uint8_t vga_read_pixel(int x, int y);
 void vga_draw_color_bars();
 void vga_fill_rect(int x, int y, int w, int h, uint8_t color);
 void vga_draw_rect(int x, int y, int w, int h, uint8_t color);
@@ -65,6 +67,11 @@ void vga_draw_string(int x, int y, const char* str, uint8_t color);
 /* Kernel log – prints timestamped message to both VGA and serial */
 extern void klog(const char* s);
 extern void klog_hex(const char* prefix, uint64_t v);
+/* GUI log pane: ring-buffer mirror of every klog byte. klog_seq() returns
+ * the total byte counter; klog_copy_from() copies bytes with sequence >=
+ * *seq (advancing it), clamped to the oldest retained byte. */
+extern uint32_t klog_seq(void);
+extern uint32_t klog_copy_from(uint32_t* seq, char* dst, uint32_t max);
 void vga_draw_window(int x, int y, int w, int h, const char* title);
 
 #endif

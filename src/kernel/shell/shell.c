@@ -52,6 +52,7 @@ static int cmd_date(int argc, char** argv);
 static int cmd_time(int argc, char** argv);
 static int cmd_gfx(int argc, char** argv);
 static int cmd_gui(int argc, char** argv);
+static int cmd_desktop(int argc, char** argv);
 static int cmd_ping(int argc, char** argv);
 static int cmd_ifconfig(int argc, char** argv);
 static int cmd_netstat(int argc, char** argv);
@@ -77,6 +78,7 @@ static shell_command_t commands[] = {
     {"edit", "Edit file", cmd_edit},
     {"gfx", "Graphical display test", cmd_gfx},
     {"gui", "Launch desktop GUI", cmd_gui},
+    {"desktop", "Launch GOP desktop (UEFI boot)", cmd_desktop},
     {"ping", "Ping a host", cmd_ping},
     {"ifconfig", "Show network configuration", cmd_ifconfig},
     {"netstat", "Show network status", cmd_netstat},
@@ -504,6 +506,168 @@ static int cmd_edit(int argc, char** argv) {
 
 static int desktop_active = 0;
 
+/* Shared desktop backend: the mode13h desktop (BIOS boot) and the GOP
+ * desktop (UEFI boot) drive the same loop; the dt_* wrappers route the
+ * drawing primitives to the active surface and dt_w/dt_h carry the
+ * mode-specific geometry. */
+static int dt_use_fb = 0;
+static int dt_w = GFX_WIDTH;
+static int dt_h = GFX_HEIGHT;
+
+/* Desktop layout geometry (mode13h and GOP desktops share the layout):
+ * left function panel | right-top shell terminal | right-bottom kernel log. */
+static int lay_header_h, lay_footer_h;
+static int lay_left_w;      /* function panel width */
+static int lay_split_y;     /* y of the separator between shell and klog panes */
+
+/* Left-panel functions, selectable through the Win-key popup menu */
+enum { FUNC_EDITOR = 0, FUNC_FILES, FUNC_SYSTEM, FUNC_CATS, DT_MENU_COUNT };
+static const char* dt_menu_items[DT_MENU_COUNT] = {
+    "Editor", "Files", "System", "CATs"
+};
+static int active_func = FUNC_EDITOR;
+
+static void dt_fill_rect(int x, int y, int w, int h, uint8_t c) {
+    if (dt_use_fb) fb_gfx_fill_rect(x, y, w, h, c);
+    else           vga_fill_rect(x, y, w, h, c);
+}
+
+static void dt_draw_rect(int x, int y, int w, int h, uint8_t c) {
+    if (dt_use_fb) fb_gfx_draw_rect(x, y, w, h, c);
+    else           vga_draw_rect(x, y, w, h, c);
+}
+
+static void dt_draw_string(int x, int y, const char* s, uint8_t c) {
+    if (dt_use_fb) fb_gfx_draw_string(x, y, s, c);
+    else           vga_draw_string(x, y, s, c);
+}
+
+static void dt_wait_vsync(void) {
+    if (!dt_use_fb) vga_wait_vsync();   /* no legacy VGA regs under GOP */
+}
+
+static void dt_cursor_draw(int x, int y) {
+    if (dt_use_fb) fb_gfx_cursor_draw(x, y);
+    else           mouse_draw_cursor(x, y);
+}
+
+static void dt_cursor_erase(int x, int y) {
+    if (dt_use_fb) fb_gfx_cursor_erase(x, y);
+    else           mouse_erase_cursor(x, y);
+}
+
+/* ===== Win-key function menu popup ===== */
+static void menu_popup_draw(int sel) {
+    int spacing = dt_use_fb ? 16 : 12;
+    int w = 18 * 8;                          /* widest item + padding */
+    int h = DT_MENU_COUNT * spacing + 20;
+    int x = (dt_w - w) / 2;
+    int y = (dt_h - h) / 2;
+
+    dt_fill_rect(x, y, w, h, 0x0F);
+    dt_draw_rect(x, y, w, h, 0x09);
+    dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
+    dt_draw_string(x + 4, y + 3, "Menu", 0x09);
+
+    for (int i = 0; i < DT_MENU_COUNT; i++) {
+        int iy = y + 14 + i * spacing;
+        if (i == sel) {
+            dt_fill_rect(x + 3, iy - 1, w - 6, spacing - 1, 0x01);
+            dt_draw_string(x + 8, iy, dt_menu_items[i], 0x0F);
+        } else {
+            dt_draw_string(x + 8, iy, dt_menu_items[i], 0x00);
+        }
+    }
+}
+
+/* ===== Kernel-log pane =====
+ * Renders the klog serial mirror (ring buffer in main.c) as a scrolling
+ * read-only view in the right-bottom pane. Line-based: bytes are pumped
+ * from the ring, split on '\n', and the last kl_rows lines are drawn. */
+#define KL_MAX_ROWS 48
+#define KL_MAX_COLS 100
+static char kl_lines[KL_MAX_ROWS][KL_MAX_COLS + 1];
+static int  kl_head, kl_count;          /* line ring */
+static char kl_acc[KL_MAX_COLS + 1];    /* partial line accumulator */
+static int  kl_len;
+static uint32_t kl_seq;                 /* reader position in the klog ring */
+static int  kl_rows, kl_cols;
+static int  kl_bx, kl_by;               /* glyph origin */
+static int  kl_cx, kl_cy, kl_cw, kl_ch; /* repaint region */
+
+static void klog_view_init(int bx, int by, int cols, int rows,
+                           int cx, int cy, int cw, int ch) {
+    kl_bx = bx; kl_by = by;
+    kl_cols = (cols < 1) ? 1 : (cols > KL_MAX_COLS ? KL_MAX_COLS : cols);
+    kl_rows = (rows < 1) ? 1 : (rows > KL_MAX_ROWS ? KL_MAX_ROWS : rows);
+    kl_cx = cx; kl_cy = cy; kl_cw = cw; kl_ch = ch;
+    kl_head = 0; kl_count = 0; kl_len = 0;
+    kl_seq = klog_seq();
+    /* show the tail of the logs emitted before the desktop started */
+    if (kl_seq > 1024) kl_seq -= 1024;
+    for (int r = 0; r < KL_MAX_ROWS; r++) kl_lines[r][0] = '\0';
+}
+
+static void kl_push_line(const char* s) {
+    /* strip the "[   time] " klog timestamp so narrow panes keep room
+     * for the message itself */
+    if (s[0] == '[') {
+        const char* p = s;
+        while (*p && *p != ']') p++;
+        if (*p == ']') {
+            p++;
+            while (*p == ' ') p++;
+            s = p;
+        }
+    }
+    if (kl_count == KL_MAX_ROWS) {
+        kl_head = (kl_head + 1) % KL_MAX_ROWS;
+        kl_count--;
+    }
+    int slot = (kl_head + kl_count) % KL_MAX_ROWS;
+    int i = 0;
+    while (s[i] && i < kl_cols) {
+        kl_lines[slot][i] = s[i];
+        i++;
+    }
+    kl_lines[slot][i] = '\0';
+    kl_count++;
+}
+
+/* Pull new bytes from the klog ring; returns 1 when the view needs repaint */
+static int klog_view_pump(void) {
+    char tmp[256];
+    int dirty = 0;
+    for (int guard = 0; guard < 8; guard++) {       /* bounded per frame */
+        uint32_t n = klog_copy_from(&kl_seq, tmp, (uint32_t)sizeof(tmp));
+        if (n == 0) break;
+        for (uint32_t i = 0; i < n; i++) {
+            char c = tmp[i];
+            if (c == '\n') {
+                kl_acc[kl_len] = '\0';
+                kl_push_line(kl_acc);
+                kl_len = 0;
+                dirty = 1;
+            } else if (c >= 32 && c <= 126) {
+                if (kl_len < kl_cols) kl_acc[kl_len++] = c;
+                /* beyond the pane width: dropped (log view) */
+            }
+        }
+    }
+    return dirty;
+}
+
+static void klog_view_render(void) {
+    dt_fill_rect(kl_cx, kl_cy, kl_cw, kl_ch, 0x0F);
+    int first = (kl_count > kl_rows) ? kl_count - kl_rows : 0;
+    for (int r = 0; r < kl_rows; r++) {
+        int idx = first + r;
+        if (idx >= kl_count) break;
+        dt_draw_string(kl_bx, kl_by + r * 8,
+                       kl_lines[(kl_head + idx) % KL_MAX_ROWS], 0x00);
+    }
+}
+
 static int cmd_gfx(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -512,13 +676,13 @@ static int cmd_gfx(int argc, char** argv) {
         return 1;
     }
     if (fb_is_active()) {
-        term_puts("gfx: mode13h test needs the VGA path (BIOS boot)\n");
+        term_puts("gfx: VGA graphics test needs the BIOS path (BIOS boot)\n");
         return 1;
     }
 
     vga_puts("Switching to graphical mode...\n");
 
-    vga_set_mode_13h();
+    vga_set_gfx_mode();
     vga_wait_vsync();
     vga_draw_color_bars();
 
@@ -540,20 +704,20 @@ static int gui_shell_x = 0;
 static int gui_shell_y = 0;
 
 static void gui_shell_draw_prompt(void) {
-    vga_draw_string(gui_shell_x, gui_shell_y, "> ", 0x0F);
+    dt_draw_string(gui_shell_x, gui_shell_y, "> ", 0x00);
 }
 
-static void gui_shell_init(int left_w, int header_h) {
+static void gui_shell_init(int prompt_x, int prompt_y) {
     gui_shell_len = 0;
     gui_shell_buf[0] = '\0';
-    gui_shell_x = left_w + 4;
-    gui_shell_y = header_h + 14;
+    gui_shell_x = prompt_x;
+    gui_shell_y = prompt_y;
     gui_shell_draw_prompt();
 }
 
 static int execute_command(char* cmd);
 
-static void gui_shell_execute(int left_w, int header_h, int content_h) {
+static void gui_shell_execute(void) {
     gui_shell_buf[gui_shell_len] = '\0';
 
     char cmd_buf[GUI_SHELL_BUF_SIZE];
@@ -571,156 +735,136 @@ static void gui_shell_execute(int left_w, int header_h, int content_h) {
     gui_shell_draw_prompt();
 }
 
-static void gui_draw_content(int left_w, int header_h, int content_h, int active_idx) {
-    int cx = left_w + 4;
-    int cy = header_h + 4;
+/* Left function panel: target of the Win-key menu. Default = text editor. */
+static void draw_func_panel(int func) {
+    int cx = 4;
+    int cy = lay_header_h + 4;
+    int content_h = dt_h - lay_header_h - lay_footer_h;
 
-    /* clear content area (inside border) */
-    vga_fill_rect(left_w + 1, header_h + 1, GFX_WIDTH - left_w - 2, content_h - 2, 0x00);
+    /* clear interior (inside border) */
+    dt_fill_rect(1, lay_header_h + 1, lay_left_w - 2, content_h - 2, 0x0F);
 
-    switch (active_idx) {
-        case 0: /* Shell */
-            vga_draw_string(cx, cy, "Shell Terminal", 0x0E);
-            term_init_gui(left_w, header_h, content_h);
-            gui_shell_init(left_w, header_h);
+    switch (func) {
+        case FUNC_EDITOR:
+            dt_draw_string(cx, cy, "Text Editor", 0x09);
+            dt_draw_string(cx, cy + 16, "Default view.", 0x00);
+            dt_draw_string(cx, cy + 30, "Edit a file", 0x00);
+            dt_draw_string(cx, cy + 42, "from shell:", 0x00);
+            dt_draw_string(cx, cy + 58, "edit <file>", 0x01);
             break;
-        case 1: /* Files */
-            vga_draw_string(cx, cy, "File Manager", 0x0E);
-            vga_draw_string(cx, cy + 10, "Browse and", 0x0F);
-            vga_draw_string(cx, cy + 20, "manage files.", 0x0F);
+        case FUNC_FILES:
+            dt_draw_string(cx, cy, "File Manager", 0x09);
+            dt_draw_string(cx, cy + 16, "Browse files", 0x00);
+            dt_draw_string(cx, cy + 28, "from shell:", 0x00);
+            dt_draw_string(cx, cy + 44, "ls / cd / cat", 0x01);
             break;
-        case 2: /* Edit */
-            vga_draw_string(cx, cy, "Text Editor", 0x0E);
-            vga_draw_string(cx, cy + 10, "Edit text files", 0x0F);
-            vga_draw_string(cx, cy + 20, "in memory.", 0x0F);
-            break;
-        case 3: /* System */
-            vga_draw_string(cx, cy, "System Monitor", 0x0E);
+        case FUNC_SYSTEM: {
+            char buf[40];
+            int y = cy + 14;
+            int bar_w = lay_left_w - 10;
 
-            /* CPU stats */
-            {
-                uint32_t ncpus = smp_get_cpu_count();
-                char cpu_title[32];
-                char* cp = cpu_title;
-                strcpy(cp, "CPUs: ");
-                cp += strlen(cp);
-                itoa((int)ncpus, cp, 10, 4);
-                cp += strlen(cp);
-                vga_draw_string(cx, cy + 12, cpu_title, 0x0F);
+            uint32_t ncpus = smp_get_cpu_count();
+            int max_cores = (int)ncpus;
+            if (max_cores > 4) max_cores = 4;
+            if (lay_left_w < 160 && max_cores > 2) max_cores = 2;
 
-                int bar_w = GFX_WIDTH - left_w - 12;
-                int bar_h = 6;
-                int bar_x = cx;
-                int max_cores = (int)ncpus;
-                if (max_cores > 4) max_cores = 4;
+            strcpy(buf, "CPUs: ");
+            itoa((int)ncpus, buf + 6, 10, 8);
+            dt_draw_string(cx, y, buf, 0x00);
 
-                for (int i = 0; i < max_cores; i++) {
-                    int bar_y = cy + 24 + i * 12;
-                    uint32_t usage = cpu_usage_percent[i];
-                    if (usage > 100) usage = 100;
-                    int fill_w = (bar_w * (int)usage) / 100;
+            for (int i = 0; i < max_cores; i++) {
+                uint32_t usage = cpu_usage_percent[i];
+                if (usage > 100) usage = 100;
 
-                    char label[16];
-                    char* lp = label;
-                    strcpy(lp, "CPU");
-                    lp += strlen(lp);
-                    itoa(i, lp, 10, 2);
-                    lp += strlen(lp);
-                    strcpy(lp, ":");
-                    vga_draw_string(bar_x, bar_y - 1, label, 0x0E);
+                y += 12;
+                strcpy(buf, "CPU");
+                char* lp = buf + 3;
+                itoa(i, lp, 10, 2);
+                lp += strlen(lp);
+                strcpy(lp, ":");
+                dt_draw_string(cx, y, buf, 0x00);
 
-                    vga_fill_rect(bar_x + 30, bar_y, bar_w - 30, bar_h, 0x00);
-                    vga_draw_rect(bar_x + 30, bar_y, bar_w - 30, bar_h, 0x0F);
+                char pct[8];
+                itoa((int)usage, pct, 10, 4);
+                int px = cx + lay_left_w - 6 - (int)strlen(pct) * 8;
+                if (px < cx + 40) px = cx + 40;
+                dt_draw_string(px, y, pct, 0x00);
 
-                    uint8_t color = 0x0A;
-                    if (usage > 50) color = 0x0E;
-                    if (usage > 80) color = 0x0C;
-                    vga_fill_rect(bar_x + 31, bar_y + 1, fill_w - 2, bar_h - 2, color);
-
-                    char pct[8];
-                    itoa((int)usage, pct, 10, 4);
-                    int plen = strlen(pct);
-                    vga_draw_string(bar_x + 30 + bar_w - 30 - plen * 6 - 2, bar_y - 1, pct, 0x0F);
-                }
-            }
-
-            /* Memory stats */
-            {
-                uint64_t total_p, used_p, free_p;
-                pmm_get_stats(&total_p, &used_p, &free_p);
-                uint64_t total_mb = (total_p * PAGE_SIZE) / (1024 * 1024);
-                uint64_t used_mb  = (used_p  * PAGE_SIZE) / (1024 * 1024);
-                uint64_t free_mb  = (free_p  * PAGE_SIZE) / (1024 * 1024);
-
-                char mem_buf[64];
-                char* mp = mem_buf;
-                strcpy(mp, "Mem: ");
-                mp += strlen(mp);
-                itoa((int)used_mb, mp, 10, 8);
-                mp += strlen(mp);
-                strcpy(mp, " / ");
-                mp += strlen(mp);
-                itoa((int)total_mb, mp, 10, 8);
-                mp += strlen(mp);
-                strcpy(mp, " MB");
-                vga_draw_string(cx, cy + 66, mem_buf, 0x0F);
-
-                /* Progress bar */
-                int bar_x = cx;
-                int bar_y = cy + 78;
-                int bar_w = GFX_WIDTH - left_w - 12;
-                int bar_h = 6;
-                int fill_w = (bar_w * (int)used_mb) / (int)(total_mb ? total_mb : 1);
-                if (fill_w > bar_w - 2) fill_w = bar_w - 2;   /* stay inside the border */
+                y += 9;
+                dt_fill_rect(cx, y, bar_w, 6, 0x07);
+                dt_draw_rect(cx, y, bar_w, 6, 0x00);
+                int fill_w = ((bar_w - 2) * (int)usage) / 100;
                 if (fill_w < 0) fill_w = 0;
-
-                vga_fill_rect(bar_x, bar_y, bar_w, bar_h, 0x00);
-                vga_draw_rect(bar_x, bar_y, bar_w, bar_h, 0x0F);
-                vga_fill_rect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, 0x0A);
-
-                char free_buf[32];
-                char* fp = free_buf;
-                strcpy(fp, "Free: ");
-                fp += strlen(fp);
-                itoa((int)free_mb, fp, 10, 8);
-                fp += strlen(fp);
-                strcpy(fp, " MB");
-                vga_draw_string(cx, cy + 88, free_buf, 0x0B);
+                uint8_t color = 0x0A;
+                if (usage > 50) color = 0x0E;
+                if (usage > 80) color = 0x0C;
+                dt_fill_rect(cx + 1, y + 1, fill_w, 4, color);
+                y += 9;
             }
 
-            /* Process list */
-            {
-                int proc_y = cy + 104;
-                int ntasks = task_get_count();
-                char proc_title[32];
-                char* pt = proc_title;
-                strcpy(pt, "Processes (");
-                pt += strlen(pt);
-                itoa(ntasks, pt, 10, 4);
-                pt += strlen(pt);
-                strcpy(pt, "):");
-                vga_draw_string(cx, proc_y, proc_title, 0x0E);
+            /* memory */
+            uint64_t total_p, used_p, free_p;
+            pmm_get_stats(&total_p, &used_p, &free_p);
+            uint64_t total_mb = (total_p * PAGE_SIZE) / (1024 * 1024);
+            uint64_t used_mb  = (used_p  * PAGE_SIZE) / (1024 * 1024);
+            uint64_t free_mb  = (free_p  * PAGE_SIZE) / (1024 * 1024);
 
-                int row = 0;
-                for (int i = 0; i < MAX_TASKS && row < 6; i++) {   /* 6 rows fit above footer */
-                    int st = task_get_status(i);
-                    if (st == TASK_DEAD) continue;
+            y += 2;
+            strcpy(buf, "Mem: ");
+            char* mp = buf + 5;
+            itoa((int)used_mb, mp, 10, 8);
+            mp += strlen(mp);
+            strcpy(mp, "/");
+            mp += strlen(mp);
+            itoa((int)total_mb, mp, 10, 8);
+            mp += strlen(mp);
+            strcpy(mp, "MB");
+            if ((int)strlen(buf) * 8 <= lay_left_w - 8)
+                dt_draw_string(cx, y, buf, 0x00);
 
-                    int py = proc_y + 12 + row * 10;
-                    const char* name = task_get_name(i);
-                    const char* sstr = task_status_str(st);
+            y += 10;
+            dt_fill_rect(cx, y, bar_w, 6, 0x07);
+            dt_draw_rect(cx, y, bar_w, 6, 0x00);
+            int fill_w = (bar_w * (int)used_mb) / (int)(total_mb ? total_mb : 1);
+            if (fill_w > bar_w - 2) fill_w = bar_w - 2;
+            if (fill_w < 0) fill_w = 0;
+            dt_fill_rect(cx + 1, y + 1, fill_w, 4, 0x0A);
 
-                    vga_draw_string(cx, py, name, 0x0F);
-                    vga_draw_string(cx + 80, py, sstr,
-                        (st == TASK_RUNNING) ? 0x0A : 0x0E);
-                    row++;
-                }
+            y += 12;
+            strcpy(buf, "Free: ");
+            char* fp = buf + 6;
+            itoa((int)free_mb, fp, 10, 8);
+            fp += strlen(fp);
+            strcpy(fp, "MB");
+            if ((int)strlen(buf) * 8 <= lay_left_w - 8)
+                dt_draw_string(cx, y, buf, 0x0B);
+
+            /* processes */
+            y += 12;
+            int ntasks = task_get_count();
+            strcpy(buf, "Procs: ");
+            itoa(ntasks, buf + 7, 10, 8);
+            dt_draw_string(cx, y, buf, 0x00);
+
+            int bottom = dt_h - lay_footer_h - 2;
+            for (int i = 0; i < MAX_TASKS; i++) {
+                int st = task_get_status(i);
+                if (st == TASK_DEAD) continue;
+                if (y + 9 + 8 > bottom) break;
+                y += 9;
+                dt_draw_string(cx, y, task_get_name(i), 0x00);
+                const char* sstr = task_status_str(st);
+                int sx = cx + lay_left_w - 6 - (int)strlen(sstr) * 8;
+                if (sx < cx + 40) sx = cx + 40;
+                dt_draw_string(sx, y, sstr,
+                               (st == TASK_RUNNING) ? 0x0A : 0x01);
             }
             break;
-        case 4: /* CATs */
-            vga_draw_string(cx, cy, "CAT Viewer", 0x0E);
-            vga_draw_string(cx, cy + 10, "=^._.^=", 0x0F);
-            vga_draw_string(cx, cy + 20, "Meow!", 0x0F);
+        }
+        case FUNC_CATS:
+            dt_draw_string(cx, cy, "CAT Viewer", 0x09);
+            dt_draw_string(cx, cy + 16, "=^._.^=", 0x00);
+            dt_draw_string(cx, cy + 28, "Meow!", 0x00);
             break;
     }
 }
@@ -763,81 +907,81 @@ static void gui_draw_datetime(int footer_h) {
     *p = '\0';
 
     int len = strlen(buf);
-    int x = GFX_WIDTH - len * 6 - 4;
+    int x = dt_w - len * 8 - 4;
     if (x < 0) x = 0;
 
-    vga_fill_rect(x, GFX_HEIGHT - footer_h + 1, len * 6 + 2, 8, 0x01);
-    vga_draw_string(x, GFX_HEIGHT - footer_h + 2, buf, 0x0F);
+    dt_fill_rect(x, dt_h - footer_h + 1, len * 8 + 2, 8, 0x01);
+    dt_draw_string(x, dt_h - footer_h + 2, buf, 0x0F);
 }
 
-static int cmd_gui(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    if (desktop_active) {
-        vga_puts("gui: desktop already running\n");
-        return 1;
-    }
-    if (fb_is_active()) {
-        term_puts("gui: the mode13h desktop needs the VGA path (BIOS boot)\n");
-        return 1;
-    }
-
-    vga_puts("Launching desktop...\n");
-    desktop_active = 1;
-
-    vga_set_mode_13h();
-
-    int header_h = 10;
-    int footer_h = 10;
-    int left_w = 100;
-    int content_h = GFX_HEIGHT - header_h - footer_h;
-
-    /* menu state */
-    const char* menu_items[] = {"Shell", "Files", "Edit", "System", "CATs"};
-    int menu_count = 5;
-    int selected_idx = 0;
-    int active_idx = 0;
-    int menu_x = 4;
-    int menu_start_y = header_h + 14;
-    int menu_spacing = 10;
+/* Desktop chrome: backdrop, header bar, left function panel, right-top
+ * shell pane, right-bottom kernel-log pane, footer + clock. Shared by the
+ * mode13h and GOP desktops; geometry lives in the lay_* statics. */
+static void desktop_draw_chrome(void) {
+    int content_h = dt_h - lay_header_h - lay_footer_h;
+    int right_w = dt_w - lay_left_w;
+    int title_y = (lay_header_h - 8) / 2;
+    if (title_y < 2) title_y = 2;
 
     /* clear screen (aligned to vertical retrace to avoid tearing) */
-    vga_wait_vsync();
-    vga_fill_rect(0, 0, GFX_WIDTH, GFX_HEIGHT, 0x01);
+    dt_wait_vsync();
+    dt_fill_rect(0, 0, dt_w, dt_h, 0x0F);
 
     /* top header bar */
-    vga_fill_rect(0, 0, GFX_WIDTH, header_h, 0x01);
-    vga_draw_rect(0, 0, GFX_WIDTH, header_h, 0x0E);
-    vga_draw_string(4, 2, "Kil0yOS v2.17.0", 0x0F);
+    dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
+    dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
+    dt_draw_string(4, title_y, "Kil0yOS v2.17.1", 0x00);
+    dt_draw_string(dt_w - 84, title_y, "[Win]=Menu", 0x01);
 
-    /* left panel */
-    vga_fill_rect(0, header_h, left_w, content_h, 0x00);
-    vga_draw_rect(0, header_h, left_w, content_h, 0x0E);
-    vga_draw_string(menu_x, header_h + 4, "Menu", 0x0E);
+    /* left function panel */
+    dt_fill_rect(0, lay_header_h, lay_left_w, content_h, 0x0F);
+    dt_draw_rect(0, lay_header_h, lay_left_w, content_h, 0x03);
 
-    /* draw menu items */
-    for (int i = 0; i < menu_count; i++) {
-        uint8_t color = (i == selected_idx) ? 0x0E : 0x0F;
-        vga_draw_string(menu_x, menu_start_y + i * menu_spacing, menu_items[i], color);
-    }
+    /* right-top shell pane */
+    dt_fill_rect(lay_left_w, lay_header_h, right_w,
+                 lay_split_y - lay_header_h, 0x0F);
+    dt_draw_rect(lay_left_w, lay_header_h, right_w,
+                 lay_split_y - lay_header_h, 0x03);
+    dt_draw_string(lay_left_w + 4, lay_header_h + 2, "Shell", 0x09);
 
-    /* right content panel */
-    vga_fill_rect(left_w, header_h, GFX_WIDTH - left_w, content_h, 0x00);
-    vga_draw_rect(left_w, header_h, GFX_WIDTH - left_w, content_h, 0x0E);
-    gui_draw_content(left_w, header_h, content_h, active_idx);
+    /* right-bottom kernel-log pane */
+    int klog_h = dt_h - lay_footer_h - lay_split_y;
+    dt_fill_rect(lay_left_w, lay_split_y, right_w, klog_h, 0x0F);
+    dt_draw_rect(lay_left_w, lay_split_y, right_w, klog_h, 0x03);
+    dt_draw_string(lay_left_w + 4, lay_split_y + 2, "Kernel Log", 0x09);
 
     /* bottom footer bar */
-    vga_fill_rect(0, GFX_HEIGHT - footer_h, GFX_WIDTH, footer_h, 0x01);
-    vga_draw_rect(0, GFX_HEIGHT - footer_h, GFX_WIDTH, footer_h, 0x0E);
+    dt_fill_rect(0, dt_h - lay_footer_h, dt_w, lay_footer_h, 0x0F);
+    dt_draw_rect(0, dt_h - lay_footer_h, dt_w, lay_footer_h, 0x03);
+    gui_draw_datetime(lay_footer_h);
+
+    draw_func_panel(active_func);
+}
+
+/* Full repaint after the menu popup closes (chrome + panes + prompt + log) */
+static void desktop_repaint(void) {
+    desktop_draw_chrome();
+    term_gui_render();
+    gui_shell_draw_prompt();
+    klog_view_render();
+}
+
+/* Shared desktop main loop: Win-key menu popup, shell input, kernel-log
+ * pump, clock, pointer. Runs until ESC; both desktops differ only in
+ * geometry/backend. Keyboard focus stays on the right-top shell pane. */
+static void desktop_run_loop(void) {
+    extern void klog(const char* s);
+    int menu_open = 0;
+    int menu_sel = 0;
+    static int trace_moved = 0;
 
     mouse_state_t prev = { .x = -1, .y = -1, .buttons = 0 };
     uint8_t last_second = 0xFF;
 
-    gui_draw_datetime(footer_h);
-
     /* show pointer from the first frame on */
     mouse_get_state(&prev);
-    mouse_draw_cursor(prev.x, prev.y);
+    dt_cursor_draw(prev.x, prev.y);
+    klog("[desktop] loop enter\n");
 
     while (1) {
         /* update clock every second */
@@ -846,69 +990,78 @@ static int cmd_gui(int argc, char** argv) {
             last_second = t.second;
 
             /* hide pointer first so repaints are not clobbered by stale restore pixels */
-            mouse_erase_cursor(prev.x, prev.y);
+            dt_cursor_erase(prev.x, prev.y);
 
-            vga_wait_vsync();
-            gui_draw_datetime(footer_h);
+            dt_wait_vsync();
+            gui_draw_datetime(lay_footer_h);
 
             /* auto-refresh System Monitor CPU stats */
-            if (active_idx == 3) {
+            if (active_func == FUNC_SYSTEM) {
                 smp_update_cpu_usage();
-                gui_draw_content(left_w, header_h, content_h, active_idx);
+                draw_func_panel(FUNC_SYSTEM);
             }
 
             /* pointer back with a fresh background snapshot */
-            mouse_draw_cursor(prev.x, prev.y);
+            dt_cursor_draw(prev.x, prev.y);
+        }
+
+        /* pump new kernel-log lines into the right-bottom pane */
+        if (klog_view_pump()) {
+            dt_cursor_erase(prev.x, prev.y);
+            klog_view_render();
+            dt_cursor_draw(prev.x, prev.y);
         }
 
         if (keyboard_has_input()) {
             unsigned char c = (unsigned char)keyboard_getc();
 
-            if (c == KEY_ESC) break;   /* exit desktop */
-
-            if (c == KEY_UP || c == KEY_DOWN) {
-                int old_idx = selected_idx;
-
-                if (c == KEY_UP && selected_idx > 0) {
-                    selected_idx--;
-                } else if (c == KEY_DOWN && selected_idx < menu_count - 1) {
-                    selected_idx++;
+            if (c == KEY_ESC) {
+                if (menu_open) {
+                    menu_open = 0;
+                    dt_cursor_erase(prev.x, prev.y);
+                    desktop_repaint();
+                    dt_cursor_draw(prev.x, prev.y);
+                } else {
+                    break;   /* exit desktop */
                 }
-
-                if (old_idx != selected_idx) {
-                    mouse_erase_cursor(prev.x, prev.y);
-
-                    /* erase old item */
-                    vga_fill_rect(menu_x, menu_start_y + old_idx * menu_spacing,
-                                  left_w - 8, 8, 0x00);
-                    vga_draw_string(menu_x, menu_start_y + old_idx * menu_spacing,
-                                    menu_items[old_idx], 0x0F);
-
-                    /* draw new selected item */
-                    vga_fill_rect(menu_x, menu_start_y + selected_idx * menu_spacing,
-                                  left_w - 8, 8, 0x00);
-                    vga_draw_string(menu_x, menu_start_y + selected_idx * menu_spacing,
-                                    menu_items[selected_idx], 0x0E);
-
-                    mouse_draw_cursor(prev.x, prev.y);
+            } else if (c == KEY_WIN) {
+                menu_open = !menu_open;
+                dt_cursor_erase(prev.x, prev.y);
+                if (menu_open) {
+                    menu_sel = active_func;
+                    menu_popup_draw(menu_sel);
+                } else {
+                    desktop_repaint();
                 }
-            }
-
-            if (c == '\n') {
-                if (selected_idx != active_idx) {
-                    active_idx = selected_idx;
-                    mouse_erase_cursor(prev.x, prev.y);
-                    vga_wait_vsync();
-                    gui_draw_content(left_w, header_h, content_h, active_idx);
-                    mouse_draw_cursor(prev.x, prev.y);
-                } else if (active_idx == 0) {
-                    gui_shell_execute(left_w, header_h, content_h);
+                dt_cursor_draw(prev.x, prev.y);
+            } else if (menu_open) {
+                if (c == KEY_UP || c == KEY_DOWN) {
+                    int old_sel = menu_sel;
+                    if (c == KEY_UP && menu_sel > 0) {
+                        menu_sel--;
+                    } else if (c == KEY_DOWN && menu_sel < DT_MENU_COUNT - 1) {
+                        menu_sel++;
+                    }
+                    if (old_sel != menu_sel) {
+                        dt_cursor_erase(prev.x, prev.y);
+                        menu_popup_draw(menu_sel);
+                        dt_cursor_draw(prev.x, prev.y);
+                    }
+                } else if (c == '\n') {
+                    menu_open = 0;
+                    active_func = menu_sel;
+                    dt_cursor_erase(prev.x, prev.y);
+                    desktop_repaint();
+                    dt_cursor_draw(prev.x, prev.y);
+                    klog("[desktop] func -> ");
+                    klog(dt_menu_items[active_func]);
+                    klog("\n");
                 }
-            }
-
-            /* shell input handling */
-            if (active_idx == 0) {
-                if (c >= 32 && c <= 126 && gui_shell_len < GUI_SHELL_BUF_SIZE - 1) {
+            } else {
+                /* keyboard focus: right-top shell pane */
+                if (c == '\n') {
+                    gui_shell_execute();
+                } else if (c >= 32 && c <= 126 && gui_shell_len < GUI_SHELL_BUF_SIZE - 1) {
                     gui_shell_buf[gui_shell_len++] = c;
                     term_gui_type_char(c);          /* store in cells + echo once */
                 } else if (c == '\b' && gui_shell_len > 0) {
@@ -922,19 +1075,140 @@ static int cmd_gui(int argc, char** argv) {
         mouse_get_state(&state);
 
         if (state.x != prev.x || state.y != prev.y) {
+            if (!trace_moved) {
+                trace_moved = 1;
+                klog("[desktop] first pointer sample\n");
+            }
             /* draw_cursor restores the previous position itself when visible */
-            mouse_draw_cursor(state.x, state.y);
+            dt_cursor_draw(state.x, state.y);
             prev = state;
         }
 
         __asm__ volatile("hlt");   /* sleep until next interrupt instead of spinning */
     }
 
+    dt_cursor_erase(prev.x, prev.y);
+    klog("[desktop] loop exit\n");
+}
+
+static int cmd_gui(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    if (desktop_active) {
+        vga_puts("gui: desktop already running\n");
+        return 1;
+    }
+    if (fb_is_active()) {
+        term_puts("gui: the VGA desktop needs the VGA path (use 'desktop' on UEFI boot)\n");
+        return 1;
+    }
+
+    vga_puts("Launching desktop...\n");
+    desktop_active = 1;
+
+    dt_use_fb = 0;
+    dt_w = GFX_WIDTH;
+    dt_h = GFX_HEIGHT;
+    mouse_set_bounds(dt_w, dt_h);
+
+    vga_set_gfx_mode();
+
+    /* layout (640x480): proportional band split like the GOP desktop */
+    lay_header_h = 16;
+    lay_footer_h = 16;
+    lay_left_w = 200;
+    lay_split_y = lay_header_h +
+                  (dt_h - lay_header_h - lay_footer_h) * 55 / 100;
+
+    /* right-top shell terminal grid */
+    int sh_bx = lay_left_w + 4;
+    int sh_by = lay_header_h + 14;
+    int sh_cols = (dt_w - lay_left_w - 8) / 8;
+    int sh_rows = (lay_split_y - 12 - sh_by) / 8;
+
+    desktop_draw_chrome();
+    term_init_gui_at(sh_bx, sh_by, sh_cols, sh_rows,
+                     lay_left_w + 1, lay_header_h + 12, dt_w - lay_left_w - 2,
+                     lay_split_y - (lay_header_h + 13));
+    gui_shell_init(sh_bx, sh_by);
+
+    /* right-bottom kernel-log pane */
+    klog_view_init(lay_left_w + 4, lay_split_y + 14, sh_cols,
+                   (dt_h - lay_footer_h - lay_split_y - 16) / 8,
+                   lay_left_w + 1, lay_split_y + 12, dt_w - lay_left_w - 2,
+                   dt_h - lay_footer_h - (lay_split_y + 13));
+
+    desktop_run_loop();
+
     desktop_active = 0;
-    mouse_erase_cursor(prev.x, prev.y);
+    mouse_set_bounds(GFX_WIDTH, GFX_HEIGHT);
     vga_set_text_mode();
     term_init_text();
     vga_puts("Returned to text mode.\n");
+    return 0;
+}
+
+static int cmd_desktop(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    if (desktop_active) {
+        vga_puts("desktop: already running\n");
+        return 1;
+    }
+    if (!fb_is_active()) {
+        vga_puts("desktop: needs the UEFI GOP framebuffer (use 'gui' on BIOS boot)\n");
+        return 1;
+    }
+
+    term_puts("Launching GOP desktop...\n");
+    desktop_active = 1;
+
+    dt_use_fb = 1;
+    dt_w = fb_width();
+    dt_h = fb_height();
+    mouse_set_bounds(dt_w, dt_h);
+
+    lay_header_h = 20;
+    lay_footer_h = 20;
+    lay_left_w = dt_w / 5;   /* 1/5 of the screen, clamped to a usable band */
+    if (lay_left_w < 120) lay_left_w = 120;
+    if (lay_left_w > 240) lay_left_w = 240;
+    lay_split_y = lay_header_h +
+                  (dt_h - lay_header_h - lay_footer_h) * 55 / 100;
+
+    /* right-top shell terminal grid */
+    int sh_bx = lay_left_w + 8;
+    int sh_by = lay_header_h + 26;
+    int sh_cols = (dt_w - lay_left_w - 16) / 8;
+    int sh_rows = (lay_split_y - sh_by - 4) / 8;
+    int sh_clr_y = lay_header_h + 14;
+
+    desktop_draw_chrome();
+    term_init_gop_gui(sh_bx, sh_by, sh_cols, sh_rows,
+                      lay_left_w + 2, sh_clr_y, dt_w - lay_left_w - 4,
+                      lay_split_y - sh_clr_y - 1);
+    gui_shell_init(sh_bx, sh_by);
+
+    /* right-bottom kernel-log pane */
+    int kl_by = lay_split_y + 16;
+    int kl_clr_y = lay_split_y + 12;
+    klog_view_init(lay_left_w + 8, kl_by, sh_cols,
+                   (dt_h - lay_footer_h - kl_by - 2) / 8,
+                   lay_left_w + 2, kl_clr_y, dt_w - lay_left_w - 4,
+                   dt_h - lay_footer_h - kl_clr_y - 1);
+
+    /* The desktop owns the whole framebuffer now: mute the plain fb text
+     * console so klog diagnostics go to serial only and never paint over
+     * the UI (unmute + full repaint on exit below). */
+    fb_console_mute(1);
+    desktop_run_loop();
+    fb_console_mute(0);
+
+    desktop_active = 0;
+    mouse_set_bounds(GFX_WIDTH, GFX_HEIGHT);
+    fb_clear();
+    term_init_text();
+    term_puts("Returned to shell.\n");
     return 0;
 }
 

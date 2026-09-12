@@ -15,7 +15,7 @@
 #define MOUSE_CMD_ENABLE_REPORTING 0xF4
 #define MOUSE_ACK               0xFA
 
-static mouse_state_t mouse = { .x = 160, .y = 100, .buttons = 0, .ready = 0 };
+static mouse_state_t mouse = { .x = 320, .y = 240, .buttons = 0, .ready = 0 };
 
 static uint8_t mouse_packet[3];
 static int mouse_cycle = 0;
@@ -36,9 +36,14 @@ static int cursor_visible = 0;
 
 /* Bounded waits: an EFI firmware may leave the aux channel owned by its
  * own (vmmouse) driver in a state that never ACKs, so every poll must
- * time out instead of hanging the boot.  Threshold >= 1000000 per the
- * mouse bring-up rule (ISA port reads ~1us each, 2M is ~2s worst case). */
+ * time out instead of hanging the boot.  Controller-level waits (IBF,
+ * CDB reply) always complete fast, so they keep the >= 1000000 threshold.
+ * Device ACKs never come in the parked-firmware state, and on VMware
+ * every port read is a VM-exit (~10x QEMU), so a 2M-loop ACK poll stalls
+ * the boot for tens of seconds; MOUSE_ACK_LOOPS bounds that to ~100ms
+ * (QEMU) / ~1s (VMware) - still 100x over a real device ACK. */
 #define MOUSE_WAIT_LOOPS 2000000
+#define MOUSE_ACK_LOOPS  100000
 
 static int mouse_wait_timeout(uint8_t type) {
     uint32_t n = MOUSE_WAIT_LOOPS;
@@ -64,10 +69,38 @@ static int mouse_write(uint8_t data) {
     return 1;
 }
 
+/* Read one byte from the 8042 output buffer, filtered by source.
+ * Status bit5 (AUX flag) marks mouse bytes; 0 marks controller/keyboard
+ * bytes.  OBF is a single slot, so a byte from the wrong source is
+ * consumed and dropped - leaving a keyboard byte in place would block
+ * the mouse ACK behind it, and consuming a keystroke as the CDB reply
+ * poisons the command byte (a 0x92 reply writes bit0=0: keyboard IRQ
+ * dead, shell receives no input). */
+static int mouse_read_filtered(uint8_t* out, int want_aux, uint32_t loops) {
+    while (loops--) {
+        uint8_t st = inb(MOUSE_STATUS_PORT);
+        if (st & 0x01) {
+            uint8_t b = inb(MOUSE_DATA_PORT);
+            if (((st & 0x20) != 0) == (want_aux != 0)) {
+                *out = b;
+                return 1;
+            }
+            /* wrong-source byte: dropped, keep waiting */
+        }
+        __asm__ volatile("nop");
+    }
+    return 0;
+}
+
+/* Device-side byte (mouse ACK / data): short bound, AUX-flagged only. */
 static int mouse_read(uint8_t* out) {
-    if (!mouse_wait_timeout(0)) return 0;
-    *out = inb(MOUSE_DATA_PORT);
-    return 1;
+    return mouse_read_filtered(out, 1, MOUSE_ACK_LOOPS);
+}
+
+/* Controller-side byte (the CDB reply to command 0x20): non-AUX only,
+ * controller-level bound (the reply always comes, and fast). */
+static int mouse_read_cdb(uint8_t* out) {
+    return mouse_read_filtered(out, 0, MOUSE_WAIT_LOOPS);
 }
 
 static void mouse_flush(void) {
@@ -92,6 +125,15 @@ static int mouse_reset_device(void) {
 static int mouse_controller_reset(void) {
     uint8_t status, ack;
 
+    /* IRQs OFF for the whole 8042 command sequence.  With KIE/ME set the
+     * CDB reply and every device ACK raise IRQ1/IRQ12 - the registered
+     * keyboard handler (and later the default IRQ12 path) would consume
+     * the OBF byte before our filtered poll sees it.  Observed on VMware:
+     * the CDB reply 0x67 was stolen by the IRQ1 handler, the CDB read
+     * timed out and the aux channel stayed dead for the whole session. */
+    int irqon = irq_save();
+    disable_interrupts();
+
     mouse_flush();
 
     /* start from a known controller state: disable aux, enable the aux
@@ -100,8 +142,9 @@ static int mouse_controller_reset(void) {
     io_wait();
 
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_READ_CFG);
-    if (!mouse_read(&status)) {
+    if (!mouse_read_cdb(&status)) {
         klog("[mouse] 8042 config read timeout\n");
+        irq_restore(irqon);
         return 0;
     }
     status |= 0x02;
@@ -109,11 +152,13 @@ static int mouse_controller_reset(void) {
 
     if (!mouse_wait_timeout(1)) {
         klog("[mouse] 8042 ibf stuck\n");
+        irq_restore(irqon);
         return 0;
     }
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_WRITE_CFG);
     if (!mouse_wait_timeout(1)) {
         klog("[mouse] 8042 cfg write stuck\n");
+        irq_restore(irqon);
         return 0;
     }
     outb(MOUSE_DATA_PORT, status);
@@ -139,13 +184,27 @@ static int mouse_controller_reset(void) {
         klog("\n");
         goto fail;
     }
+    irq_restore(irqon);
     return 1;
 fail:
     /* park the aux channel: no IRQ12 storm from stray firmware bytes */
     mouse_flush();
     outb(MOUSE_COMMAND_PORT, MOUSE_CMD_DISABLE);
     io_wait();
+    irq_restore(irqon);
     return 0;
+}
+
+/* Pointer clamp extents; the GOP desktop raises these to the framebuffer
+ * size (mouse_set_bounds) so the cursor can reach the whole screen. */
+static int bound_w = GFX_WIDTH;
+static int bound_h = GFX_HEIGHT;
+
+void mouse_set_bounds(int w, int h) {
+    if (w < CURSOR_W) w = CURSOR_W;
+    if (h < CURSOR_H) h = CURSOR_H;
+    bound_w = w;
+    bound_h = h;
 }
 
 /* Integrate one motion sample (shared by the PS/2 and USB HID paths).
@@ -158,8 +217,8 @@ void mouse_inject_delta(int dx, int dy, int buttons) {
     if (mouse.x < 0) mouse.x = 0;
     if (mouse.y < 0) mouse.y = 0;
     /* keep cursor fully on-screen: guard in mouse_draw_cursor uses x+CURSOR_W > GFX_WIDTH */
-    if (mouse.x > GFX_WIDTH - CURSOR_W)  mouse.x = GFX_WIDTH - CURSOR_W;
-    if (mouse.y > GFX_HEIGHT - CURSOR_H) mouse.y = GFX_HEIGHT - CURSOR_H;
+    if (mouse.x > bound_w - CURSOR_W)  mouse.x = bound_w - CURSOR_W;
+    if (mouse.y > bound_h - CURSOR_H)  mouse.y = bound_h - CURSOR_H;
 
     mouse.buttons = (uint8_t)(buttons & 0x07);
     mouse.ready = 1;
@@ -266,8 +325,8 @@ void mouse_draw_cursor(int x, int y) {
         for (int col = 0; col < CURSOR_W; col++) {
             int px = x + col;
             int py = y + row;
-            saved_pixels[row][col] = vga_gfx_buffer[py * GFX_WIDTH + px];
-            vga_gfx_buffer[py * GFX_WIDTH + px] = cursor_pattern[row][col];
+            saved_pixels[row][col] = vga_read_pixel(px, py);
+            vga_plot_pixel(px, py, cursor_pattern[row][col]);
         }
     }
     cursor_visible = 1;
@@ -284,7 +343,7 @@ void mouse_erase_cursor(int x, int y) {
             int px = saved_x + col;
             int py = saved_y + row;
             if (px >= 0 && py >= 0 && px < GFX_WIDTH && py < GFX_HEIGHT) {
-                vga_gfx_buffer[py * GFX_WIDTH + px] = saved_pixels[row][col];
+                vga_plot_pixel(px, py, saved_pixels[row][col]);
             }
         }
     }

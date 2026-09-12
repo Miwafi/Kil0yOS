@@ -163,9 +163,9 @@ uint64_t sys_yield(uint64_t unused1, uint64_t unused2, uint64_t unused3,
 }
 
 /* --- Ring3 graphics / game support ---------------------------------
- * User programs render through the kernel's mode-13h framebuffer
- * instead of touching 0xA0000 directly (identity-map pages are
- * kernel-only). All vga_* drawing primitives are no-ops when the
+ * User programs render through the kernel's VGA mode-12h framebuffer
+ * primitives instead of touching 0xA0000 directly (identity-map pages
+ * are kernel-only). All vga_* drawing primitives are no-ops when the
  * display is not in graphics mode, so stray calls are harmless. */
 
 uint64_t sys_gfx_mode(uint64_t mode, uint64_t unused1, uint64_t unused2,
@@ -173,12 +173,12 @@ uint64_t sys_gfx_mode(uint64_t mode, uint64_t unused1, uint64_t unused2,
     (void)unused1; (void)unused2; (void)unused3;
     (void)unused4; (void)unused5;
 
-    /* mode13h is a legacy VGA facility; the GOP framebuffer must not be
+    /* VGA gfx is a legacy facility; the GOP framebuffer must not be
      * clobbered by ring-3 gfx clients (draw calls below stay no-ops) */
     if (fb_is_active()) return (uint64_t)-1;
 
     if (mode) {
-        vga_set_mode_13h();
+        vga_set_gfx_mode();
     } else {
         vga_set_text_mode();
     }

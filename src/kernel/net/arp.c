@@ -139,6 +139,13 @@ int arp_resolve(netif_t* iface, uint32_t ip, uint8_t* out_mac) {
             for (int i = 0; i < 6; i++) out_mac[i] = entry->mac[i];
             return 0;
         }
+        if (netif_poll_busy()) {
+            /* We are inside another frame's dispatch (e.g. an ICMP echo
+             * reply sent from the ISR): nested polling is suppressed, so
+             * the ARP reply can never reach us here. Bail out instead of
+             * spinning a full second with interrupts off. */
+            return -1;
+        }
         if (retry % 50 == 49) arp_send_request(iface, ip);
     }
     klog("arp: resolve failed\n");

@@ -33,7 +33,6 @@ MM_SRCS = $(SRCDIR)/kernel/mm/memory.c
 
 # --- Device Drivers ---
 DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
-               $(SRCDIR)/kernel/drivers/font_8x8.c \
                $(SRCDIR)/kernel/drivers/keyboard.c \
                $(SRCDIR)/kernel/drivers/mouse.c \
                $(SRCDIR)/kernel/drivers/disk.c \
@@ -119,7 +118,7 @@ USER_BINS = $(patsubst %, $(BUILDDIR)/user/%.bin, $(USER_PROGRAMS))
 USER_BLOB_OBJS = $(patsubst %, $(BUILDDIR)/user_blob_%.o, $(USER_PROGRAMS))
 .SECONDARY: $(USER_BINS) $(BUILDDIR)/user/hello.o $(BUILDDIR)/user/pong.o
 
-.PHONY: all clean run iso
+.PHONY: all clean run iso usb
 
 all: iso
 
@@ -307,9 +306,20 @@ $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 	@mkdir -p $(BUILDDIR)/iso/boot/grub
 	cp $(BUILDDIR)/kernel.bin $(BUILDDIR)/iso/boot/kil0yos.bin
 	cp grub.cfg $(BUILDDIR)/iso/boot/grub/grub.cfg
-	grub-mkrescue -o $@ $(BUILDDIR)/iso
+	# --mbr-force-bootable: grub-mkrescue's default hybrid MBR carries only
+	# a GPT-protective entry (type 0xEE, no boot flag). Real BIOSes often
+	# refuse to boot such a USB stick ("no bootable device"). xorriso adds
+	# a pseudo boot-flag entry so picky BIOSes accept the stick.
+	grub-mkrescue -o $@ $(BUILDDIR)/iso --mbr-force-bootable
 
 iso: $(BUILDDIR)/kil0yos.iso
+
+# Bare-metal USB stick image (MBR + FAT16 + GRUB): the hybrid ISO is
+# ISO9660-over-USB which real BIOSes often fail to read, and GRUB needs
+# insmod multiboot2 since command.lst is not shipped. See the script
+# header for details. Run inside WSL.
+usb: $(BUILDDIR)/kernel.bin
+	bash tools/make_usb.sh $(BUILDDIR)/kil0yos-usb.img
 
 run: $(BUILDDIR)/kil0yos.iso
 	$(QEMU) -cdrom $(BUILDDIR)/kil0yos.iso -m 512M -display none -serial stdio -netdev user,id=net0 -device rtl8139,netdev=net0

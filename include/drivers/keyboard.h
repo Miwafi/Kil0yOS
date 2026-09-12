@@ -13,6 +13,7 @@
 #define KEY_DOWN   0x81
 #define KEY_LEFT   0x82
 #define KEY_RIGHT  0x83
+#define KEY_WIN    0x84   /* either Windows key (E0 5B / E0 5C) */
 
 void keyboard_init();
 char keyboard_getc();
@@ -27,5 +28,10 @@ void keyboard_feed_scancode(uint8_t sc, int ext);
 /* While a USB keyboard is bound the PS/2 IRQ handler only drains the
  * 8042 buffer (sendkey would otherwise deliver every key twice). */
 void keyboard_set_ps2_enabled(int enabled);
+
+/* Re-write the 8042 command byte with keyboard OBF-int (bit0) forced on
+ * and the keyboard clock-disable (bit4) cleared.  Called after mouse_init,
+ * whose CDB read/write can be poisoned by a stray keystroke byte. */
+void keyboard_rearm_interrupt(void);
 
 #endif

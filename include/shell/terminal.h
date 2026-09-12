@@ -14,7 +14,13 @@ struct terminal {
 };
 
 void term_init_text(void);
-void term_init_gui(int left_w, int header_h, int content_h);
+/* Desktop terminal placed at an arbitrary pane region: the caller computes
+ * the glyph grid and the repaint rect (mode13h surface backend). */
+void term_init_gui_at(int base_x, int base_y, int cols, int rows,
+                      int clr_x, int clr_y, int clr_w, int clr_h);
+/* Same, on the GOP framebuffer (fb_gfx backend). */
+void term_init_gop_gui(int base_x, int base_y, int cols, int rows,
+                       int clr_x, int clr_y, int clr_w, int clr_h);
 void term_set(terminal_t* t);
 terminal_t* term_get(void);
 

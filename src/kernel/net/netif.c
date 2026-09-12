@@ -7,6 +7,17 @@
 
 netif_t g_netif;
 
+/* Set while a received frame is being dispatched. Frame dispatch can
+ * transmit (ICMP echo reply, TCP ACK), which may trigger arp_resolve ->
+ * netif_poll; draining new frames inside that dispatch recurses and each
+ * level burns ~4KB of stack for packet buffers, overflowing the kernel
+ * stack (observed as corrupted interrupt frames / #GP). */
+static int rx_busy = 0;
+
+int netif_poll_busy(void) {
+    return rx_busy;
+}
+
 int netif_init(void) {
     g_netif.flags = 0;
     g_netif.send = NULL;
@@ -15,6 +26,10 @@ int netif_init(void) {
 }
 
 void netif_poll(void) {
+    /* Nested poll (from a transmit inside frame dispatch): refuse. The
+     * frames stay in the NIC ring and are drained by the next top-level
+     * poll (main loop, socket wait, ...). */
+    if (rx_busy) return;
     if (g_netif.poll) g_netif.poll();
 }
 
@@ -23,7 +38,9 @@ void netif_receive(const uint8_t* data, uint16_t len) {
     /* Drivers must never hand us frames larger than the stack can hold:
      * upper layers memcpy len-sized payloads into fixed buffers. */
     if (len > NET_MAX_PACKET) return;
+    rx_busy = 1;
     eth_receive(&g_netif, data, len);
+    rx_busy = 0;
 }
 
 int netif_send(const uint8_t* data, uint16_t len) {

@@ -49,7 +49,14 @@ static void serial_init() {
 }
 
 static void serial_putc(char c) {
-    while ((inb(0x3F8 + 5) & 0x20) == 0);
+    /* Bounded THR wait: if the VMware/QEMU serial back-end ever stops
+     * draining (locked log file, full pipe), an unbounded spin here would
+     * freeze the whole kernel at the next klog - silently, with no log
+     * line to explain it.  On stall: drop the char, never hang. */
+    int guard = 100000;
+    while ((inb(0x3F8 + 5) & 0x20) == 0) {
+        if (--guard == 0) return;
+    }
     outb(0x3F8, (uint8_t)c);
 }
 
@@ -60,19 +67,67 @@ static void serial_puts(const char* s) {
     }
 }
 
+/* Kernel-log mirror ring: every klog() byte (timestamp + text) lands here
+ * so GUI panes can render recent output without touching the serial UART.
+ * Power-of-two size, masked indexing; guarded by irq_save because klog is
+ * legal from IRQ context (exception dump, device handlers). */
+#define KLOG_RING_SIZE 8192   /* power of two */
+static char klog_ring[KLOG_RING_SIZE];
+static volatile uint32_t klog_wr = 0;   /* total bytes ever written */
+
+static void klog_ring_write(const char* s) {
+    int irqon = irq_save();
+    disable_interrupts();
+    while (*s) {
+        klog_ring[klog_wr & (KLOG_RING_SIZE - 1)] = *s++;
+        klog_wr++;
+    }
+    irq_restore(irqon);
+}
+
+/* Reader side: how many bytes have ever been logged. */
+uint32_t klog_seq(void) {
+    return klog_wr;
+}
+
+/* Copy log bytes with sequence >= *seq (max `max`) into dst; *seq advances
+ * by the copied count. Clamps to the oldest byte still in the ring (a
+ * reader that fell behind gets a mid-line start - acceptable for a view). */
+uint32_t klog_copy_from(uint32_t* seq, char* dst, uint32_t max) {
+    uint32_t wr = klog_wr;
+    uint32_t oldest = (wr > KLOG_RING_SIZE) ? wr - KLOG_RING_SIZE : 0;
+    uint32_t s = *seq;
+    if (s < oldest) s = oldest;
+    if (s >= wr) return 0;
+    uint32_t n = wr - s;
+    if (n > max) {
+        n = max;
+        s = wr - n;   /* keep the most recent bytes */
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        dst[i] = klog_ring[(s + i) & (KLOG_RING_SIZE - 1)];
+    }
+    *seq = s + n;
+    return n;
+}
+
 void klog(const char* s) {
     char ts[24];
     pit_format_time(ts, sizeof(ts));
     /* fb terminal takes priority when GOP grabbed the display; in VGA
      * graphics mode the text VRAM window is not mapped as text - keep
-     * those logs serial-only (BIOS path behaviour unchanged) */
-    if (fb_is_active()) {
+     * those logs serial-only (BIOS path behaviour unchanged).  The GOP
+     * desktop additionally mutes the fb console so diagnostics never
+     * paint over the desktop UI (isr.c's exception dump bypasses this). */
+    if (fb_is_active() && !fb_console_muted()) {
         fb_puts(ts);
         fb_puts(s);
     } else if (!vga_is_graphics()) {
         vga_puts(ts);
         vga_puts(s);
     }
+    klog_ring_write(ts);
+    klog_ring_write(s);
     serial_puts(ts);
     serial_puts(s);
 }
@@ -165,6 +220,10 @@ void kernel_main(uint64_t mb_info_phys) {
     mouse_init();
     heap_verify("mouse");
     klog("[init] mouse_init done\n");
+
+    /* mouse.c rewrites the 8042 CDB; force the keyboard interrupt bits
+     * back on in case its CDB read consumed a stray keystroke byte */
+    keyboard_rearm_interrupt();
 
     klog("Speaker: initializing...\n");
     speaker_init();

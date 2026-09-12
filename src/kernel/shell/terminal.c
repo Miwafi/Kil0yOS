@@ -8,7 +8,12 @@
  * I/O from the serial log. Mirrors the same approach used by tty.c for
  * program output; without it builtin ls/touch output is GUI-only. */
 static void term_serial_putc(char c) {
-    while ((inb(0x3F8 + 5) & 0x20) == 0) {}
+    /* Bounded THR wait - same rationale as klog's serial_putc: a stalled
+     * serial back-end must never hang the shell. */
+    int guard = 100000;
+    while ((inb(0x3F8 + 5) & 0x20) == 0) {
+        if (--guard == 0) return;
+    }
     outb(0x3F8, (uint8_t)c);
 }
 
@@ -75,19 +80,24 @@ static terminal_t g_fb_term = {
 };
 
 /* ========== GUI terminal implementation ========== */
-#define GUI_TERM_COLS 35
-#define GUI_TERM_ROWS 19
+/* Cells grid used by both desktops. The mode13h desktop uses a 26x19 grid
+ * inside its 216px content panel; the GOP desktop computes its grid from
+ * the framebuffer size. MAX bounds size the static cells buffer. */
+#define GUI_TERM_MAX_COLS 192
+#define GUI_TERM_MAX_ROWS 96
 
 typedef struct {
-    uint16_t cells[GUI_TERM_ROWS][GUI_TERM_COLS];
+    uint16_t cells[GUI_TERM_MAX_ROWS][GUI_TERM_MAX_COLS];
     int cursor_x;
     int cursor_y;
     uint8_t color;
-    int base_x;
+    int cols;               /* active grid size (<= MAX)          */
+    int rows;
+    int base_x;             /* glyph origin on the active surface */
     int base_y;
-    int left_w;
-    int header_h;
-    int content_h;
+    int clr_x, clr_y;       /* repaint region (cells area)        */
+    int clr_w, clr_h;
+    int use_fb;             /* render backend: 0=vga mode13h, 1=gop fb */
 } gui_term_priv_t;
 
 static gui_term_priv_t g_gui_priv;
@@ -108,7 +118,7 @@ static void gui_putchar(terminal_t* t, char c) {
         }
     } else if (c == '\t') {
         p->cursor_x = (p->cursor_x + 4) & ~3;
-        if (p->cursor_x >= GUI_TERM_COLS) {
+        if (p->cursor_x >= p->cols) {
             p->cursor_x = 0;
             p->cursor_y++;
         }
@@ -117,21 +127,21 @@ static void gui_putchar(terminal_t* t, char c) {
         p->cursor_x++;
     }
 
-    if (p->cursor_x >= GUI_TERM_COLS) {
+    if (p->cursor_x >= p->cols) {
         p->cursor_x = 0;
         p->cursor_y++;
     }
 
-    if (p->cursor_y >= GUI_TERM_ROWS) {
-        for (int i = 1; i < GUI_TERM_ROWS; i++) {
-            for (int j = 0; j < GUI_TERM_COLS; j++) {
+    if (p->cursor_y >= p->rows) {
+        for (int i = 1; i < p->rows; i++) {
+            for (int j = 0; j < p->cols; j++) {
                 p->cells[i - 1][j] = p->cells[i][j];
             }
         }
-        for (int j = 0; j < GUI_TERM_COLS; j++) {
-            p->cells[GUI_TERM_ROWS - 1][j] = ' ' | ((uint16_t)p->color << 8);
+        for (int j = 0; j < p->cols; j++) {
+            p->cells[p->rows - 1][j] = ' ' | ((uint16_t)p->color << 8);
         }
-        p->cursor_y = GUI_TERM_ROWS - 1;
+        p->cursor_y = p->rows - 1;
     }
 }
 
@@ -149,8 +159,8 @@ static void gui_set_color(terminal_t* t, uint8_t color) {
 static void gui_clear(terminal_t* t) {
     gui_term_priv_t* p = (gui_term_priv_t*)t->priv;
     if (!p) return;
-    for (int i = 0; i < GUI_TERM_ROWS; i++) {
-        for (int j = 0; j < GUI_TERM_COLS; j++) {
+    for (int i = 0; i < p->rows; i++) {
+        for (int j = 0; j < p->cols; j++) {
             p->cells[i][j] = ' ' | ((uint16_t)p->color << 8);
         }
     }
@@ -174,24 +184,47 @@ void term_init_text(void) {
     g_current_term = fb_is_active() ? &g_fb_term : &g_text_term;
 }
 
-void term_init_gui(int left_w, int header_h, int content_h) {
+/* Shared GUI-terminal geometry setup (both desktops / panes). */
+static void gui_term_setup(int use_fb, int base_x, int base_y, int cols, int rows,
+                           int clr_x, int clr_y, int clr_w, int clr_h) {
     gui_term_priv_t* p = &g_gui_priv;
-    p->left_w   = left_w;
-    p->header_h = header_h;
-    p->content_h = content_h;
-    p->base_x   = left_w + 4;
-    p->base_y   = header_h + 14;
-    p->color    = 0x0F;
+    p->use_fb   = use_fb;
+    p->cols     = (cols > GUI_TERM_MAX_COLS) ? GUI_TERM_MAX_COLS : cols;
+    p->rows     = (rows > GUI_TERM_MAX_ROWS) ? GUI_TERM_MAX_ROWS : rows;
+    if (p->cols < 1) p->cols = 1;
+    if (p->rows < 1) p->rows = 1;
+    p->base_x   = base_x;
+    p->base_y   = base_y;
+    p->clr_x    = clr_x;
+    p->clr_y    = clr_y;
+    p->clr_w    = clr_w;
+    p->clr_h    = clr_h;
+    p->color    = 0x00;   /* black text on the white panel */
     p->cursor_x = 0;
     p->cursor_y = 0;
 
-    for (int i = 0; i < GUI_TERM_ROWS; i++) {
-        for (int j = 0; j < GUI_TERM_COLS; j++) {
-            p->cells[i][j] = ' ' | (0x0F << 8);
+    for (int i = 0; i < p->rows; i++) {
+        for (int j = 0; j < p->cols; j++) {
+            p->cells[i][j] = ' ' | (0x00 << 8);
         }
     }
 
     g_current_term = &g_gui_term;
+}
+
+/* Desktop shell terminal on the mode13h surface: caller computes grid and
+ * repaint region for the pane it wants the terminal in. */
+void term_init_gui_at(int base_x, int base_y, int cols, int rows,
+                      int clr_x, int clr_y, int clr_w, int clr_h) {
+    gui_term_setup(0, base_x, base_y, cols, rows, clr_x, clr_y, clr_w, clr_h);
+}
+
+/* GOP desktop shell terminal: grid computed from the framebuffer size by
+ * the caller; rendered through the fb_gfx primitives instead of the
+ * mode13h surface. */
+void term_init_gop_gui(int base_x, int base_y, int cols, int rows,
+                       int clr_x, int clr_y, int clr_w, int clr_h) {
+    gui_term_setup(1, base_x, base_y, cols, rows, clr_x, clr_y, clr_w, clr_h);
 }
 
 void term_set(terminal_t* t) {
@@ -238,20 +271,24 @@ void term_gui_render(void) {
     gui_term_priv_t* p = &g_gui_priv;
 
     /* clear cells area only - keeps the "Shell Terminal" title above base_y intact */
-    vga_fill_rect(p->left_w + 1, p->base_y,
-                  GFX_WIDTH - p->left_w - 2,
-                  p->header_h + p->content_h + 1 - p->base_y, 0x00);
+    if (p->use_fb) {
+        fb_gfx_fill_rect(p->clr_x, p->clr_y, p->clr_w, p->clr_h, 0x0F);
+    } else {
+        vga_fill_rect(p->clr_x, p->clr_y, p->clr_w, p->clr_h, 0x0F);
+    }
 
-    for (int row = 0; row < GUI_TERM_ROWS; row++) {
+    for (int row = 0; row < p->rows; row++) {
         int y = p->base_y + row * 8;
-        if (y >= GFX_HEIGHT - 20) break;
+        if (y >= p->clr_y + p->clr_h) break;
 
-        for (int col = 0; col < GUI_TERM_COLS; col++) {
+        for (int col = 0; col < p->cols; col++) {
             uint16_t cell = p->cells[row][col];
             char c = (char)(cell & 0xFF);
             uint8_t color = (uint8_t)(cell >> 8);
             if (c != ' ') {
-                vga_draw_char(p->base_x + col * 6, y, c, color);
+                int x = p->base_x + col * 8;
+                if (p->use_fb) fb_gfx_draw_char(x, y, c, color);
+                else           vga_draw_char(x, y, c, color);
             }
         }
     }
@@ -269,15 +306,16 @@ void term_gui_type_char(char c) {
     if (g_current_term != &g_gui_term) return;
     gui_term_priv_t* p = &g_gui_priv;
 
-    int px = p->base_x + p->cursor_x * 6;
+    int px = p->base_x + p->cursor_x * 8;
     int py = p->base_y + p->cursor_y * 8;
 
     /* stay inside the content panel and the visible terminal region */
-    if (px + 6 > GFX_WIDTH - 2) return;
-    if (py >= GFX_HEIGHT - 20) return;
+    if (px + 8 > p->clr_x + p->clr_w - 2) return;
+    if (py >= p->clr_y + p->clr_h) return;
 
     gui_putchar(&g_gui_term, c);          /* update cells + cursor */
-    vga_draw_char(px, py, c, p->color);   /* echo immediately */
+    if (p->use_fb) fb_gfx_draw_char(px, py, c, p->color);
+    else           vga_draw_char(px, py, c, p->color);
 }
 
 /* Backspace for interactive input: clear previous cell and move cursor back. */
@@ -291,10 +329,15 @@ void term_gui_backspace(void) {
         p->cursor_x--;
     } else {
         p->cursor_y--;
-        p->cursor_x = GUI_TERM_COLS - 1;
+        p->cursor_x = p->cols - 1;
     }
 
     p->cells[p->cursor_y][p->cursor_x] = ' ' | ((uint16_t)p->color << 8);
-    vga_fill_rect(p->base_x + p->cursor_x * 6,
-                  p->base_y + p->cursor_y * 8, 6, 8, 0x00);
+    if (p->use_fb) {
+        fb_gfx_fill_rect(p->base_x + p->cursor_x * 8,
+                         p->base_y + p->cursor_y * 8, 8, 8, 0x0F);
+    } else {
+        vga_fill_rect(p->base_x + p->cursor_x * 8,
+                      p->base_y + p->cursor_y * 8, 8, 8, 0x0F);
+    }
 }

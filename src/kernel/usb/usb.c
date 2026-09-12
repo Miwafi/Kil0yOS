@@ -451,6 +451,9 @@ void usb_tick(void) {
     if (++tick_count < USB_TICKS_PER_POLL) return;
     tick_count = 0;
 
+    /* release HID binds whose interrupt pipe never came alive */
+    usb_hid_probe_tick();
+
     for (int port = 1; port <= 2; port++) {
         int conn = uhci_port_connected(port);
         uhci_clear_port_change(port);

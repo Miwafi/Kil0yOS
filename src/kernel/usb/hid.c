@@ -71,6 +71,20 @@ static usb_device_t* kbd_dev;
 static uint8_t kbd_prev[8];
 static int kbd_seen_first;
 
+/* bring-up probe state (see usb_hid_probe_tick) */
+static uint32_t kbd_last_xfer;
+static int kbd_silent;
+
+/* --- mouse ---------------------------------------------------------------- */
+
+static usb_device_t* mouse_dev;
+static int mouse_seen_first;
+static uint64_t mouse_last_log_us;
+
+/* bring-up probe state (see usb_hid_probe_tick) */
+static uint32_t mouse_last_xfer;
+static int mouse_silent;
+
 static int slot_has_usage(const uint8_t* r, uint8_t u) {
     for (int i = 2; i < 8; i++)
         if (r[i] == u) return 1;
@@ -120,10 +134,6 @@ static void kbd_report(usb_device_t* dev, const uint8_t* data, int len) {
 
 /* --- mouse --------------------------------------------------------------- */
 
-static usb_device_t* mouse_dev;
-static int mouse_seen_first;
-static uint64_t mouse_last_log_us;
-
 static void mouse_report(usb_device_t* dev, const uint8_t* data, int len) {
     (void)dev;
     if (len < 3) return;
@@ -163,6 +173,8 @@ void usb_hid_attach(usb_device_t* dev) {
         }
         kbd_dev = dev;
         kbd_seen_first = 0;
+        kbd_last_xfer = 0;
+        kbd_silent = 0;
         dev->on_report = kbd_report;
         keyboard_set_ps2_enabled(0);
         klog("[usb] usb_ps2_suppressed\n");
@@ -173,6 +185,8 @@ void usb_hid_attach(usb_device_t* dev) {
         }
         mouse_dev = dev;
         mouse_seen_first = 0;
+        mouse_last_xfer = 0;
+        mouse_silent = 0;
         dev->on_report = mouse_report;
         mouse_set_ps2_enabled(0);
         klog("[usb] usb_mouse_ok\n");
@@ -192,5 +206,40 @@ void usb_hid_detach(usb_device_t* dev) {
         mouse_set_ps2_enabled(1);
         klog("[usb] usb_mouse_gone\n");
         klog("[usb] usb_ps2_resumed\n");
+    }
+}
+
+/* --- bring-up probe -------------------------------------------------------- */
+
+/* A bound HID device whose interrupt pipe stays fully silent for 3 s
+ * (no reports AND no NAKs - a live-but-idle device keeps NAKing the
+ * polled IN token, so nak_count advances) will never deliver input:
+ * unbind it and give the console back to the PS/2 counterpart.  Covers
+ * the parked-firmware case where a virtual USB HID enumerates fine but
+ * its pipe is dead - the unconditional keyboard_set_ps2_enabled(0) in
+ * usb_hid_attach then silenced the only working keyboard.  Called from
+ * usb_tick at the ~1 s cadence, IF=0. */
+#define HID_PROBE_TICKS 3
+
+void usb_hid_probe_tick(void) {
+    if (kbd_dev) {
+        uint32_t xfer = kbd_dev->nak_count + kbd_dev->report_count;
+        if (xfer != kbd_last_xfer) {
+            kbd_last_xfer = xfer;
+            kbd_silent = 0;
+        } else if (++kbd_silent >= HID_PROBE_TICKS) {
+            klog("[usb] usb_kbd pipe silent - releasing bind\n");
+            usb_hid_detach(kbd_dev);          /* restores the PS/2 keyboard */
+        }
+    }
+    if (mouse_dev) {
+        uint32_t xfer = mouse_dev->nak_count + mouse_dev->report_count;
+        if (xfer != mouse_last_xfer) {
+            mouse_last_xfer = xfer;
+            mouse_silent = 0;
+        } else if (++mouse_silent >= HID_PROBE_TICKS) {
+            klog("[usb] usb_mouse pipe silent - releasing bind\n");
+            usb_hid_detach(mouse_dev);        /* restores the PS/2 mouse */
+        }
     }
 }

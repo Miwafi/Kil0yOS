@@ -50,7 +50,7 @@ Linux 兼容层：
 
 GUI：
 
-- 平铺桌面（模式 13h），带 shell、系统面板和一只猫
+- 平铺桌面：BIOS 下驱动 VGA mode 12h（640x480x16 平面显存），UEFI 下渲染到 GOP 帧缓冲
 - 乒乓球游戏作为 Ring 3 程序跑在图形系统调用上
 
 ## 构建和运行
@@ -93,13 +93,7 @@ $ exec /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 
 ## GUI
 
-运行 `gui` 进入平铺桌面，方向键选左侧菜单，回车切换面板。
-
-### 交互式 Shell
-
-图形化 shell，支持 `ls`、`cd`、`mkdir`、`touch`、`pwd`、`shutdown` 等。
-
-![Shell GUI](assets/shellgui.png)
+运行 `gui`（UEFI 启动则用 `desktop`）进入平铺桌面。BIOS 启动时驱动 VGA mode 12h，分辨率 640x480、16 色；UEFI 启动时渲染到 GOP 帧缓冲。方向键选左侧菜单，回车切换面板。
 
 ### 猫
 
@@ -114,6 +108,12 @@ $ exec /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 ### 乒乓球
 
 `exec /bin/pong.bin` 和AI顶级智斗，5分赢。W/S移动挡板，ESC回shell
+
+### 真机运行
+
+VGA 桌面可以直接跑在裸机上——用 `make usb` 写 U 盘，从 BIOS 机器 U 盘启动即可。
+
+![真机上的 Kil0yOS 桌面](assets/realmachine.jpg)
 
 ## 项目结构
 

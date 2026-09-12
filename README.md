@@ -52,7 +52,7 @@ Network:
 
 GUI:
 
-- TempleOS-style tiling desktop in mode 13h, with a shell, a system panel, and a cat
+- TempleOS-style tiling desktop: VGA mode 12h (640x480x16, planar) on BIOS, GOP framebuffer on UEFI
 - A Pong game running as a ring 3 program through the graphics syscalls
 
 ## Build and run
@@ -95,13 +95,7 @@ $ exec /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 
 ## GUI
 
-Run `gui` to enter the tiling desktop. Arrow keys navigate the left menu, Enter switches panels.
-
-### Interactive Shell
-
-A graphical shell supporting `ls`, `cd`, `mkdir`, `touch`, `pwd`, `shutdown`, and more.
-
-![Shell GUI](assets/shellgui.png)
+Run `gui` (or `desktop` if you're launching system from UEFI) to enter the tiling desktop. On BIOS boots it drives the VGA in mode 12h at 640x480, 16 colors; on UEFI it renders onto the GOP framebuffer. Arrow keys navigate the left menu, Enter switches panels.
 
 ### Cat
 
@@ -116,6 +110,12 @@ Because every OS needs one.
 ### Pong
 
 `exec /bin/pong.bin` plays against the AI, first to 5 wins. W/S to move, ESC returns to the shell. Rendered through ring 3 graphics syscalls with incremental, flicker-free updates.
+
+### Real hardware
+
+The VGA desktop also runs on bare metal — write the USB image with `make usb` and boot a BIOS machine from the stick.
+
+![Kil0yOS desktop on a real machine](assets/realmachine.jpg)
 
 ## Project structure
 

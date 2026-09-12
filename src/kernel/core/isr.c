@@ -157,6 +157,25 @@ uint64_t isr_handler(interrupt_frame_t* frame) {
         ex_serial_puts(buf);
     }
 
+    /* Boot-stack overflow detector: the boot page tables used to sit
+     * directly below the boot stack, so a run-away kernel stack silently
+     * zeroed PDEs (seen as random not-present #PFs on heap/.bss windows
+     * minutes into boot). Classify the faulting RSP against the boot
+     * stack + guard region so the cause is visible on the first fault. */
+    if ((frame->cs & 3) == 0) {
+        extern char stack_guard_bottom[], stack_bottom[], stack_top[];
+        uint64_t rsp = frame->rsp;
+        if (rsp >= (uint64_t)stack_bottom && rsp < (uint64_t)stack_top) {
+            utohex((uint64_t)stack_top - rsp, buf);
+            ex_serial_puts(" [stk] boot-stack depth=0x");
+            ex_serial_puts(buf);
+        } else if (rsp < (uint64_t)stack_bottom && rsp >= (uint64_t)stack_guard_bottom) {
+            ex_serial_puts(" [stk] !! BOOT-STACK OVERFLOW (burning guard)");
+        } else if (rsp < (uint64_t)stack_guard_bottom) {
+            ex_serial_puts(" [stk] !!! BOOT-STACK OVERFLOW - below guard, stomping low .bss");
+        }
+    }
+
     /* Kernel stack dump: helps identify the caller chain of a fault in
      * kernel context (code lives at 0x100000-0x400000). */
     if ((frame->cs & 3) == 0) {

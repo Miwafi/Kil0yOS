@@ -32,16 +32,35 @@ void rtc_init(void) {
 int rtc_read(rtc_time_t* time) {
     if (!time) return -1;
 
-    /* Wait for update in progress to clear */
-    while (cmos_read(RTC_STAT_A) & 0x80);
+    /* UIP-safe read.  The old `while (UIP);` was UNBOUNDED: the desktop
+     * clock loop calls rtc_read ~100x/s, so it hits the per-second ~2ms
+     * update window within seconds of entering the desktop - and with the
+     * parked VMware firmware the observed UIP never cleared, silently
+     * freezing the desktop (no #PF, interrupts still on, nothing on the
+     * serial log).  Now: bounded UIP wait + full-burst retry when an
+     * update begins mid-read (torn values) + -1 degrade instead of hang. */
+    uint8_t second, minute, hour, day, month, year, century;
+    int ok = 0;
+    for (int attempt = 0; attempt < 5 && !ok; attempt++) {
+        uint32_t n = 500000;   /* real silicon clears UIP in <= 2.244ms */
+        while (cmos_read(RTC_STAT_A) & 0x80) {
+            if (--n == 0) return -1;   /* UIP stuck: degrade, never hang */
+            __asm__ volatile("pause");
+        }
 
-    uint8_t second  = cmos_read(RTC_SEC);
-    uint8_t minute  = cmos_read(RTC_MIN);
-    uint8_t hour    = cmos_read(RTC_HOUR);
-    uint8_t day     = cmos_read(RTC_DAY);
-    uint8_t month   = cmos_read(RTC_MONTH);
-    uint8_t year    = cmos_read(RTC_YEAR);
-    uint8_t century = cmos_read(RTC_CENTURY);
+        second  = cmos_read(RTC_SEC);
+        minute  = cmos_read(RTC_MIN);
+        hour    = cmos_read(RTC_HOUR);
+        day     = cmos_read(RTC_DAY);
+        month   = cmos_read(RTC_MONTH);
+        year    = cmos_read(RTC_YEAR);
+        century = cmos_read(RTC_CENTURY);
+
+        /* update began during the burst?  UIP set again -> values may be
+         * torn (e.g. 59 -> 00 mid-read); retry the whole burst. */
+        if ((cmos_read(RTC_STAT_A) & 0x80) == 0) ok = 1;
+    }
+    if (!ok) return -1;
 
     uint8_t stat_b = cmos_read(RTC_STAT_B);
 

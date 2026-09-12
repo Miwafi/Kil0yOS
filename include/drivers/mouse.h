@@ -27,4 +27,8 @@ void mouse_inject_delta(int dx, int dy, int buttons);
  * (sendkey/mouse_move would otherwise deliver every event twice). */
 void mouse_set_ps2_enabled(int enabled);
 
+/* Pointer movement clamp; defaults to the 320x200 mode13h surface. The GOP
+ * desktop raises it to the framebuffer size on entry and restores it. */
+void mouse_set_bounds(int w, int h);
+
 #endif

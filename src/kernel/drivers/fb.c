@@ -19,8 +19,17 @@ static int       active = 0;
 static int cur_x = 0;           /* glyph column              */
 static int cur_y = 0;           /* glyph row                 */
 static int cursor_drawn = 0;    /* software cursor on screen */
+static int console_muted = 0;   /* desktop mode: klog must not paint */
 static uint32_t fg_rgb = 0xAAAAAA;   /* EGA 7 light grey */
 static uint32_t bg_rgb = 0x000000;   /* EGA 0 black      */
+
+/* While the GOP desktop owns the whole screen, plain console text would
+ * be painted straight over the desktop chrome and stay there until some
+ * UI redraw happens to cover that region.  Muting makes fb_putchar a
+ * no-op so klog output goes to the serial log only; the desktop exit
+ * path unmutes and repaints the terminal via fb_clear(). */
+void fb_console_mute(int on) { console_muted = on; }
+int  fb_console_muted(void)  { return console_muted; }
 
 /* EGA 16-color palette (matches the vga_color numbering) -> 0xRRGGBB */
 static const uint32_t ega_rgb[16] = {
@@ -51,6 +60,8 @@ void fb_set_info(uint64_t base, uint32_t pitch, uint32_t w, uint32_t h,
 int fb_is_active(void) { return active; }
 int fb_cols(void)      { return active ? (int)(w_ / 8) : 0; }
 int fb_rows(void)      { return active ? (int)(h_ / 8) : 0; }
+int fb_width(void)     { return active ? (int)w_ : 0; }
+int fb_height(void)    { return active ? (int)h_ : 0; }
 
 static inline void set_pixel(int x, int y, uint32_t rgb) {
     uint32_t word;
@@ -63,6 +74,123 @@ static inline void set_pixel(int x, int y, uint32_t rgb) {
         word = 0xFF000000u | rgb;              /* X R G B little-endian */
     }
     fb[y * (pitch_ / 4) + x] = word;
+}
+
+/* ========== GOP desktop primitives (EGA-index colored) ========== */
+
+static inline uint32_t pack_rgb(uint32_t rgb) {
+    return rgbx_ ? (0xFF000000u | ((rgb & 0xFF) << 16) |
+                    (rgb & 0xFF00) | (rgb >> 16))
+                 : (0xFF000000u | rgb);
+}
+
+void fb_gfx_fill_rect(int x, int y, int w, int h, uint8_t ega_index) {
+    if (!active) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)w_) w = (int)w_ - x;
+    if (y + h > (int)h_) h = (int)h_ - y;
+    if (w <= 0 || h <= 0) return;
+
+    uint32_t word = pack_rgb(ega_rgb[ega_index & 0x0F]);
+    uint32_t stride = pitch_ / 4;
+    for (int row = y; row < y + h; row++) {
+        uint32_t* line = fb + row * stride + x;
+        for (int col = 0; col < w; col++) line[col] = word;
+    }
+}
+
+void fb_gfx_draw_rect(int x, int y, int w, int h, uint8_t ega_index) {
+    if (!active || w <= 0 || h <= 0) return;
+    fb_gfx_fill_rect(x, y, w, 1, ega_index);
+    fb_gfx_fill_rect(x, y + h - 1, w, 1, ega_index);
+    fb_gfx_fill_rect(x, y, 1, h, ega_index);
+    fb_gfx_fill_rect(x + w - 1, y, 1, h, ega_index);
+}
+
+/* transparent-background glyph, matching vga_draw_char */
+void fb_gfx_draw_char(int x, int y, char c, uint8_t ega_index) {
+    if (!active) return;
+    if (x < 0 || x + 8 > (int)w_ || y < 0 || y + 8 > (int)h_) return;
+    if (c < 0x20 || c > 0x7E) c = 0x20;
+
+    uint32_t rgb = ega_rgb[ega_index & 0x0F];
+    for (int row = 0; row < 8; row++) {
+        uint8_t bits = matrix_font[c - 0x20][row];
+        for (int col = 0; col < 8; col++) {
+            if (bits & (0x80 >> col)) set_pixel(x + col, y + row, rgb);
+        }
+    }
+}
+
+void fb_gfx_draw_string(int x, int y, const char* s, uint8_t ega_index) {
+    if (!active) return;
+    int cx = x;
+    while (s && *s) {
+        if (*s == '\n') {
+            cx = x;
+            y += 8;
+        } else {
+            fb_gfx_draw_char(cx, y, *s, ega_index);
+            cx += 8;
+        }
+        s++;
+    }
+}
+
+/* ========== desktop pointer (white arrow, save/restore) ========== */
+
+#define DCUR_W 8
+#define DCUR_H 12
+static const uint8_t dcur_pat[DCUR_H][DCUR_W] = {
+    {1,0,0,0,0,0,0,0},
+    {1,1,0,0,0,0,0,0},
+    {1,1,1,0,0,0,0,0},
+    {1,1,1,1,0,0,0,0},
+    {1,1,1,1,1,0,0,0},
+    {1,1,1,1,1,1,0,0},
+    {1,1,1,1,1,1,1,0},
+    {1,1,1,1,1,1,1,1},
+    {1,1,1,1,1,0,0,0},
+    {1,1,0,1,1,0,0,0},
+    {1,0,0,1,1,0,0,0},
+    {0,0,0,1,1,0,0,0},
+};
+static uint32_t dcur_save[DCUR_H][DCUR_W];
+static int dcur_x = -1, dcur_y = -1, dcur_visible = 0;
+
+void fb_gfx_cursor_draw(int x, int y) {
+    if (!active) return;
+    if (dcur_visible) fb_gfx_cursor_erase(0, 0);
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + DCUR_W > (int)w_) x = (int)w_ - DCUR_W;
+    if (y + DCUR_H > (int)h_) y = (int)h_ - DCUR_H;
+
+    uint32_t stride = pitch_ / 4;
+    for (int row = 0; row < DCUR_H; row++) {
+        for (int col = 0; col < DCUR_W; col++) {
+            int px = x + col, py = y + row;
+            dcur_save[row][col] = fb[py * stride + px];
+            if (dcur_pat[row][col]) set_pixel(px, py, 0x000000);
+        }
+    }
+    dcur_x = x;
+    dcur_y = y;
+    dcur_visible = 1;
+}
+
+void fb_gfx_cursor_erase(int x, int y) {
+    (void)x; (void)y;   /* position remembered internally */
+    if (!dcur_visible || !active) { dcur_visible = 0; return; }
+
+    uint32_t stride = pitch_ / 4;
+    for (int row = 0; row < DCUR_H; row++)
+        for (int col = 0; col < DCUR_W; col++)
+            fb[(dcur_y + row) * stride + (dcur_x + col)] = dcur_save[row][col];
+
+    dcur_visible = 0;
 }
 
 /* 8x8 glyph from matrix_font; the whole cell is repainted with the
@@ -144,10 +272,13 @@ void fb_clear(void) {
     cur_x = 0;
     cur_y = 0;
     cursor_drawn = 0;
+    /* screen wipe invalidates the desktop pointer's save buffer */
+    dcur_visible = 0;
+    dcur_x = dcur_y = -1;
 }
 
 void fb_putchar(char c) {
-    if (!active) return;
+    if (!active || console_muted) return;
     cursor_erase();
 
     if (c == '\n') {
