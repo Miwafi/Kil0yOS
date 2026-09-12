@@ -137,6 +137,37 @@ CHANGELOG.md          Release notes
 ROADMAP_LINUX_COMPAT.md   Linux compatibility roadmap (phases 0-4)
 ```
 
+## External resources
+
+Kil0yOS is licensed GPL-2.0. The following third-party resources are used or
+referenced; each is listed with its license and how it is used.
+
+### Embedded in the kernel image
+
+| Resource | License | Usage |
+|---|---|---|
+| [BusyBox](https://busybox.net/) 1.36.1 | GPL-2.0 | Built from source by `tools/build_busybox.sh`; when the binary exists it is embedded via `incbin` and installed as `/bin/busybox` at boot. |
+| [MT7601U firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/mediatek/mt7601u.bin) (`assets/firmware/mt7601u.bin`) | **Redistributable, NOT GPL** — MediaTek proprietary firmware, redistributed unchanged per `LICENCE.mediatek` in the linux-firmware tree | Embedded via `incbin` at build time and uploaded to the Wi-Fi dongle at runtime by `src/kernel/net/mt7601u.c`. md5 verified by `tools/fetch_mt7601.sh`. |
+
+### Source code used as reference (GPL-2.0, license-compatible)
+
+| Reference | License | Where it influenced Kil0yOS |
+|---|---|---|
+| Linux kernel `drivers/net/wireless/mediatek/mt7601u` | GPL-2.0 | Vendor request opcodes, BBP/RF/MCU init sequence, firmware-upload protocol in `src/kernel/net/mt7601u.c` follow the Linux driver's behavior. |
+| Linux kernel `drivers/usb/host/xhci.h` | GPL-2.0 | Register/layout constants in `src/kernel/usb/xhci.c`. |
+| QEMU `hw/usb/hcd-xhci.c` | GPL-2.0 | Studied as a behavioral reference for xHCI command/event semantics. |
+
+Because Kil0yOS itself is GPL-2.0, deriving from these GPL works is
+license-compatible. `tools/fetch_mt7601.sh` / `tools/fetch_xhci_ref.sh`
+re-download the exact reference sources for auditability.
+
+### Test tooling only (not distributed as part of the OS)
+
+| Resource | License | Usage |
+|---|---|---|
+| QEMU | GPL-2.0 | Development and headless acceptance testing only. |
+| [glibc](https://www.gnu.org/software/libc/) | LGPL-2.1 | Host `libc.so.6` / `ld-linux` are embedded as blobs **only** for Linux-ABI compatibility tests (`hello-glibc`), never for the OS itself. |
+| [musl libc](https://musl.libc.org/) | MIT | Host toolchain libc used to build test programs at build time. |
 ## License
 
 GPL-2.0

@@ -135,6 +135,37 @@ CHANGELOG.md          发布日志
 ROADMAP_LINUX_COMPAT.md   Linux 兼容路线图（阶段 0-4）
 ```
 
+## 外部资源声明
+
+Kil0yOS 采用 GPL-2.0 许可证。项目使用或参考了以下第三方资源，逐一标注来源、
+许可证与使用方式。
+
+### 内嵌进内核镜像
+
+| 资源 | 许可证 | 使用方式 |
+|---|---|---|
+| [BusyBox](https://busybox.net/) 1.36.1 | GPL-2.0 | 由 `tools/build_busybox.sh` 从源码构建；构建产物存在时经 `incbin` 内嵌，启动时安装为 `/bin/busybox`。 |
+| [MT7601U 固件](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/mediatek/mt7601u.bin)（`assets/firmware/mt7601u.bin`） | **可再分发、非 GPL**——MediaTek 专有固件，按 linux-firmware 树中的 `LICENCE.mediatek` 原样再分发 | 构建期 `incbin` 内嵌，运行时由 `src/kernel/net/mt7601u.c` 上传到网卡；`tools/fetch_mt7601.sh` 下载时校验 md5。 |
+
+### 参考的源码（GPL-2.0，与本项目许可证兼容）
+
+| 参考 | 许可证 | 对本项目的影响 |
+|---|---|---|
+| Linux 内核 `drivers/net/wireless/mediatek/mt7601u` | GPL-2.0 | `src/kernel/net/mt7601u.c` 中的厂商请求码、BBP/RF/MCU 初始化时序、固件上传协议遵循 Linux 驱动的行为。 |
+| Linux 内核 `drivers/usb/host/xhci.h` | GPL-2.0 | `src/kernel/usb/xhci.c` 的寄存器与结构体布局常量。 |
+| QEMU `hw/usb/hcd-xhci.c` | GPL-2.0 | 作为 xHCI 命令/事件语义的行为参考研读。 |
+
+Kil0yOS 本身即 GPL-2.0，对上述 GPL 作品的参考在许可证上兼容。
+`tools/fetch_mt7601.sh` / `tools/fetch_xhci_ref.sh` 可重新下载确切的参考源码
+以便审计。
+
+### 仅测试工具链（不随操作系统分发）
+
+| 资源 | 许可证 | 使用方式 |
+|---|---|---|
+| QEMU | GPL-2.0 | 仅用于开发与无头验收测试。 |
+| [glibc](https://www.gnu.org/software/libc/) | LGPL-2.1 | 宿主机 `libc.so.6` / `ld-linux` 仅作为 Linux-ABI 兼容性测试（`hello-glibc`）的测试 blob 内嵌，不用于操作系统本体。 |
+| [musl libc](https://musl.libc.org/) | MIT | 构建期宿主机工具链的 libc，用于编译测试程序。 |
 ## 许可证
 
 GPL-2.0
