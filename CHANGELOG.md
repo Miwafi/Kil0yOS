@@ -2,6 +2,28 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.19.0] - 2026-09-13
+This release turns the desktop's left Files panel from a static placeholder into a **real graphical file manager**: it browses the `fs_entry_t` tree with keyboard and mouse, creates files/directories, deletes with confirmation, and previews text files in place — all through absolute paths, so the shell pane's working directory is never disturbed.
+
+### Added
+- **Graphical browsing**: the FUNC_FILES panel lists the browsed directory — directories first, then case-insensitive alphabetical files; blue `/`-suffixed dir rows, right-aligned size column for files (B/K/M), a selection bar, a scroll window with scrollbar, a `..` up-row, entry count, a tail-truncated absolute path header, and a transient status line (created/deleted plus `fs_get_last_error` mapping).
+- **Keyboard interaction**: ↑/↓ move the selection, Enter opens (directory → navigate into; file → text preview), Backspace/← go to the parent, `M` new directory, `N` new file, `D` delete with a Y/N confirm box. While Files is active the panel owns the keyboard — keys no longer leak into the shell pane.
+- **Mouse interaction**: left-click selects a row; clicking the already-selected row opens it; a click also dismisses the preview popup.
+- **Text preview popup**: centered modal showing the first 14 lines (4 KB cap) of a file with binary detection (`<binary data>`), tab/non-printable sanitizing, and a title bar with name + human-readable size.
+- **Create/delete via absolute paths**: the name-input popup (typing + Enter/Esc) creates a file/directory inside the browsed directory by absolute path (`fs_create_file`/`fs_create_dir`); deletion resolves the same absolute path through `fs_delete_entry`. Created entries are auto-selected, and every action is klog-recorded as `[files] created|deleted <abs path>`.
+
+### Changed
+- `desktop_repaint` redraws an open Files modal popup last, so closing the Win-key menu over a modal no longer erases it; ESC and Win during a modal are routed to the modal (ESC closes the popup instead of leaving the desktop).
+- **Stale-directory guard**: before every render the browsed directory is validated against `fs_root()` reachability — if the shell deleted it meanwhile, the panel falls back to the root instead of dereferencing freed memory.
+- Version strings bumped to 2.19.0 (boot banner, `uname`, shell `version`, GUI title bar, `accept_gop.sh` checks).
+
+### File Changes
+- `src/kernel/shell/shell.c`: FM core (state, sorting, render/geometry), three modals (name input / delete confirm / preview), keyboard + mouse integration into the desktop loop, `FUNC_FILES` + repaint wiring
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
+### Notes
+- **Acceptance**: headless QEMU UEFI smoke on `build/kil0yos.iso` — Win-menu → Files renders (pixel-verified selection bar + dir rows), `N hello.txt` and `M mydir` produce `[files] created` klog markers, Enter/backspace navigate, `D` + `Y` fires the delete marker, ESC returns to the shell and `ls` shows the created directory; no `EXCEPTION`/`PANIC` in the serial log.
+
 ## [2.18.0] - 2026-09-12
 This release reshapes the GUI desktop into a **three-pane layout** with a Win-key start menu, replaces the PIT-rollover uptime with a **TSC-based monotonic clock**, and — the headline — boots from a **real USB stick on bare-metal BIOS machines** (`tools/make_usb.sh` writes a FAT16 MBR image; the VGA desktop runs unmodified on the stick-booted machine).
 

@@ -443,7 +443,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.17.1\n");
+    vga_puts("Kil0yOS v2.19.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -735,6 +735,609 @@ static void gui_shell_execute(void) {
     gui_shell_draw_prompt();
 }
 
+/* ===== Files panel: graphical file manager =====
+ * Left-panel browser over the fs_entry_t tree. Directories open on Enter,
+ * files open a text preview; M/N create a directory/file in the browsed
+ * directory (never touching the shell's cwd: creation goes through
+ * absolute paths), D deletes with confirmation. Mouse: click selects,
+ * clicking the selected row opens. */
+static void desktop_repaint(void);   /* fwd: modal close repaints everything */
+extern void klog(const char* s);
+
+enum { FM_BROWSE = 0, FM_INPUT, FM_CONFIRM, FM_PREVIEW };
+static fs_entry_t* fm_dir = NULL;               /* browsed directory */
+static int fm_sel = 0;                          /* selected row */
+static int fm_scroll = 0;                       /* first visible row */
+static fs_entry_t* fm_list[MAX_DIR_ENTRIES];    /* rows; NULL = ".." up */
+static int fm_count = 0;                        /* rows incl. ".." */
+static int fm_mode = FM_BROWSE;
+static int fm_input_kind;                       /* 0 = file, 1 = directory */
+static char fm_input_buf[40];
+static int fm_input_len;
+static char fm_status[64];                      /* last action / error */
+
+#define FM_PV_ROWS 14
+#define FM_PV_COLS 76
+static char fm_pv[FM_PV_ROWS][FM_PV_COLS + 1];
+static int fm_pv_count;
+static char fm_pv_title[96];
+
+/* list geometry captured by fm_render for mouse hit testing */
+static int fm_list_y0, fm_row_h, fm_vis;
+
+static void fm_clipn(char* out, int outsz, const char* s, int maxc) {
+    int i = 0;
+    if (maxc > outsz - 1) maxc = outsz - 1;
+    while (s[i] && i < maxc) {
+        out[i] = s[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+/* clipped draw inside the left panel (panel interior ends at lay_left_w-2) */
+static void fm_sclip(int x, int y, const char* s, uint8_t col) {
+    int avail = lay_left_w - 2 - x;
+    if (avail < 8) return;
+    char buf[40];
+    fm_clipn(buf, (int)sizeof(buf), s, avail / 8);
+    dt_draw_string(x, y, buf, col);
+}
+
+static void fm_abs_path(fs_entry_t* e, char* out, int outsz) {
+    if (e == NULL || e->parent == NULL) {
+        strcpy(out, "/");
+        return;
+    }
+    const char* comps[32];
+    int n = 0;
+    for (fs_entry_t* p = e; p != NULL && p->parent != NULL && n < 32; p = p->parent) {
+        comps[n++] = p->name;
+    }
+    int pos = 0;
+    out[pos++] = '/';
+    for (int i = n - 1; i >= 0; i--) {
+        int len = strlen(comps[i]);
+        if (pos + len + 2 >= outsz) break;
+        memcpy(out + pos, comps[i], len);
+        pos += len;
+        if (i > 0) out[pos++] = '/';
+    }
+    out[pos] = '\0';
+}
+
+static int fm_ci_cmp(const char* a, const char* b) {
+    while (*a && *b) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb) return (ca < cb) ? -1 : 1;
+        a++;
+        b++;
+    }
+    if (*a) return 1;
+    if (*b) return -1;
+    return 0;
+}
+
+/* Pointer validation: the shell can delete (and free) the directory we are
+ * browsing, so never dereference fm_dir without proving it is still in the
+ * tree. Only compares pointers, safe even for a dangling fm_dir. */
+static int fm_in_tree(fs_entry_t* node, fs_entry_t* target) {
+    if (node == target) return 1;
+    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+        if (node->children[i] != NULL &&
+            node->children[i]->type == FS_TYPE_DIRECTORY &&
+            fm_in_tree(node->children[i], target)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Rebuild the sorted row list: ".." first, then directories before files,
+ * each group case-insensitive alphabetical. */
+static void fm_refresh(void) {
+    if (fm_dir == NULL) fm_dir = fs_current();
+    if (fm_dir == NULL || !fm_in_tree(fs_root(), fm_dir)) {
+        fm_dir = fs_root();
+        fm_sel = 0;
+        fm_scroll = 0;
+    }
+
+    static fs_entry_t* tmp[MAX_DIR_ENTRIES];
+    int t = 0;
+    for (int i = 0; i < MAX_DIR_ENTRIES && t < MAX_DIR_ENTRIES; i++) {
+        if (fm_dir->children[i] != NULL) tmp[t++] = fm_dir->children[i];
+    }
+    for (int i = 1; i < t; i++) {
+        fs_entry_t* key = tmp[i];
+        int j = i - 1;
+        while (j >= 0) {
+            int rj = (tmp[j]->type != FS_TYPE_DIRECTORY) ? 1 : 0;
+            int rk = (key->type != FS_TYPE_DIRECTORY) ? 1 : 0;
+            if (rj > rk || (rj == rk && fm_ci_cmp(tmp[j]->name, key->name) > 0)) {
+                tmp[j + 1] = tmp[j];
+                j--;
+            } else {
+                break;
+            }
+        }
+        tmp[j + 1] = key;
+    }
+
+    int n = 0;
+    if (fm_dir->parent != NULL) fm_list[n++] = NULL;   /* ".." row */
+    for (int i = 0; i < t && n < MAX_DIR_ENTRIES; i++) {
+        fm_list[n++] = tmp[i];
+    }
+    fm_count = n;
+    if (fm_sel >= fm_count) fm_sel = (fm_count > 0) ? fm_count - 1 : 0;
+    if (fm_sel < 0) fm_sel = 0;
+}
+
+static void fm_size_str(uint32_t sz, char* out) {
+    if (sz < 1024) {
+        itoa((int)sz, out, 10, 8);
+    } else if (sz < 1024u * 1024) {
+        itoa((int)(sz / 1024), out, 10, 8);
+        strcat(out, "K");
+    } else {
+        itoa((int)(sz / (1024u * 1024)), out, 10, 8);
+        strcat(out, "M");
+    }
+}
+
+static void fm_render(void) {
+    int cx = 4;
+    int y = lay_header_h + 3;
+    int content_h = dt_h - lay_header_h - lay_footer_h;
+    int bottom = dt_h - lay_footer_h - 1;
+
+    dt_fill_rect(1, lay_header_h + 1, lay_left_w - 2, content_h - 2, 0x0F);
+
+    fm_sclip(cx, y, "Files", 0x09);
+    if (fm_dir != NULL) {
+        char cnt[12];
+        itoa(fm_count, cnt, 10, sizeof(cnt));
+        int cxx = lay_left_w - 2 - (int)strlen(cnt) * 8 - 4;
+        if (cxx > cx + 48) fm_sclip(cxx, y, cnt, 0x08);
+    }
+    y += 11;
+
+    /* current path, tail-truncated (deepest components matter most) */
+    char p[MAX_PATH_LENGTH];
+    fm_abs_path(fm_dir, p, (int)sizeof(p));
+    int pmax = (lay_left_w - 2 - cx) / 8;
+    if ((int)strlen(p) > pmax) {
+        char pt[MAX_PATH_LENGTH];
+        pt[0] = '~';
+        strcpy(pt + 1, p + strlen(p) - (pmax - 1));
+        fm_sclip(cx, y, pt, 0x08);
+    } else {
+        fm_sclip(cx, y, p, 0x08);
+    }
+    y += 10;
+    dt_fill_rect(cx, y, lay_left_w - 8, 1, 0x07);
+    y += 4;
+
+    fm_row_h = dt_use_fb ? 12 : 10;
+    int list_h = bottom - 34 - y;
+    if (list_h < fm_row_h) list_h = fm_row_h;
+    fm_list_y0 = y;
+    fm_vis = list_h / fm_row_h;
+    if (fm_vis < 1) fm_vis = 1;
+
+    if (fm_scroll > fm_sel) fm_scroll = fm_sel;
+    if (fm_sel >= fm_scroll + fm_vis) fm_scroll = fm_sel - fm_vis + 1;
+    if (fm_scroll < 0) fm_scroll = 0;
+    if (fm_count > 0 && fm_scroll > fm_count - 1) fm_scroll = fm_count - 1;
+
+    int text_x = cx + 2;
+    if (fm_count == 0) {
+        fm_sclip(text_x, fm_list_y0 + 2, "(empty)", 0x08);
+    } else {
+        for (int r = 0; r < fm_vis; r++) {
+            int idx = fm_scroll + r;
+            if (idx >= fm_count) break;
+            int ry = fm_list_y0 + r * fm_row_h;
+            fs_entry_t* e = fm_list[idx];
+            int is_dir = (e == NULL) || (e->type == FS_TYPE_DIRECTORY);
+            if (idx == fm_sel) {
+                dt_fill_rect(cx + 1, ry - 1, lay_left_w - 7 - cx, fm_row_h - 1, 0x01);
+            }
+            uint8_t col = (idx == fm_sel) ? 0x0F
+                        : (is_dir)          ? 0x01
+                                            : 0x00;
+            if (e == NULL) {
+                fm_sclip(text_x, ry, "..", col);
+            } else {
+                char nb[64];
+                fm_clipn(nb, (int)sizeof(nb) - 2, e->name, sizeof(nb) - 3);
+                if (is_dir) strcat(nb, "/");
+                fm_sclip(text_x, ry, nb, col);
+                if (!is_dir) {
+                    char sb[12];
+                    fm_size_str(e->size, sb);
+                    int sx = lay_left_w - 6 - (int)strlen(sb) * 8;
+                    if (sx > text_x + (int)strlen(nb) * 8 + 8) {
+                        fm_sclip(sx, ry, sb, 0x08);
+                    }
+                }
+            }
+        }
+        if (fm_count > fm_vis) {
+            int sb_x = lay_left_w - 5;
+            dt_fill_rect(sb_x, fm_list_y0, 2, list_h, 0x07);
+            int thumb = (fm_vis * list_h) / fm_count;
+            if (thumb < 4) thumb = 4;
+            int max_off = fm_count - fm_vis;
+            int ty = fm_list_y0 + ((list_h - thumb) * fm_scroll) / (max_off > 0 ? max_off : 1);
+            dt_fill_rect(sb_x, ty, 2, thumb, 0x01);
+        }
+    }
+
+    /* status + key hints */
+    if (fm_status[0]) fm_sclip(cx, bottom - 26, fm_status, 0x04);
+    fm_sclip(cx, bottom - 16, "Enter:open BS:up", 0x08);
+    fm_sclip(cx, bottom - 8, "M:dir N:file D:del", 0x08);
+}
+
+static void fm_navigate(fs_entry_t* d) {
+    if (d == NULL || d->type != FS_TYPE_DIRECTORY) return;
+    fm_dir = d;
+    fm_sel = 0;
+    fm_scroll = 0;
+    fm_status[0] = '\0';
+    fm_refresh();
+}
+
+static void fm_preview_show(fs_entry_t* e) {
+    fm_pv_count = 0;
+    char sb[12];
+    fm_size_str(e->size, sb);
+    fm_clipn(fm_pv_title, (int)sizeof(fm_pv_title) - 8, e->name, 64);
+    strcat(fm_pv_title, " (");
+    strcat(fm_pv_title, sb);
+    strcat(fm_pv_title, ")");
+
+    if (e->size == 0) {
+        strcpy(fm_pv[0], "<empty file>");
+        fm_pv_count = 1;
+    } else {
+        size_t rd = (e->size < 4096) ? e->size : 4096;
+        uint8_t* buf = (uint8_t*)kmalloc(rd + 1);
+        if (buf == NULL) {
+            strcpy(fm_pv[0], "<out of memory>");
+            fm_pv_count = 1;
+        } else {
+            int got = fs_read_file(e, buf, rd);
+            if (got <= 0) {
+                strcpy(fm_pv[0], "<read error>");
+                fm_pv_count = 1;
+            } else {
+                int binary = 0;
+                for (int i = 0; i < got; i++) {
+                    if (buf[i] == 0) { binary = 1; break; }
+                }
+                if (binary) {
+                    strcpy(fm_pv[0], "<binary data>");
+                    fm_pv_count = 1;
+                } else {
+                    const uint8_t* ptr = buf;
+                    const uint8_t* end = buf + got;
+                    while (ptr < end && fm_pv_count < FM_PV_ROWS) {
+                        int i = 0;
+                        while (ptr < end && *ptr != '\n' && *ptr != '\r' &&
+                               i < FM_PV_COLS) {
+                            char c = (char)*ptr;
+                            if (c == '\t') c = ' ';
+                            else if (c < 32 || c > 126) c = '.';
+                            fm_pv[fm_pv_count][i++] = c;
+                            ptr++;
+                        }
+                        fm_pv[fm_pv_count][i] = '\0';
+                        fm_pv_count++;
+                        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ptr++;
+                    }
+                    if (ptr < end && fm_pv_count > 0) {
+                        strcpy(fm_pv[fm_pv_count - 1], "...");
+                    }
+                }
+            }
+            kfree(buf);
+        }
+    }
+    fm_mode = FM_PREVIEW;
+}
+
+static void fm_open_selected(void) {
+    if (fm_count == 0 || fm_dir == NULL) return;
+    fs_entry_t* e = fm_list[fm_sel];
+    if (e == NULL) {
+        fm_navigate(fm_dir->parent);       /* ".." */
+        return;
+    }
+    if (e->type == FS_TYPE_DIRECTORY) {
+        fm_navigate(e);
+        return;
+    }
+    fm_preview_show(e);
+}
+
+static void fm_status_err(const char* op) {
+    int err = fs_get_last_error();
+    strcpy(fm_status, op);
+    strcat(fm_status, ": ");
+    strcat(fm_status, (err == FS_ERR_EXISTS) ? "exists"
+                    : (err == FS_ERR_FULL)   ? "full"
+                    : (err == FS_ERR_IO)     ? "io error"
+                                             : "error");
+}
+
+/* Create in the BROWSED directory via absolute path - the shell's cwd
+ * (fs_current) must stay untouched. */
+static void fm_input_confirm(void) {
+    const char* name = fm_input_buf;
+    if (name[0] == '\0' || !strcmp(name, ".") || !strcmp(name, "..")) {
+        strcpy(fm_status, "invalid name");
+        return;
+    }
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL) {
+        strcpy(fm_status, "invalid name");
+        return;
+    }
+
+    char base[MAX_PATH_LENGTH];
+    fm_abs_path(fm_dir, base, (int)sizeof(base));
+    if (strlen(base) > 1) strcat(base, "/");
+    if (strlen(base) + strlen(name) >= sizeof(base)) {
+        strcpy(fm_status, "name too long");
+        return;
+    }
+    strcat(base, name);
+
+    fs_entry_t* created = (fm_input_kind == 1) ? fs_create_dir(base)
+                                               : fs_create_file(base);
+    if (created == NULL) {
+        fm_status_err(fm_input_kind == 1 ? "mkdir" : "touch");
+        return;
+    }
+
+    strcpy(fm_status, "created ");
+    strcat(fm_status, name);
+    klog("[files] created ");
+    klog(base);
+    klog("\n");
+    fm_refresh();
+    for (int i = 0; i < fm_count; i++) {
+        if (fm_list[i] == created) { fm_sel = i; break; }
+    }
+}
+
+static void fm_do_delete(void) {
+    if (fm_sel < 0 || fm_sel >= fm_count || fm_dir == NULL) return;
+    fs_entry_t* e = fm_list[fm_sel];
+    if (e == NULL) return;
+
+    char base[MAX_PATH_LENGTH];
+    fm_abs_path(fm_dir, base, (int)sizeof(base));
+    if (strlen(base) > 1) strcat(base, "/");
+    if (strlen(base) + strlen(e->name) >= sizeof(base)) {
+        strcpy(fm_status, "name too long");
+        return;
+    }
+    strcat(base, e->name);
+
+    if (fs_delete_entry(base) != 0) {
+        strcpy(fm_status, "delete failed");
+        return;
+    }
+    strcpy(fm_status, "deleted ");
+    strcat(fm_status, e->name);
+    klog("[files] deleted ");
+    klog(base);
+    klog("\n");
+    fm_refresh();
+    if (fm_sel >= fm_count && fm_sel > 0) fm_sel--;
+}
+
+/* ===== modal popups (centered, overlap the right panes) ===== */
+static void fm_input_box_draw(void) {
+    int w = dt_w - 40; if (w > 300) w = 300; if (w < 180) w = 180;
+    int h = 64;
+    int x = (dt_w - w) / 2;
+    int y = (dt_h - h) / 2;
+
+    dt_fill_rect(x, y, w, h, 0x0F);
+    dt_draw_rect(x, y, w, h, 0x09);
+    dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
+    dt_draw_string(x + 8, y + 6, fm_input_kind ? "New folder" : "New file", 0x09);
+
+    char line[sizeof(fm_input_buf) + 2];
+    fm_clipn(line, (int)sizeof(line), fm_input_buf, (w - 20) / 8 - 1);
+    strcat(line, "_");
+    dt_draw_string(x + 8, y + 24, line, 0x00);
+    dt_fill_rect(x + 8, y + 34, w - 16, 1, 0x07);
+    dt_draw_string(x + 8, y + 42, "Enter:ok  Esc:cancel", 0x08);
+}
+
+static void fm_confirm_draw(void) {
+    int w = dt_w - 60; if (w > 280) w = 280; if (w < 200) w = 200;
+    int h = 56;
+    int x = (dt_w - w) / 2;
+    int y = (dt_h - h) / 2;
+
+    dt_fill_rect(x, y, w, h, 0x0F);
+    dt_draw_rect(x, y, w, h, 0x09);
+    dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
+    dt_draw_string(x + 8, y + 6, "Delete entry?", 0x04);
+    char nb[64];
+    if (fm_count > 0 && fm_list[fm_sel] != NULL) {
+        fm_clipn(nb, (int)sizeof(nb), fm_list[fm_sel]->name, (w - 20) / 8);
+    } else {
+        nb[0] = '\0';
+    }
+    dt_draw_string(x + 8, y + 22, nb, 0x01);
+    dt_draw_string(x + 8, y + 38, "Y:delete  N/Esc:no", 0x08);
+}
+
+static void fm_preview_draw(void) {
+    int w = dt_w - 40; if (w > 380) w = 380; if (w < 200) w = 200;
+    int h = 28 + FM_PV_ROWS * 10 + 12;
+    int x = (dt_w - w) / 2;
+    int y = (dt_h - h) / 2;
+
+    dt_fill_rect(x, y, w, h, 0x0F);
+    dt_draw_rect(x, y, w, h, 0x09);
+    dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
+    dt_fill_rect(x + 2, y + 2, w - 4, 13, 0x01);
+    char title[96];
+    fm_clipn(title, (int)sizeof(title), fm_pv_title, (w - 12) / 8);
+    dt_draw_string(x + 6, y + 4, title, 0x0F);
+    for (int i = 0; i < FM_PV_ROWS && i < fm_pv_count; i++) {
+        char row[FM_PV_COLS + 1];
+        fm_clipn(row, (int)sizeof(row), fm_pv[i], (w - 16) / 8);
+        dt_draw_string(x + 8, y + 20 + i * 10, row, 0x00);
+    }
+    dt_draw_string(x + 8, y + h - 12, "any key closes", 0x08);
+}
+
+static void fm_modal_draw(void) {
+    switch (fm_mode) {
+        case FM_INPUT:   fm_input_box_draw();   break;
+        case FM_CONFIRM: fm_confirm_draw();     break;
+        case FM_PREVIEW: fm_preview_draw();     break;
+        default: break;
+    }
+}
+
+/* repaint helpers: the mouse cursor must hop over every repaint */
+static void fm_repaint_panel(int cur_x, int cur_y) {
+    dt_cursor_erase(cur_x, cur_y);
+    fm_render();
+    dt_cursor_draw(cur_x, cur_y);
+}
+
+static void fm_repaint_modal(int cur_x, int cur_y) {
+    dt_cursor_erase(cur_x, cur_y);
+    fm_modal_draw();
+    dt_cursor_draw(cur_x, cur_y);
+}
+
+static void fm_repaint_all(int cur_x, int cur_y) {
+    dt_cursor_erase(cur_x, cur_y);
+    desktop_repaint();
+    dt_cursor_draw(cur_x, cur_y);
+}
+
+/* Returns 1: the Files panel owns the keyboard while active */
+static int fm_handle_key(unsigned char c, int cur_x, int cur_y) {
+    if (fm_mode == FM_PREVIEW) {
+        fm_mode = FM_BROWSE;
+        fm_repaint_all(cur_x, cur_y);
+        return 1;
+    }
+    if (fm_mode == FM_CONFIRM) {
+        if (c == 'y' || c == 'Y') fm_do_delete();
+        fm_mode = FM_BROWSE;
+        fm_repaint_all(cur_x, cur_y);
+        return 1;
+    }
+    if (fm_mode == FM_INPUT) {
+        if (c == '\n') {
+            fm_input_confirm();
+            fm_mode = FM_BROWSE;
+            fm_repaint_all(cur_x, cur_y);
+        } else if (c == '\b') {
+            if (fm_input_len > 0) {
+                fm_input_buf[--fm_input_len] = '\0';
+                fm_repaint_modal(cur_x, cur_y);
+            }
+        } else if (c >= 32 && c <= 126 &&
+                   fm_input_len < (int)sizeof(fm_input_buf) - 1) {
+            fm_input_buf[fm_input_len++] = (char)c;
+            fm_input_buf[fm_input_len] = '\0';
+            fm_repaint_modal(cur_x, cur_y);
+        }
+        return 1;
+    }
+
+    /* browse */
+    switch (c) {
+        case KEY_UP:
+            if (fm_sel > 0) {
+                fm_sel--;
+                fm_repaint_panel(cur_x, cur_y);
+            }
+            return 1;
+        case KEY_DOWN:
+            if (fm_sel < fm_count - 1) {
+                fm_sel++;
+                fm_repaint_panel(cur_x, cur_y);
+            }
+            return 1;
+        case KEY_LEFT:
+        case '\b':
+            if (fm_dir != NULL && fm_dir->parent != NULL) {
+                fm_navigate(fm_dir->parent);
+                fm_repaint_panel(cur_x, cur_y);
+            }
+            return 1;
+        case '\n':
+            fm_open_selected();
+            if (fm_mode != FM_BROWSE) fm_repaint_all(cur_x, cur_y);
+            else fm_repaint_panel(cur_x, cur_y);
+            return 1;
+        case 'm': case 'M':
+            fm_input_kind = 1;
+            fm_input_len = 0;
+            fm_input_buf[0] = '\0';
+            fm_mode = FM_INPUT;
+            fm_repaint_all(cur_x, cur_y);
+            return 1;
+        case 'n': case 'N':
+            fm_input_kind = 0;
+            fm_input_len = 0;
+            fm_input_buf[0] = '\0';
+            fm_mode = FM_INPUT;
+            fm_repaint_all(cur_x, cur_y);
+            return 1;
+        case 'd': case 'D':
+            if (fm_count > 0 && fm_list[fm_sel] != NULL) {
+                fm_mode = FM_CONFIRM;
+                fm_repaint_all(cur_x, cur_y);
+            }
+            return 1;
+        default:
+            return 1;   /* swallowed: Files panel is modal */
+    }
+}
+
+/* Left click: select a row; clicking the selected row opens it */
+static int fm_handle_click(int mx, int my, int cur_x, int cur_y) {
+    if (fm_mode == FM_PREVIEW) {
+        fm_mode = FM_BROWSE;
+        fm_repaint_all(cur_x, cur_y);
+        return 1;
+    }
+    if (fm_mode != FM_BROWSE) return 1;   /* input/confirm are keyboard-modal */
+    if (fm_count == 0 || fm_vis <= 0) return 1;
+    if (mx < 1 || mx >= lay_left_w - 1) return 1;
+    if (my < fm_list_y0 || my >= fm_list_y0 + fm_vis * fm_row_h) return 1;
+
+    int idx = fm_scroll + (my - fm_list_y0) / fm_row_h;
+    if (idx >= fm_count) return 1;
+    if (idx == fm_sel) {
+        fm_open_selected();
+        if (fm_mode != FM_BROWSE) fm_repaint_all(cur_x, cur_y);
+        else fm_repaint_panel(cur_x, cur_y);
+    } else {
+        fm_sel = idx;
+        fm_repaint_panel(cur_x, cur_y);
+    }
+    return 1;
+}
+
 /* Left function panel: target of the Win-key menu. Default = text editor. */
 static void draw_func_panel(int func) {
     int cx = 4;
@@ -753,10 +1356,8 @@ static void draw_func_panel(int func) {
             dt_draw_string(cx, cy + 58, "edit <file>", 0x01);
             break;
         case FUNC_FILES:
-            dt_draw_string(cx, cy, "File Manager", 0x09);
-            dt_draw_string(cx, cy + 16, "Browse files", 0x00);
-            dt_draw_string(cx, cy + 28, "from shell:", 0x00);
-            dt_draw_string(cx, cy + 44, "ls / cd / cat", 0x01);
+            fm_refresh();
+            fm_render();
             break;
         case FUNC_SYSTEM: {
             char buf[40];
@@ -930,7 +1531,7 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v2.17.1", 0x00);
+    dt_draw_string(4, title_y, "Kil0yOS v2.19.0", 0x00);
     dt_draw_string(dt_w - 84, title_y, "[Win]=Menu", 0x01);
 
     /* left function panel */
@@ -958,12 +1559,15 @@ static void desktop_draw_chrome(void) {
     draw_func_panel(active_func);
 }
 
-/* Full repaint after the menu popup closes (chrome + panes + prompt + log) */
+/* Full repaint after the menu popup closes (chrome + panes + prompt + log).
+ * An open Files modal popup (input/confirm/preview) is drawn last so it
+ * survives the repaint that closes the Win-key menu over it. */
 static void desktop_repaint(void) {
     desktop_draw_chrome();
     term_gui_render();
     gui_shell_draw_prompt();
     klog_view_render();
+    if (active_func == FUNC_FILES) fm_modal_draw();
 }
 
 /* Shared desktop main loop: Win-key menu popup, shell input, kernel-log
@@ -1021,19 +1625,28 @@ static void desktop_run_loop(void) {
                     dt_cursor_erase(prev.x, prev.y);
                     desktop_repaint();
                     dt_cursor_draw(prev.x, prev.y);
+                } else if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
+                    fm_mode = FM_BROWSE;   /* modal dialog: close, keep desktop */
+                    dt_cursor_erase(prev.x, prev.y);
+                    desktop_repaint();
+                    dt_cursor_draw(prev.x, prev.y);
                 } else {
                     break;   /* exit desktop */
                 }
             } else if (c == KEY_WIN) {
-                menu_open = !menu_open;
-                dt_cursor_erase(prev.x, prev.y);
-                if (menu_open) {
-                    menu_sel = active_func;
-                    menu_popup_draw(menu_sel);
+                if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
+                    /* modal dialog owns the keyboard: swallow */
                 } else {
-                    desktop_repaint();
+                    menu_open = !menu_open;
+                    dt_cursor_erase(prev.x, prev.y);
+                    if (menu_open) {
+                        menu_sel = active_func;
+                        menu_popup_draw(menu_sel);
+                    } else {
+                        desktop_repaint();
+                    }
+                    dt_cursor_draw(prev.x, prev.y);
                 }
-                dt_cursor_draw(prev.x, prev.y);
             } else if (menu_open) {
                 if (c == KEY_UP || c == KEY_DOWN) {
                     int old_sel = menu_sel;
@@ -1057,6 +1670,8 @@ static void desktop_run_loop(void) {
                     klog(dt_menu_items[active_func]);
                     klog("\n");
                 }
+            } else if (active_func == FUNC_FILES) {
+                fm_handle_key(c, prev.x, prev.y);
             } else {
                 /* keyboard focus: right-top shell pane */
                 if (c == '\n') {
@@ -1074,6 +1689,10 @@ static void desktop_run_loop(void) {
         mouse_state_t state;
         mouse_get_state(&state);
 
+        /* click edge detection must run even when the pointer stands still */
+        int left_now = (state.buttons & 1) != 0;
+        int left_was = (prev.buttons & 1) != 0;
+
         if (state.x != prev.x || state.y != prev.y) {
             if (!trace_moved) {
                 trace_moved = 1;
@@ -1083,6 +1702,13 @@ static void desktop_run_loop(void) {
             dt_cursor_draw(state.x, state.y);
             prev = state;
         }
+
+        if (left_now && !left_was) {
+            if (active_func == FUNC_FILES) {
+                fm_handle_click(state.x, state.y, state.x, state.y);
+            }
+        }
+        if (state.buttons != prev.buttons) prev.buttons = state.buttons;
 
         __asm__ volatile("hlt");   /* sleep until next interrupt instead of spinning */
     }
