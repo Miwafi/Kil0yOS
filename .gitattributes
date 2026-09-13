@@ -1,2 +1,11 @@
 # Force LF for shell scripts: they run inside WSL, where CRLF breaks bash
 *.sh text eol=lf
+
+# Binary assets: never let git touch their line endings
+*.jpg binary
+*.png binary
+*.svg binary
+*.mp3 binary
+*.gz binary
+*.iso binary
+*.deb binary
