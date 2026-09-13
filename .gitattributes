@@ -1,0 +1,2 @@
+# Force LF for shell scripts: they run inside WSL, where CRLF breaks bash
+*.sh text eol=lf
