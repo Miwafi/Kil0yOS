@@ -33,6 +33,9 @@ void fb_gfx_draw_rect(int x, int y, int w, int h, uint8_t ega_index);
 void fb_gfx_draw_char(int x, int y, char c, uint8_t ega_index);
 void fb_gfx_draw_string(int x, int y, const char* s, uint8_t ega_index);
 
+/* raw 0xRRGGBB pixel write (desktop image viewer); no-op off-screen */
+void fb_gfx_pixel_rgb(int x, int y, uint32_t rgb);
+
 /* solid white arrow pointer with background save/restore; draw erases the
  * previous position itself (mouse_draw_cursor semantics) */
 void fb_gfx_cursor_draw(int x, int y);

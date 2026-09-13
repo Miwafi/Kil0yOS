@@ -708,6 +708,15 @@ extern const uint8_t user_nettest_end[];
 extern const uint8_t user_busybox_start[] __attribute__((weak));
 extern const uint8_t user_busybox_end[] __attribute__((weak));
 
+/* Desktop art assets (user/art/*, embedded verbatim via Makefile incbin
+ * rules; weak so builds without user/art still link) */
+extern const uint8_t user_art_103_mp3_start[] __attribute__((weak));
+extern const uint8_t user_art_103_mp3_end[] __attribute__((weak));
+extern const uint8_t user_art_cat_jpg_start[] __attribute__((weak));
+extern const uint8_t user_art_cat_jpg_end[] __attribute__((weak));
+extern const uint8_t user_art_memory_jpg_start[] __attribute__((weak));
+extern const uint8_t user_art_memory_jpg_end[] __attribute__((weak));
+
 /* Phase 3: deploy an embedded file under a root directory (created on
  * demand), e.g. ("lib64", "ld-linux-x86-64.so.2", ...). Skipped when the
  * blob is absent (weak symbols) or the file already exists. */
@@ -716,11 +725,8 @@ static void user_install_blob(const char* dir, const char* name,
                               const char* note) {
     if (start == NULL || end == NULL || end <= start) return;
     if (fs_resolve_path(dir) == NULL) {
-        fs_entry_t* prev_root = fs_current();
-        fs_set_current(fs_root());
-        fs_entry_t* d = fs_create_dir(dir + 1);   /* strip leading '/' */
-        fs_set_current(prev_root);
-        if (d == NULL) {
+        /* dir may be nested (e.g. /home/user/art): create the whole chain */
+        if (fs_mkdir_p(dir) != 0) {
             klog("[user] failed to create ");
             klog(dir);
             klog("\n");
@@ -870,6 +876,14 @@ void user_programs_install(void) {
                       "glibc");
     user_install_blob("/bin", "hello-pthread", user_pthread_start,
                       user_pthread_end, "glibc pthread probe");
+
+    /* Desktop art assets: user/art/* -> /home/user/art */
+    user_install_blob("/home/user/art", "103.mp3", user_art_103_mp3_start,
+                      user_art_103_mp3_end, NULL);
+    user_install_blob("/home/user/art", "cat.jpg", user_art_cat_jpg_start,
+                      user_art_cat_jpg_end, NULL);
+    user_install_blob("/home/user/art", "memory.jpg", user_art_memory_jpg_start,
+                      user_art_memory_jpg_end, NULL);
 
     fs_set_current(prev);
 

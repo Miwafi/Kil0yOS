@@ -138,6 +138,13 @@ void fb_gfx_draw_string(int x, int y, const char* s, uint8_t ega_index) {
     }
 }
 
+/* raw RGB pixel for the image viewer: bypasses the EGA palette entirely */
+void fb_gfx_pixel_rgb(int x, int y, uint32_t rgb) {
+    if (!active) return;
+    if (x < 0 || y < 0 || x >= (int)w_ || y >= (int)h_) return;
+    set_pixel(x, y, rgb);
+}
+
 /* ========== desktop pointer (white arrow, save/restore) ========== */
 
 #define DCUR_W 8

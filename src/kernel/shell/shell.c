@@ -24,6 +24,7 @@
 #include "pkg/dpkg.h"
 #include "pkg/kilget.h"
 #include "usb/usb.h"
+#include "drivers/jpeg.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -443,7 +444,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.19.0\n");
+    vga_puts("Kil0yOS v2.20.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -554,6 +555,52 @@ static void dt_cursor_draw(int x, int y) {
 static void dt_cursor_erase(int x, int y) {
     if (dt_use_fb) fb_gfx_cursor_erase(x, y);
     else           mouse_erase_cursor(x, y);
+}
+
+/* ===== true-color pixel (image viewer) =====
+ * GOP: native 0xRRGGBB write.  mode12h desktop: the fixed EGA-16 palette
+ * gets 4x4 ordered dithering (Bayer matrix) before nearest-color matching
+ * so JPEG gradients survive as spatial color mixes. */
+static const uint32_t dt_ega_rgb[16] = {
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+    0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+    0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+};
+static const uint8_t dt_bayer[4][4] = {
+    {  0,  8,  2, 10 },
+    { 12,  4, 14,  6 },
+    {  3, 11,  1,  9 },
+    { 15,  7, 13,  5 }
+};
+
+static uint8_t dt_nearest_ega(uint32_t rgb, int x, int y) {
+    int d = (dt_bayer[y & 3][x & 3] * 34 - 255) / 6;   /* ~[-42, +42] */
+    int r = (int)((rgb >> 16) & 0xFF) + d;
+    int g = (int)((rgb >> 8) & 0xFF) + d;
+    int b = (int)(rgb & 0xFF) + d;
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+
+    uint8_t best = 0;
+    int bestd = 0x7FFFFFFF;
+    for (int i = 0; i < 16; i++) {
+        int dr = r - (int)((dt_ega_rgb[i] >> 16) & 0xFF);
+        int dg = g - (int)((dt_ega_rgb[i] >> 8) & 0xFF);
+        int db = b - (int)(dt_ega_rgb[i] & 0xFF);
+        int dist = dr * dr + dg * dg + db * db;
+        if (dist < bestd) {
+            bestd = dist;
+            best = (uint8_t)i;
+        }
+    }
+    return best;
+}
+
+static void dt_pixel_rgb(int x, int y, uint32_t rgb) {
+    if (dt_use_fb) fb_gfx_pixel_rgb(x, y, rgb);
+    else           vga_plot_pixel(x, y, dt_nearest_ega(rgb, x, y));
 }
 
 /* ===== Win-key function menu popup ===== */
@@ -744,7 +791,7 @@ static void gui_shell_execute(void) {
 static void desktop_repaint(void);   /* fwd: modal close repaints everything */
 extern void klog(const char* s);
 
-enum { FM_BROWSE = 0, FM_INPUT, FM_CONFIRM, FM_PREVIEW };
+enum { FM_BROWSE = 0, FM_INPUT, FM_CONFIRM, FM_PREVIEW, FM_IMAGE };
 static fs_entry_t* fm_dir = NULL;               /* browsed directory */
 static int fm_sel = 0;                          /* selected row */
 static int fm_scroll = 0;                       /* first visible row */
@@ -755,6 +802,12 @@ static int fm_input_kind;                       /* 0 = file, 1 = directory */
 static char fm_input_buf[40];
 static int fm_input_len;
 static char fm_status[64];                      /* last action / error */
+
+/* FM_IMAGE: decoded JPEG planes stay live until the viewer closes */
+static jpeg_image_t fm_img;
+static char fm_img_title[96];
+static int  fm_img_fail;                        /* 1 = show fm_img_err text */
+static char fm_img_err[40];
 
 #define FM_PV_ROWS 14
 #define FM_PV_COLS 76
@@ -1050,6 +1103,54 @@ static void fm_preview_show(fs_entry_t* e) {
     fm_mode = FM_PREVIEW;
 }
 
+/* ===== FM_IMAGE viewer: baseline JPEG decode + render ===== */
+static int fm_is_jpeg_name(const char* name) {
+    size_t n = strlen(name);
+    if (n >= 5 && fm_ci_cmp(name + n - 5, ".jpeg") == 0) return 1;
+    if (n >= 4 && fm_ci_cmp(name + n - 4, ".jpg") == 0) return 1;
+    return 0;
+}
+
+static void fm_image_show(fs_entry_t* e) {
+    fm_img_fail = 1;
+    fm_img_err[0] = '\0';
+    fm_clipn(fm_img_title, (int)sizeof(fm_img_title) - 8, e->name, 64);
+
+    if (e->size < 4) {
+        strcpy(fm_img_err, "empty file");
+    } else if (e->size > 8u * 1024 * 1024) {
+        strcpy(fm_img_err, "file too large");
+    } else {
+        uint8_t* buf = (uint8_t*)kmalloc((size_t)e->size);
+        if (buf == NULL) {
+            strcpy(fm_img_err, "out of memory");
+        } else {
+            int got = fs_read_file(e, buf, (size_t)e->size);
+            if (got <= 0) {
+                strcpy(fm_img_err, "read error");
+            } else if (jpeg_decode(buf, (size_t)got, &fm_img) != 0) {
+                strcpy(fm_img_err, "unsupported jpeg");
+            } else {
+                fm_img_fail = 0;
+                klog("[files] decoded ");
+                klog(e->name);
+                klog("\n");
+            }
+            kfree(buf);
+        }
+    }
+    fm_mode = FM_IMAGE;
+}
+
+/* modal teardown shared by every close path; frees viewer planes */
+static void fm_close_modal(void) {
+    if (fm_mode == FM_IMAGE) {
+        if (!fm_img_fail) jpeg_image_free(&fm_img);
+        fm_img_fail = 0;
+    }
+    fm_mode = FM_BROWSE;
+}
+
 static void fm_open_selected(void) {
     if (fm_count == 0 || fm_dir == NULL) return;
     fs_entry_t* e = fm_list[fm_sel];
@@ -1059,6 +1160,10 @@ static void fm_open_selected(void) {
     }
     if (e->type == FS_TYPE_DIRECTORY) {
         fm_navigate(e);
+        return;
+    }
+    if (fm_is_jpeg_name(e->name)) {
+        fm_image_show(e);
         return;
     }
     fm_preview_show(e);
@@ -1202,11 +1307,88 @@ static void fm_preview_draw(void) {
     dt_draw_string(x + 8, y + h - 12, "any key closes", 0x08);
 }
 
+/* FM_IMAGE: centered viewer window; the image is power-of-two halved until
+ * it fits, every destination pixel is nearest-neighbor sampled from the
+ * YCbCr planes and pushed through dt_pixel_rgb (native RGB on GOP, dithered
+ * EGA-16 on the mode12h desktop). */
+static void fm_image_draw(void) {
+    if (fm_img_fail) {
+        int w = 240, h = 64;
+        int x = (dt_w - w) / 2;
+        int y = (dt_h - h) / 2;
+        dt_fill_rect(x, y, w, h, 0x0F);
+        dt_draw_rect(x, y, w, h, 0x04);
+        dt_draw_string(x + 8, y + 6, fm_img_title, 0x04);
+        dt_draw_string(x + 8, y + 24, fm_img_err, 0x04);
+        dt_draw_string(x + 8, y + 44, "any key closes", 0x08);
+        return;
+    }
+
+    int maxw = dt_w - 48;
+    int maxh = dt_h - 110;
+    if (maxw < 64) maxw = 64;
+    if (maxh < 64) maxh = 64;
+    int dw = fm_img.W, dh = fm_img.H;
+    while ((dw > maxw || dh > maxh) && (dw > 1 || dh > 1)) {
+        dw = (dw + 1) >> 1;
+        dh = (dh + 1) >> 1;
+    }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+
+    int w = dw + 16;
+    if (w < 200) w = 200;
+    int h = 13 + dh + 8 + 12;
+    int x = (dt_w - w) / 2;
+    int y = (dt_h - h) / 2;
+
+    dt_fill_rect(x, y, w, h, 0x0F);
+    dt_draw_rect(x, y, w, h, 0x09);
+    dt_fill_rect(x + 2, y + 2, w - 4, 13, 0x01);
+    char title[112];
+    fm_clipn(title, (int)sizeof(title) - 16, fm_img_title, (w - 12) / 8 - 10);
+    strcat(title, " ");
+    char num[16];
+    itoa(fm_img.W, num, 10, sizeof(num));
+    strcat(title, num);
+    strcat(title, "x");
+    itoa(fm_img.H, num, 10, sizeof(num));
+    strcat(title, num);
+    dt_draw_string(x + 6, y + 4, title, 0x0F);
+
+    int ix = x + 8;
+    int iy = y + 17;
+    for (int dy = 0; dy < dh; dy++) {
+        int sy = dy * fm_img.H / dh;
+        for (int dx = 0; dx < dw; dx++) {
+            int sx = dx * fm_img.W / dw;
+            int Y = jpeg_sample(&fm_img, 0, sx, sy);
+            int r, g, b;
+            if (fm_img.ncomp == 3) {
+                int cb = jpeg_sample(&fm_img, 1, sx, sy) - 128;
+                int cr = jpeg_sample(&fm_img, 2, sx, sy) - 128;
+                r = Y + ((91881 * cr) >> 16);
+                g = Y - ((22554 * cb + 46802 * cr) >> 16);
+                b = Y + ((116130 * cb) >> 16);
+            } else {
+                r = g = b = Y;
+            }
+            if (r < 0) r = 0; else if (r > 255) r = 255;
+            if (g < 0) g = 0; else if (g > 255) g = 255;
+            if (b < 0) b = 0; else if (b > 255) b = 255;
+            dt_pixel_rgb(ix + dx, iy + dy,
+                         ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+        }
+    }
+    dt_draw_string(x + 8, y + h - 12, "any key closes", 0x08);
+}
+
 static void fm_modal_draw(void) {
     switch (fm_mode) {
         case FM_INPUT:   fm_input_box_draw();   break;
         case FM_CONFIRM: fm_confirm_draw();     break;
         case FM_PREVIEW: fm_preview_draw();     break;
+        case FM_IMAGE:   fm_image_draw();       break;
         default: break;
     }
 }
@@ -1232,21 +1414,21 @@ static void fm_repaint_all(int cur_x, int cur_y) {
 
 /* Returns 1: the Files panel owns the keyboard while active */
 static int fm_handle_key(unsigned char c, int cur_x, int cur_y) {
-    if (fm_mode == FM_PREVIEW) {
-        fm_mode = FM_BROWSE;
+    if (fm_mode == FM_PREVIEW || fm_mode == FM_IMAGE) {
+        fm_close_modal();
         fm_repaint_all(cur_x, cur_y);
         return 1;
     }
     if (fm_mode == FM_CONFIRM) {
         if (c == 'y' || c == 'Y') fm_do_delete();
-        fm_mode = FM_BROWSE;
+        fm_close_modal();
         fm_repaint_all(cur_x, cur_y);
         return 1;
     }
     if (fm_mode == FM_INPUT) {
         if (c == '\n') {
             fm_input_confirm();
-            fm_mode = FM_BROWSE;
+            fm_close_modal();
             fm_repaint_all(cur_x, cur_y);
         } else if (c == '\b') {
             if (fm_input_len > 0) {
@@ -1315,8 +1497,8 @@ static int fm_handle_key(unsigned char c, int cur_x, int cur_y) {
 
 /* Left click: select a row; clicking the selected row opens it */
 static int fm_handle_click(int mx, int my, int cur_x, int cur_y) {
-    if (fm_mode == FM_PREVIEW) {
-        fm_mode = FM_BROWSE;
+    if (fm_mode == FM_PREVIEW || fm_mode == FM_IMAGE) {
+        fm_close_modal();
         fm_repaint_all(cur_x, cur_y);
         return 1;
     }
@@ -1531,7 +1713,7 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v2.19.0", 0x00);
+    dt_draw_string(4, title_y, "Kil0yOS v2.20.0", 0x00);
     dt_draw_string(dt_w - 84, title_y, "[Win]=Menu", 0x01);
 
     /* left function panel */
@@ -1626,7 +1808,7 @@ static void desktop_run_loop(void) {
                     desktop_repaint();
                     dt_cursor_draw(prev.x, prev.y);
                 } else if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
-                    fm_mode = FM_BROWSE;   /* modal dialog: close, keep desktop */
+                    fm_close_modal();  /* modal dialog: close, keep desktop */
                     dt_cursor_erase(prev.x, prev.y);
                     desktop_repaint();
                     dt_cursor_draw(prev.x, prev.y);

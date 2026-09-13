@@ -42,7 +42,8 @@ DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
                $(SRCDIR)/kernel/drivers/rtc.c \
                $(SRCDIR)/kernel/drivers/speaker.c \
                $(SRCDIR)/kernel/drivers/efi_gop.c \
-               $(SRCDIR)/kernel/drivers/fb.c
+               $(SRCDIR)/kernel/drivers/fb.c \
+               $(SRCDIR)/kernel/drivers/jpeg.c
 
 # --- Filesystem ---
 FS_SRCS = $(SRCDIR)/kernel/fs/fs.c \
@@ -260,6 +261,17 @@ $(BUILDDIR)/user_blob_busybox.o: $(BUSYBOX_SRC)
 	printf 'section .rodata\nglobal user_busybox_start\nuser_busybox_start:\nincbin "%s"\nglobal user_busybox_end\nuser_busybox_end:\n' '$<' > $(BUILDDIR)/user_blob_busybox.s
 	$(AS) -f elf64 $(BUILDDIR)/user_blob_busybox.s -o $@
 
+# Desktop art assets: every file in user/art/ is embedded verbatim and
+# installed to /home/user/art at boot (process.c: user_install_blob).
+# Symbol names sanitize '.', '-', '+' to '_' (user_art_cat_jpg etc.).
+ART_FILES := $(wildcard user/art/*)
+ART_BLOB_OBJS := $(patsubst user/art/%, $(BUILDDIR)/user_blob_art_%.o, $(ART_FILES))
+art_sym = user_art_$(subst +,_,$(subst -,_,$(subst .,_,$(1))))
+
+$(BUILDDIR)/user_blob_art_%.o: user/art/%
+	printf 'section .rodata\nglobal $(call art_sym,$*)_start\n$(call art_sym,$*)_start:\nincbin "%s"\nglobal $(call art_sym,$*)_end\n$(call art_sym,$*)_end:\n' '$<' > $(BUILDDIR)/user_blob_art_$*.s
+	$(AS) -f elf64 $(BUILDDIR)/user_blob_art_$*.s -o $@
+
 $(BUILDDIR)/user/hello.o: user/hello.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CCFLAGS) -c $< -o $@
@@ -299,8 +311,8 @@ $(BUILDDIR)/kernel/core/ap_trampoline.o: $(BUILDDIR)/ap_trampoline.bin | $(BUILD
 # Dynamic-PIE acceptance program (musl-gcc) + ldso blob (musl libc.so)
 DYN_PROG_BLOB := $(if $(MUSL_GCC),$(BUILDDIR)/user_blob_hello-dyn.o,)
 
-$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB)
-	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) -o $@
+$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS)
+	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS) -o $@
 
 $(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
 	@mkdir -p $(BUILDDIR)/iso/boot/grub

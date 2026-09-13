@@ -2,6 +2,28 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.20.0] - 2026-09-13
+This release brings **JPEG viewing to the desktop**: a from-scratch baseline-JPEG decoder inside the kernel plus a new FM_IMAGE viewer mode in the Files panel — and the `user/art` sample directory is now embedded into the kernel image and installed to `/home/user/art` at boot, giving the viewer real pictures to open out of the box.
+
+### Added
+- **Baseline JPEG decoder** (`drivers/jpeg.c`): SOF0/SOF1 huffman streams — 8-bit samples, 1-3 components (grayscale / 4:4:4 / 4:2:2 / 4:2:0), sampling factors up to 2x2, restart intervals (DRI/RSTn), 8- and 16-bit quantization tables. Integer-only two-pass IDCT (precomputed 2^13 cosine table, 64-bit accumulators, fixed `/4` scale), flat Huffman decode tables, MSB bit-reader with restart-marker resync; progressive (SOF2), arithmetic and 4-component CMYK/Adobe streams are rejected cleanly. On success the caller gets one 8-bit plane per component at component resolution plus `jpeg_sample()` replicate-upsampling for display coordinates.
+- **Files-panel image viewer (FM_IMAGE)**: opening a `.jpg`/`.jpeg` entry (case-insensitive) decodes it and shows a centered modal — title bar with name + decoded `WxH`, the image power-of-two halved until it fits, every destination pixel nearest-neighbor sampled from the YCbCr planes and converted with integer fixed-point YCbCr→RGB. Decode/IO/size failures render an error popup instead; any key, click or ESC closes the viewer and frees the planes.
+- **True-color pixel path**: `fb_gfx_pixel_rgb` writes raw `0xRRGGBB` on the GOP framebuffer; on the 16-color BIOS desktop `dt_pixel_rgb` applies a 4x4 Bayer ordered dither before nearest-EGA matching, so JPEG gradients survive mode12h as spatial color mixes.
+- **Embedded art assets**: every file in `user/art/` is incbin'd into the kernel via Makefile wildcard rules (symbol names sanitized to `user_art_*`, weak declarations so the tree still builds without the directory) and installed idempotently to `/home/user/art` at boot through `user_install_blob` (`fs_mkdir_p` creates the nested path); works on FAT and ext2, existing files are skipped.
+
+### Changed
+- All Files modal close paths (key, click, ESC) now route through a shared `fm_close_modal()` so image planes are freed exactly once regardless of how the viewer is dismissed.
+- Version strings bumped to 2.20.0 (boot banner, `uname`, shell `version`, GUI title bar, `accept_gop.sh` checks).
+
+### File Changes
+- `include/drivers/jpeg.h`, `src/kernel/drivers/jpeg.c`: new decoder (521 lines)
+- `src/kernel/shell/shell.c`: FM_IMAGE mode, viewer draw (halving fit + YCbCr→RGB), `dt_pixel_rgb` with EGA dither, close-path refactor
+- `include/drivers/fb.h`, `src/kernel/drivers/fb.c`: `fb_gfx_pixel_rgb`
+- `src/kernel/core/process.c`: art install to `/home/user/art`
+- `Makefile`: `ART_BLOB_OBJS` incbin rules + jpeg.c in DRIVERS_SRCS
+- `user/art/`: 103.mp3, cat.jpg, memory.jpg
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [2.19.0] - 2026-09-13
 This release turns the desktop's left Files panel from a static placeholder into a **real graphical file manager**: it browses the `fs_entry_t` tree with keyboard and mouse, creates files/directories, deletes with confirmation, and previews text files in place — all through absolute paths, so the shell pane's working directory is never disturbed.
 
