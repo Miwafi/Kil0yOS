@@ -43,7 +43,8 @@ check() {
 FAIL=0
 
 # wav capture by default; AUDIO_BACKEND=none,id=snd0 switches to the dummy
-# backend (realtime paced, no file) for driver-only runs
+# backend (realtime paced, no file) for driver-only runs.
+# AUDIO_CARD=hda swaps the emulated AC'97 for intel-hda + an HDA codec.
 WAV_OUT="$TDIR/mp3_capture.wav"
 if [ -z "${AUDIO_BACKEND:-}" ]; then
     ADEV="wav,id=snd0,path=$WAV_OUT"
@@ -51,7 +52,14 @@ else
     ADEV="$AUDIO_BACKEND"
     WAV_OUT=""
 fi
-echo "audiodev: $ADEV"
+if [ "${AUDIO_CARD:-ac97}" = "hda" ]; then
+    CARD_ARGS="-device intel-hda -device hda-duplex,audiodev=snd0"
+    CARD_MARK="backend: HDA"
+else
+    CARD_ARGS="-device AC97,audiodev=snd0"
+    CARD_MARK="codec ready"
+fi
+echo "card: ${AUDIO_CARD:-ac97}  audiodev: $ADEV"
 
 echo "=== 1) UEFI boot + desktop ==="
 qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
@@ -59,7 +67,7 @@ qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
   -serial file:"$TDIR/serial_mp3.log" \
   -monitor unix:"$TDIR/qmon_mp3",server,nowait \
   -audiodev "$ADEV" \
-  -device AC97,audiodev=snd0 \
+  $CARD_ARGS \
   -no-reboot &
 QPID=$!
 
@@ -84,7 +92,7 @@ echo "--- 3) open 103.mp3 (row 0 = \"..\", row 1 = 103.mp3) ---"
 mon_cmd sendkey down
 sleep 1
 mon_cmd sendkey ret
-check "$TDIR/serial_mp3.log" "codec ready" "codec ready" 20 || true
+check "$TDIR/serial_mp3.log" "$CARD_MARK" "$CARD_MARK" 20 || true
 check "$TDIR/serial_mp3.log" "playing" "playing.*103.mp3" 20 || true
 
 echo "--- 4) let it play: two screendumps must show the progress bar grow ---"

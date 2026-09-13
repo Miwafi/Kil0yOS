@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include "drivers/io.h"
 #include "drivers/pci.h"
-#include "drivers/audio.h"
+#include "drivers/ac97.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 
@@ -54,10 +54,9 @@ static uint64_t     frames_written;
 static int          civ_seen;                /* playhead index at last poll */
 static int          in_flight;               /* slots handed to the DAC, unplayed */
 
-static uint16_t aud_in(uint16_t port) { return inw(nabm + port); }
 static void     aud_out(uint16_t port, uint16_t v) { outw(nabm + port, v); }
 
-int audio_init(void) {
+int ac97_init(void) {
     nam = nabm = 0;
     dma_on = 0;
     bdl = NULL;
@@ -95,9 +94,9 @@ int audio_init(void) {
     return 0;
 }
 
-int audio_open(uint32_t sample_rate) {
+int ac97_open(uint32_t sample_rate) {
     if (nam == 0) return -1;
-    if (bdl != NULL) audio_close();
+    if (bdl != NULL) ac97_close();
 
     bdl = (bdl_entry_t*)kmalloc(sizeof(bdl_entry_t) * AUD_NBUF);
     if (bdl == NULL) return -1;
@@ -154,7 +153,7 @@ int audio_open(uint32_t sample_rate) {
     return 0;
 }
 
-void audio_close(void) {
+void ac97_close(void) {
     if (bdl == NULL) return;
     outb(nabm + NABM_CR, 0x00);               /* stop DMA */
     dma_on = 0;
@@ -187,7 +186,7 @@ static void dma_reclaim(void) {
 
 /* stereo frame = 4 bytes (L,R int16). Accepts as many frames as free ring
  * slots can hold; each completed slot is published by advancing LVI. */
-int audio_write(const int16_t* pcm, int frames) {
+int ac97_write(const int16_t* pcm, int frames) {
     if (bdl == NULL) return 0;
     dma_reclaim();
 
@@ -215,22 +214,22 @@ int audio_write(const int16_t* pcm, int frames) {
     return written;
 }
 
-void audio_play(void) {
+void ac97_play(void) {
     if (bdl == NULL || dma_on) return;
     dma_on = 1;
     outb(nabm + NABM_CR, 0x01);               /* run */
 }
 
-void audio_pause(void) {
+void ac97_pause(void) {
     if (bdl == NULL || !dma_on) return;
     dma_on = 0;
     outb(nabm + NABM_CR, 0x00);
 }
 
-int audio_playing(void) { return bdl != NULL && dma_on; }
+int ac97_playing(void) { return bdl != NULL && dma_on; }
 
 /* stereo frames still queued ahead of the playhead */
-int audio_queued(void) {
+int ac97_queued(void) {
     if (bdl == NULL) return 0;
     if (!dma_on) return in_flight * AUD_BUF_FRAMES;
     if (inw(nabm + NABM_SR) & SR_DCH) return 0;   /* caught up with LVI */
@@ -242,4 +241,4 @@ int audio_queued(void) {
     return queued > 0 ? queued : 0;
 }
 
-uint64_t audio_written_total(void) { return frames_written; }
+uint64_t ac97_written_total(void) { return frames_written; }

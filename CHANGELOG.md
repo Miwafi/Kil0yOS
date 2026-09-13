@@ -2,6 +2,27 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.22.0] - 2026-09-13
+This release adds **High Definition Audio**: an Intel HDA controller driver plus Realtek ALC codec support, so modern machines (and QEMU's `intel-hda`) play MP3s out of the box. `drivers/audio.c` now fronts both controllers — HDA is probed first, AC'97 stays as the fallback — and the Files-panel player is unchanged.
+
+### Added
+- **HDA controller driver** (`drivers/hda.c`): PCI class 0x0403 probe (BAR0 MMIO, 64-bit BARs handled, rejected above the 4 GiB identity map), PCI memory-space/bus-master enable, GCTL codec reset, and CORB/RIRB command rings (128-byte aligned buffers, read/write pointer resets, `RINTCNT=1` with a status ack per response — the polled equivalent of the interrupt handshake the controller needs to hand over further CORB entries).
+- **Codec discovery**: audio function group lookup from the root's node count, widget walk via Audio Widget Capabilities, and a depth-first search from each output-capable pin (preferring line-out, then speaker) through its connection list to the first output converter (DAC); selectors/mixers on the way are remembered so their connection select and input amp can be set. The whole path is powered to D0, output amps (and mixer input amps) are unmuted, the pin is set to output, and EAPD is enabled on pins that advertise it — required on most Realtek ALC parts, where the external amplifier stays off otherwise. Realtek codecs are reported as `Realtek ALC<device>` and any other vendor by id.
+- **HDA playback stream**: the first output stream descriptor (SD index = ISS from GCAP) is reset, programmed with a 32×512-frame cyclic BDL (64 KiB, ~371 ms), format and stream tag, and matched by the converter's `SET_STREAM_FORMAT`/`SET_CHANNEL_STREAMID`. Format encoding covers the standard 44.1/48 kHz bases with the multiply/divide fields (so 8 kHz … 192 kHz map exactly), and the writer keeps one slot of slack behind `SD_LPIB` so it can never lap the DMA.
+- **`drivers/audio.c` front-end** + internal `drivers/ac97.h`/`drivers/hda.h`: `hda_init()` first, `ac97_init()` as fallback, one `[audio] backend:` log line; the public `drivers/audio.h` API and all callers are unchanged.
+- **`tools/accept_audio.sh`** now takes `AUDIO_CARD=hda` to run the same end-to-end checks against `intel-hda` + `hda-duplex` (backend marker, player screenshots, wav capture).
+
+### Changed
+- Version strings bumped to 2.22.0 (boot banner, `uname`, shell `version`, GUI title bar, `accept_gop.sh` checks).
+
+### File Changes
+- `include/drivers/hda.h`, `src/kernel/drivers/hda.c`: new HDA controller + codec driver
+- `include/drivers/ac97.h`, `src/kernel/drivers/ac97.c`: AC'97 entry points renamed to `ac97_*` (internal API)
+- `src/kernel/drivers/audio.c`: new backend-selecting front-end
+- `tools/accept_audio.sh`: `AUDIO_CARD=hda` mode
+- `Makefile`: `audio.c`/`hda.c` in `DRIVERS_SRCS`
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [2.21.0] - 2026-09-13
 This release adds **MP3 playback**: an AC'97 (Intel ICH) bus-master DMA audio driver plus a vendored minimp3 decoder, wired into the Files panel as an FM_AUDIO player modal that plays any `.mp3` from `/home/user/art` with elapsed time, a progress bar and Space-to-pause.
 

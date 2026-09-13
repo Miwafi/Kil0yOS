@@ -44,7 +44,9 @@ DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
                $(SRCDIR)/kernel/drivers/efi_gop.c \
                $(SRCDIR)/kernel/drivers/fb.c \
                $(SRCDIR)/kernel/drivers/jpeg.c \
+               $(SRCDIR)/kernel/drivers/audio.c \
                $(SRCDIR)/kernel/drivers/ac97.c \
+               $(SRCDIR)/kernel/drivers/hda.c \
                $(SRCDIR)/kernel/drivers/mp3.c
 
 # --- Filesystem ---
