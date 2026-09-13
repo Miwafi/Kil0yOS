@@ -1795,6 +1795,11 @@ static void desktop_run_loop(void) {
         if (klog_view_pump()) {
             dt_cursor_erase(prev.x, prev.y);
             klog_view_render();
+            /* the log pane overlaps the centered Files modal (e.g. the
+             * image viewer) - repaint it above the fresh log lines */
+            if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
+                fm_modal_draw();
+            }
             dt_cursor_draw(prev.x, prev.y);
         }
 

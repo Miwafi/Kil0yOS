@@ -187,12 +187,12 @@ static void jidct8(const int32_t* in, uint8_t* out, int stride) {
             for (int y = 0; y < 8; y++) acc[y] += (int64_t)t * c[y];
         }
         for (int y = 0; y < 8; y++) {
-            out[y * stride] = jclamp((int)((acc[y] >> 15) + 128));
+            out[y * stride + x] = jclamp((int)((acc[y] >> 15) + 128));
         }
     }
 }
 
-static int jblock(jdec* j, jcomp* c, int cbx, int cby) {
+static int jblock(jdec* j, jcomp* c, int cbx, int cby, uint8_t* scratch) {
     int zz[64];
     for (int i = 0; i < 64; i++) zz[i] = 0;
 
@@ -226,9 +226,15 @@ static int jblock(jdec* j, jcomp* c, int cbx, int cby) {
     const uint16_t* q = j->qt[c->tq];
     for (int i = 0; i < 64; i++) blk[i] = zz[i] * q[i];
 
-    /* IDCT into the component plane at (cbx*8, cby*8) */
-    uint8_t* dst = c->plane + (size_t)cby * 8 * c->pw + (size_t)cbx * 8;
-    jidct8(blk, dst, c->pw);
+    /* IDCT into the component plane; edge MCUs past the component bounds
+     * still carry huffman data in the stream (T.81 A.2.3 dummy blocks),
+     * so those decode into a scratch buffer instead of the plane */
+    if (scratch != NULL) {
+        jidct8(blk, scratch, 8);
+    } else {
+        uint8_t* dst = c->plane + (size_t)cby * 8 * c->pw + (size_t)cbx * 8;
+        jidct8(blk, dst, c->pw);
+    }
     return 0;
 }
 
@@ -341,7 +347,7 @@ static int jparse_sos(jdec* j) {
     int ns = j->d[j->pos];
     if (ns != j->ncomp) return -1;                 /* single interleaved scan */
     j->pos++;
-    if (len != 1 + ns * 2 + 3) return -1;
+    if (len != 6 + ns * 2) return -1;   /* len counts its own 2 length bytes */
     for (int i = 0; i < ns; i++) {
         int cid = j->d[j->pos];
         int tabs = j->d[j->pos + 1];
@@ -399,6 +405,7 @@ static int jsync_restart(jdec* j, int* rst_no) {
 static int jscan(jdec* j) {
     int mcus = j->mcux * j->mcuy;
     int rst_no = 0;
+    uint8_t scratch[64];
     for (int m = 0; m < mcus; m++) {
         if (j->restart_interval && m > 0 &&
             (m % j->restart_interval) == 0) {
@@ -412,8 +419,12 @@ static int jscan(jdec* j) {
                 for (int bx = 0; bx < c->hs; bx++) {
                     int cbx = mx * c->hs + bx;
                     int cby = my * c->vs + by;
-                    if (cbx >= c->bw || cby >= c->bh) continue;
-                    if (jblock(j, c, cbx, cby) != 0) return -1;
+                    if (cbx >= c->bw || cby >= c->bh) {
+                        /* consume the dummy block, don't store it */
+                        if (jblock(j, c, cbx, cby, scratch) != 0) return -1;
+                        continue;
+                    }
+                    if (jblock(j, c, cbx, cby, NULL) != 0) return -1;
                 }
             }
         }
