@@ -10,6 +10,19 @@
  * Register access is MMIO through BAR0; the kernel identity-maps the first
  * 4 GiB, so BAR/BDL addresses double as pointers. Polled: no interrupts. */
 #include <stdint.h>
+#ifdef HDA_HOST_TEST
+/* tools/hda_host_test.c drives the codec layer against a canned topology:
+ * no MMIO, no controller, no PCI - the test supplies klog/ksprintf/kmalloc,
+ * hda_cmd() and the stub declarations below. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+void klog(const char* s);
+void ksprintf(char* buf, size_t size, const char* fmt, ...);
+#define kmalloc(sz) malloc(sz)
+#define kfree(p) free(p)
+static void pit_delay_ms(uint32_t ms) { (void)ms; }
+#else
 #include "drivers/io.h"
 #include "drivers/pci.h"
 #include "drivers/hda.h"
@@ -19,6 +32,7 @@
 #include "timer/pit.h"
 
 extern void klog(const char* s);
+#endif
 
 /* ---------------- controller registers (BAR0) ---------------- */
 #define HDA_GCAP      0x00    /* u16: ISS/OSS/BSS, 64OK */
@@ -77,6 +91,7 @@ extern void klog(const char* s);
 #define V_SET_FUNC_RESET  0x07ff
 
 #define PAR_VENDOR_ID     0x00
+#define PAR_REV_ID        0x02
 #define PAR_NODE_COUNT    0x04
 #define PAR_FUNC_TYPE     0x05
 #define PAR_WIDGET_CAP    0x09
@@ -131,10 +146,12 @@ typedef struct {
 
 /* ---------------- state ---------------- */
 static volatile uint8_t* mmio;
+#ifndef HDA_HOST_TEST
 static uint32_t* corb_raw;  static uint32_t* corb;
 static uint64_t* rirb_raw;  static uint64_t* rirb;
 static uint16_t corb_wp;
 static uint16_t rirb_last;
+#endif
 static int      hda_ok;                 /* controller + codec path ready */
 
 static uint8_t  cad;                    /* codec address */
@@ -174,6 +191,7 @@ static void* alloc_aligned(size_t size, size_t align, void** raw) {
 }
 
 /* ---------------- CORB/RIRB command interface ---------------- */
+#ifndef HDA_HOST_TEST
 static int hda_cmd(uint32_t cmd, uint32_t* resp) {
     corb_wp = (uint16_t)((corb_wp + 1) % HDA_CORB_LEN);
     corb[corb_wp] = cmd;
@@ -194,6 +212,9 @@ static int hda_cmd(uint32_t cmd, uint32_t* resp) {
     klog("[hda] command timeout (codec not answering)\n");
     return -1;
 }
+#else
+static int hda_cmd(uint32_t cmd, uint32_t* resp);   /* supplied by the test */
+#endif
 
 /* verbs with a 16-bit payload use the long form (4-bit verb id): 2 set
  * converter format, 3 set amp, 4/5 coef, a/b/c/d the matching getters */
@@ -299,11 +320,100 @@ static const char* hex4(uint16_t v, char* buf) {
     return buf;
 }
 
-/* Walk one codec: find its AFG, an output pin with a DAC behind it, and
- * unmute that path. Returns 0 on success. */
+/* Realtek ALC model names for the parts the HDA device ids spell out.
+ * ALC662-VD / ALC662-VD3 share device id 0x0662 with the plain ALC662 and are
+ * told apart only by the revision id, which the probe logs next to the name.
+ * Anything not listed falls back to ALC<device id>. */
+typedef struct { uint16_t id; const char* name; } alc_model_t;
+static const alc_model_t alc_models[] = {
+    { 0x0662, "ALC662" },   /* also ALC662-VD / ALC662-VD3 */
+    { 0x0663, "ALC663" }, { 0x0665, "ALC665" }, { 0x0668, "ALC668" },
+    { 0x0670, "ALC670" }, { 0x0671, "ALC671" }, { 0x0861, "ALC861" },
+    { 0x0862, "ALC861-VD" }, { 0x0880, "ALC880" }, { 0x0882, "ALC882" },
+    { 0x0883, "ALC883" }, { 0x0885, "ALC885" }, { 0x0886, "ALC886" },
+    { 0x0887, "ALC887" }, { 0x0888, "ALC888" }, { 0x0889, "ALC889" },
+    { 0x0892, "ALC892" }, { 0x0898, "ALC898" }, { 0x0900, "ALC1150" },
+    { 0x1220, "ALC1220" }, { 0x0262, "ALC262" }, { 0x0268, "ALC268" },
+    { 0x0269, "ALC269" }, { 0x0272, "ALC272" }, { 0x0282, "ALC282" },
+    { 0x0256, "ALC256" }, { 0x0295, "ALC295" },
+};
+
+static const char* alc_model_name(uint16_t id) {
+    for (int i = 0; i < (int)(sizeof(alc_models) / sizeof(alc_models[0])); i++) {
+        if (alc_models[i].id == id) return alc_models[i].name;
+    }
+    return NULL;
+}
+
+static const char* hda_pin_dev_name(int dev) {
+    switch (dev) {
+        case 0x0: return "line-out";
+        case 0x1: return "speaker";
+        case 0x2: return "hp-out";
+        case 0x3: return "cd";
+        case 0x4: return "spdif-out";
+        case 0x5: return "dig-out";
+        case 0x8: return "line-in";
+        case 0xa: return "mic";
+        default:  return "other";
+    }
+}
+
+/* an output pin found during the walk, with the DAC path behind it */
+typedef struct {
+    uint8_t     pin;
+    int         dev;                /* default config device type */
+    int         assoc;              /* default association (bits 7:4) */
+    int         score;
+    int         path_len;
+    path_node_t path[8];
+} hda_out_t;
+
+static hda_out_t outs[8];
+static int       out_count;
+static uint8_t   dacs[8];           /* converters that carry the open stream */
+static int       dac_count;
+static int       primary_assoc;
+
+static void hda_add_dac(uint8_t nid) {
+    for (int i = 0; i < dac_count; i++) {
+        if (dacs[i] == nid) return;
+    }
+    if (dac_count < (int)(sizeof(dacs))) dacs[dac_count++] = nid;
+}
+
+/* power + unmute a pin's whole DAC path: mixers get their selected input amp
+ * unmuted and selectors their connect point set */
+static void hda_setup_path(uint8_t c, const path_node_t* p, int len) {
+    for (int k = 0; k < len; k++) {
+        hda_widget_power(c, p[k].nid);
+        hda_set_amp(c, p[k].nid, 0, 0, hda_param(c, p[k].nid, PAR_AMP_OUT_CAP));
+        if (p[k].type == WID_AUD_MIX) {
+            hda_set_amp(c, p[k].nid, 1, p[k].in_idx, hda_param(c, p[k].nid, PAR_AMP_IN_CAP));
+        }
+        if (p[k].type == WID_AUD_SEL) {
+            hda_verb(c, p[k].nid, V_SET_CONNECT_SEL, (uint32_t)p[k].in_idx, NULL);
+        }
+    }
+}
+
+static void hda_path_str(char* buf, size_t n, const hda_out_t* o) {
+    size_t p = 0;
+    buf[0] = '\0';
+    for (int k = 0; k < o->path_len; k++) {
+        char nb[16];
+        ksprintf(nb, sizeof(nb), "%s0x%02x", k ? " <- " : "", o->path[k].nid);
+        for (char* s = nb; *s != '\0' && p + 1 < n; s++) buf[p++] = *s;
+    }
+    buf[p] = '\0';
+}
+
+/* Walk one codec: find its AFG, every output pin that reaches a DAC, unmute
+ * the primary path and every sibling pin in the same default association. */
 static int hda_probe_codec(uint8_t c) {
     vendor = (uint16_t)(hda_param(c, 0, PAR_VENDOR_ID) >> 16);
     device = (uint16_t)(hda_param(c, 0, PAR_VENDOR_ID) & 0xffff);
+    uint32_t rev = hda_param(c, 0, PAR_REV_ID);
 
     uint32_t nc = hda_param(c, 0, PAR_NODE_COUNT);
     int first = (int)(nc >> 16), count = (int)(nc & 0xffff);   /* start / count */
@@ -323,11 +433,8 @@ static int hda_probe_codec(uint8_t c) {
     count = (int)(nc & 0xffff);
     if (count > 64) count = 64;
 
-    /* prefer a line-out / speaker pin, else any output-capable pin */
-    dac = 0;
-    int best_score = -1;
-    path_node_t best_path[8];
-    int best_len = 0;
+    /* ---- collect every output pin that reaches a DAC ---- */
+    out_count = 0;
     for (int i = 0; i < count; i++) {
         uint8_t nid = (uint8_t)(first + i);
         uint32_t wcaps = hda_param(c, nid, PAR_WIDGET_CAP);
@@ -338,63 +445,113 @@ static int hda_probe_codec(uint8_t c) {
         uint32_t cfg = 0;
         hda_verb(c, nid, V_GET_CONFIG_DEF, 0, &cfg);
         if (DEFCFG_PORT_CONN(cfg) == 0x1) continue;      /* no physical connection */
-        int dev = (int)DEFCFG_DEVICE(cfg);
-        int score = (dev == 0x0 /* line out */) ? 3 : (dev == 0x1 /* speaker */) ? 2 : 1;
+        if (out_count >= (int)(sizeof(outs))) break;
 
         path_len = 0;
-        if (hda_find_dac(c, nid, 0) && score > best_score) {
-            best_score = score;
-            dac = path[path_len - 1].nid;
-            pin = nid;
-            pin_eapd = (pcaps & PINCAP_EAPD) ? 1 : 0;
-            sel = 0; sel_idx = 0;
-            for (int k = 0; k < path_len - 1; k++) {
-                if (path[k].type == WID_AUD_SEL) { sel = path[k].nid; sel_idx = path[k].in_idx; }
-            }
-            best_len = path_len;
-            for (int k = 0; k < path_len; k++) best_path[k] = path[k];
-        }
+        if (!hda_find_dac(c, nid, 0)) continue;          /* no converter behind it */
+
+        hda_out_t* o = &outs[out_count];
+        o->pin = nid;
+        o->dev = (int)DEFCFG_DEVICE(cfg);
+        o->assoc = (int)((cfg >> 4) & 0xf);
+        o->path_len = path_len;
+        for (int k = 0; k < path_len; k++) o->path[k] = path[k];
+        /* front line-out wins, then speaker, then headphone; the primary
+         * association (1) is the one the board wires first */
+        o->score = (o->dev == 0x0) ? 4 : (o->dev == 0x1) ? 3 : (o->dev == 0x2) ? 2 : 1;
+        if (o->assoc == 1) o->score += 1;
+        out_count++;
         path_len = 0;
     }
-    if (dac == 0) return -1;
-    for (int k = 0; k < best_len; k++) path[k] = best_path[k];
-    path_len = best_len;
+    if (out_count == 0) return -1;
 
-    /* power + unmute everything on the path, then enable the pin */
-    for (int k = 0; k < path_len; k++) {
-        uint8_t nid = path[k].nid;
-        hda_widget_power(c, nid);
-        hda_set_amp(c, nid, 0, 0, hda_param(c, nid, PAR_AMP_OUT_CAP));
-        if (path[k].type == WID_AUD_MIX) {
-            hda_set_amp(c, nid, 1, path[k].in_idx, hda_param(c, nid, PAR_AMP_IN_CAP));
+    int best = 0;
+    for (int i = 1; i < out_count; i++) {
+        if (outs[i].score > outs[best].score) best = i;
+    }
+    pin = outs[best].pin;
+    primary_assoc = outs[best].assoc;
+    dac = outs[best].path[outs[best].path_len - 1].nid;
+    pin_eapd = (hda_param(c, pin, PAR_PIN_CAP) & PINCAP_EAPD) ? 1 : 0;
+    sel = 0; sel_idx = 0;
+    for (int k = 0; k < outs[best].path_len - 1; k++) {
+        if (outs[best].path[k].type == WID_AUD_SEL) {
+            sel = outs[best].path[k].nid;
+            sel_idx = outs[best].path[k].in_idx;
         }
     }
-    hda_widget_power(c, pin);
-    hda_set_amp(c, pin, 0, 0, hda_param(c, pin, PAR_AMP_OUT_CAP));
+
+    /* unmute the primary path and open its jack */
+    hda_setup_path(c, outs[best].path, outs[best].path_len);
     hda_verb(c, pin, V_SET_PIN_CTL, PIN_CTL_OUT_EN, NULL);
-    if (sel != 0) hda_verb(c, sel, V_SET_CONNECT_SEL, (uint32_t)sel_idx, NULL);
-    /* EAPD powers the external amplifier on most Realteks - without it the
-     * line-out/headphone jack stays silent */
+    hda_set_amp(c, pin, 0, 0, hda_param(c, pin, PAR_AMP_OUT_CAP));
+    /* EAPD powers the external amplifier on most Realtek ALC parts (the
+     * ALC662 included) - without it the jack stays silent */
     if (pin_eapd) hda_verb(c, pin, V_SET_EAPD, 0x02, NULL);
 
-    if (vendor == 0x10ec) {
-        char buf[8];
-        ksprintf(codec_name, sizeof(codec_name), "Realtek ALC%s", hex4(device, buf));
-    } else {
-        char buf[8];
-        ksprintf(codec_name, sizeof(codec_name), "codec %x:%s", vendor, hex4(device, buf));
+    /* every other output pin in the same default association carries the same
+     * stream, so front panel + headphone/speaker jacks all play */
+    dac_count = 0;
+    hda_add_dac(dac);
+    for (int i = 0; i < out_count; i++) {
+        if (i == best || outs[i].assoc != primary_assoc) continue;
+        hda_setup_path(c, outs[i].path, outs[i].path_len);
+        hda_verb(c, outs[i].pin, V_SET_PIN_CTL, PIN_CTL_OUT_EN, NULL);
+        hda_set_amp(c, outs[i].pin, 0, 0, hda_param(c, outs[i].pin, PAR_AMP_OUT_CAP));
+        if (hda_param(c, outs[i].pin, PAR_PIN_CAP) & PINCAP_EAPD) {
+            hda_verb(c, outs[i].pin, V_SET_EAPD, 0x02, NULL);
+        }
+        hda_add_dac(outs[i].path[outs[i].path_len - 1].nid);
     }
 
+    /* ---- report what was found: enough to triage a board from the log ---- */
+    if (vendor == 0x10ec) {
+        const char* n = alc_model_name(device);
+        uint32_t r = (rev >> 8) & 0xff;
+        if (n != NULL && r >= 1 && r <= 9) {
+            ksprintf(codec_name, sizeof(codec_name), "Realtek %s rev%u", n, (unsigned)r);
+        } else if (n != NULL) {
+            ksprintf(codec_name, sizeof(codec_name), "Realtek %s", n);
+        } else {
+            char b[8];
+            ksprintf(codec_name, sizeof(codec_name), "Realtek ALC%s", hex4(device, b));
+        }
+    } else {
+        char b[8];
+        ksprintf(codec_name, sizeof(codec_name), "codec %x:%s", vendor, hex4(device, b));
+    }
     {
-        char buf[128];
-        ksprintf(buf, sizeof(buf), "[hda] %s cad=%d afg=%d dac=%d pin=%d eapd=%d\n",
-                 codec_name, (int)c, (int)afg, (int)dac, (int)pin, pin_eapd);
+        char buf[112];
+        ksprintf(buf, sizeof(buf), "[hda] %s rev=%x cad=%d afg=%d (%d out pins)\n",
+                 codec_name, (unsigned)rev, (int)c, (int)afg, out_count);
         klog(buf);
+    }
+    for (int i = 0; i < out_count; i++) {
+        char pathstr[64], buf[144];
+        hda_path_str(pathstr, sizeof(pathstr), &outs[i]);
+        ksprintf(buf, sizeof(buf), "[hda] out 0x%02x assoc%u %s <- %s%s\n",
+                 outs[i].pin, (unsigned)outs[i].assoc, hda_pin_dev_name(outs[i].dev),
+                 pathstr, (i == best) ? "  [primary]" : "");
+        klog(buf);
+    }
+    {
+        char buf[96];
+        int n = 0;
+        for (int i = 0; i < dac_count && n < (int)sizeof(buf) - 8; i++) {
+            char nb[8];
+            ksprintf(nb, sizeof(nb), "%s0x%02x", i ? " " : "", dacs[i]);
+            for (char* s = nb; *s != '\0' && n < (int)sizeof(buf) - 2; s++) buf[n++] = *s;
+        }
+        buf[n] = '\0';
+        char line[112];
+        ksprintf(line, sizeof(line), "[hda] stream dacs:%s\n", buf);
+        klog(line);
     }
     return 0;
 }
 
 /* ---------------- controller bring-up ---------------- */
+#ifndef HDA_HOST_TEST
 int hda_init(void) {
     if (hda_ok) return 0;
 
@@ -503,6 +660,7 @@ int hda_init(void) {
     hda_ok = 1;
     return 0;
 }
+#endif /* !HDA_HOST_TEST */
 
 const char* hda_codec_name(void) { return hda_ok ? codec_name : ""; }
 
@@ -556,6 +714,15 @@ void hda_close(void) {
     if (ring_raw) { kfree(ring_raw); ring_raw = NULL; ring = NULL; }
 }
 
+/* point every converter of this stream at the format and stream tag, so all
+ * jacks in the primary association carry the same audio */
+static void hda_set_stream_on_dacs(uint16_t fmt) {
+    for (int i = 0; i < dac_count; i++) {
+        hda_verb(cad, dacs[i], V_SET_STREAM_FMT, fmt, NULL);
+        hda_verb(cad, dacs[i], V_SET_STREAM_ID, (uint32_t)((stream_tag << 4) | 0), NULL);
+    }
+}
+
 int hda_open(uint32_t sample_rate) {
     if (!hda_ok) return -1;
     hda_close();
@@ -585,17 +752,16 @@ int hda_open(uint32_t sample_rate) {
         bdl[i].flags = 0;                         /* no completion IRQ */
     }
 
-    /* converter: format then stream id, exactly like the stream descriptor */
-    hda_verb(cad, dac, V_SET_STREAM_FMT, fmt, NULL);
-    hda_verb(cad, dac, V_SET_STREAM_ID, (uint32_t)((stream_tag << 4) | 0), NULL);
+    /* converter(s): format then stream id, exactly like the stream descriptor */
+    hda_set_stream_on_dacs(fmt);
     if (sel != 0) hda_verb(cad, sel, V_SET_CONNECT_SEL, (uint32_t)sel_idx, NULL);
     hda_verb(cad, pin, V_SET_PIN_CTL, PIN_CTL_OUT_EN, NULL);
     hda_stream_program(fmt);
 
     {
-        char buf[80];
-        ksprintf(buf, sizeof(buf), "[hda] stream %d tag %d at %u Hz (fmt 0x%x)\n",
-                 sd_index, (int)stream_tag, (unsigned)sample_rate, (unsigned)fmt);
+        char buf[96];
+        ksprintf(buf, sizeof(buf), "[hda] stream %d tag %d at %u Hz (fmt 0x%x, %d dac)\n",
+                 sd_index, (int)stream_tag, (unsigned)sample_rate, (unsigned)fmt, dac_count);
         klog(buf);
     }
 
@@ -642,8 +808,7 @@ void hda_play(void) {
         memset(ring, 0, HDA_RING);
         wpos = 0;
         hda_stream_program(cur_fmt);
-        hda_verb(cad, dac, V_SET_STREAM_FMT, cur_fmt, NULL);
-        hda_verb(cad, dac, V_SET_STREAM_ID, (uint32_t)((stream_tag << 4) | 0), NULL);
+        hda_set_stream_on_dacs(cur_fmt);
     }
     running = 1;
     was_paused = 0;

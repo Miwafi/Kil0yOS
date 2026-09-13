@@ -2,6 +2,23 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.23.0] - 2026-09-13
+This release adds **onboard Realtek ALC662 / ALC662-VD support** on top of the HDA driver: the codec walk now handles the ALC662's topology (three DACs, front mixer plus a second mixer, front line-out and headphone/second-output pins), names the part by model and revision, and treats the board's output jacks of one association as a single output group so front panel and headphone/speaker all play. Since QEMU cannot emulate a Realtek codec, the ALC662 paths are covered by a host-side test against a canned topology and are waiting on real-board confirmation.
+
+### Added
+- **ALC model table + revision reporting**: Realtek device ids resolve to model names (ALC662 and family, ALC8xx / ALC2xx / ALC1220 …) and the revision id is decoded as `rev1/2/3`, so `[hda] Realtek ALC662 rev3` identifies the part from the serial log alone. ALC662-VD / ALC662-VD3 report the same 0x0662 device id as the plain ALC662 and are distinguished by that revision.
+- **Association-aware output group**: every output-capable pin with a DAC behind it is enumerated (line-out > speaker > headphone, primary association preferred) and all pins of the primary pin's default association are opened and given the same stream, so the ALC662's front line-out *and* its headphone/second output carry audio instead of only the jack the walk happened to pick first. Mixer input amps are unmuted at the connection index that actually feeds the DAC, and EAPD is set per pin where the codec advertises it (mandatory on ALC662-family boards).
+- **Triage logging**: one line per discovered output pin (`[hda] out 0x14 assoc1 line-out <- 0x0c <- 0x02  [primary]`) plus the converter set (`[hda] stream dacs:0x02 0x03`), so a real board's routing can be read straight off the boot log.
+- **`tools/hda_host_test.c` + `tools/hda_host_test.sh`**: builds `drivers/hda.c` with `-DHDA_HOST_TEST` (no MMIO/PCI/controller) and drives its discovery against a canned ALC662 topology — asserts the chosen pin/DAC, sibling-jack inclusion and exclusion by association, the emitted amp/EAPD verbs and the codec naming. Two scenarios (headphone pin in association 1 vs 2) both pass.
+
+### Changed
+- Version strings bumped to 2.23.0 (boot banner, `uname`, shell `version`, GUI title bar, `accept_gop.sh` checks).
+
+### File Changes
+- `src/kernel/drivers/hda.c`: ALC model/revision table, multi-pin output group, pin+converter logging, `HDA_HOST_TEST` seam
+- `tools/hda_host_test.c`, `tools/hda_host_test.sh`: new codec-discovery host test + runner
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [2.22.0] - 2026-09-13
 This release adds **High Definition Audio**: an Intel HDA controller driver plus Realtek ALC codec support, so modern machines (and QEMU's `intel-hda`) play MP3s out of the box. `drivers/audio.c` now fronts both controllers — HDA is probed first, AC'97 stays as the fallback — and the Files-panel player is unchanged.
 
