@@ -25,6 +25,8 @@
 #include "pkg/kilget.h"
 #include "usb/usb.h"
 #include "drivers/jpeg.h"
+#include "drivers/audio.h"
+#include "drivers/mp3.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -444,7 +446,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.20.0\n");
+    vga_puts("Kil0yOS v2.21.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -791,7 +793,7 @@ static void gui_shell_execute(void) {
 static void desktop_repaint(void);   /* fwd: modal close repaints everything */
 extern void klog(const char* s);
 
-enum { FM_BROWSE = 0, FM_INPUT, FM_CONFIRM, FM_PREVIEW, FM_IMAGE };
+enum { FM_BROWSE = 0, FM_INPUT, FM_CONFIRM, FM_PREVIEW, FM_IMAGE, FM_AUDIO };
 static fs_entry_t* fm_dir = NULL;               /* browsed directory */
 static int fm_sel = 0;                          /* selected row */
 static int fm_scroll = 0;                       /* first visible row */
@@ -808,6 +810,18 @@ static jpeg_image_t fm_img;
 static char fm_img_title[96];
 static int  fm_img_fail;                        /* 1 = show fm_img_err text */
 static char fm_img_err[40];
+
+/* FM_AUDIO: MP3 playback over AC97, pumped from the desktop loop */
+static mp3_t*   fm_mp3;                         /* decoder handle */
+static uint8_t* fm_mp3_data;                    /* whole-file buffer */
+static int16_t* fm_mp3_pcm;                     /* one decoded frame */
+static int      fm_mp3_pending;                 /* frames not yet in ring */
+static int      fm_mp3_pending_off;             /* offset into fm_mp3_pcm */
+static int      fm_audio_paused;
+static int      fm_audio_done;                  /* EOF reached, draining */
+static char     fm_audio_title[96];
+static char     fm_audio_info[64];              /* "48 kHz  128 kbps  stereo" */
+static uint64_t fm_audio_frames;                /* stereo frames handed over */
 
 #define FM_PV_ROWS 14
 #define FM_PV_COLS 76
@@ -1142,10 +1156,159 @@ static void fm_image_show(fs_entry_t* e) {
     fm_mode = FM_IMAGE;
 }
 
+/* ===== FM_AUDIO player: MP3 decode -> AC97 DMA ring ===== */
+static void fm_close_modal(void);   /* defined below the pump */
+
+static int fm_is_mp3_name(const char* name) {
+    size_t n = strlen(name);
+    return n >= 4 && fm_ci_cmp(name + n - 4, ".mp3") == 0;
+}
+
+static void fm_audio_show(fs_entry_t* e) {
+    fm_mp3 = NULL;
+    fm_mp3_data = NULL;
+    fm_mp3_pcm = NULL;
+    fm_mp3_pending = 0;
+    fm_mp3_pending_off = 0;
+    fm_audio_paused = 0;
+    fm_audio_done = 0;
+    fm_audio_frames = 0;
+    fm_clipn(fm_audio_title, (int)sizeof(fm_audio_title) - 8, e->name, 64);
+
+    if (audio_init() != 0) {
+        fm_img_fail = 1;
+        strcpy(fm_img_err, "no audio device");
+        fm_mode = FM_AUDIO;
+        return;
+    }
+    if (e->size < 512 || e->size > 64u * 1024 * 1024) {
+        fm_img_fail = 1;
+        strcpy(fm_img_err, "bad file size");
+        fm_mode = FM_AUDIO;
+        return;
+    }
+    fm_mp3_data = (uint8_t*)kmalloc((size_t)e->size);
+    if (fm_mp3_data == NULL) {
+        fm_img_fail = 1;
+        strcpy(fm_img_err, "out of memory");
+        fm_mode = FM_AUDIO;
+        return;
+    }
+    int got = fs_read_file(e, fm_mp3_data, (size_t)e->size);
+    if (got <= 0) {
+        kfree(fm_mp3_data);
+        fm_mp3_data = NULL;
+        fm_img_fail = 1;
+        strcpy(fm_img_err, "read error");
+        fm_mode = FM_AUDIO;
+        return;
+    }
+    fm_mp3 = mp3_open(fm_mp3_data, (size_t)got);
+    if (fm_mp3 == NULL) {
+        kfree(fm_mp3_data);
+        fm_mp3_data = NULL;
+        fm_img_fail = 1;
+        strcpy(fm_img_err, "no mp3 frames");
+        fm_mode = FM_AUDIO;
+        return;
+    }
+    if (audio_open((uint32_t)mp3_rate(fm_mp3)) != 0) {
+        mp3_close(fm_mp3);
+        fm_mp3 = NULL;
+        kfree(fm_mp3_data);
+        fm_mp3_data = NULL;
+        fm_img_fail = 1;
+        strcpy(fm_img_err, "audio open failed");
+        fm_mode = FM_AUDIO;
+        return;
+    }
+    fm_mp3_pcm = (int16_t*)kmalloc(sizeof(int16_t) * 1152 * 2);
+    if (fm_mp3_pcm == NULL) {
+        audio_close();
+        mp3_close(fm_mp3);
+        fm_mp3 = NULL;
+        kfree(fm_mp3_data);
+        fm_mp3_data = NULL;
+        fm_img_fail = 1;
+        strcpy(fm_img_err, "out of memory");
+        fm_mode = FM_AUDIO;
+        return;
+    }
+    fm_img_fail = 0;
+    {
+        const char* m = mp3_channels(fm_mp3) == 2 ? "stereo" : "mono";
+        fm_audio_info[0] = '\0';
+        char num[16];
+        itoa(mp3_rate(fm_mp3), num, 10, sizeof(num));
+        strcat(fm_audio_info, num);
+        strcat(fm_audio_info, " Hz  ");
+        itoa(mp3_bitrate(fm_mp3), num, 10, sizeof(num));
+        strcat(fm_audio_info, num);
+        strcat(fm_audio_info, " kbps  ");
+        strcat(fm_audio_info, m);
+    }
+    klog("[audio] playing ");
+    klog(e->name);
+    klog("\n");
+    fm_mode = FM_AUDIO;
+}
+
+/* decode + feed the AC97 ring from the desktop loop; called every frame */
+static void fm_audio_pump(void) {
+    if (fm_mode != FM_AUDIO || fm_mp3 == NULL || fm_img_fail) return;
+    if (fm_audio_paused) return;
+
+    if (fm_audio_done) {
+        if (audio_queued() <= 0) {
+            klog("[audio] playback finished\n");
+            fm_close_modal();
+        }
+        return;
+    }
+
+    /* feed until the ring refuses (playhead caught up) */
+    for (;;) {
+        if (fm_mp3_pending == 0) {
+            int n = mp3_decode(fm_mp3, fm_mp3_pcm);
+            if (n <= 0) {
+                fm_audio_done = 1;
+                break;
+            }
+            if (mp3_channels(fm_mp3) < 2) {
+                /* the DAC only plays 16-bit stereo: duplicate the mono
+                 * samples in place, back to front (1152 -> 2304 fits) */
+                for (int i = n - 1; i >= 0; i--) {
+                    fm_mp3_pcm[i * 2]     = fm_mp3_pcm[i];
+                    fm_mp3_pcm[i * 2 + 1] = fm_mp3_pcm[i];
+                }
+                n *= 2;
+            }
+            fm_mp3_pending = n / 2;        /* stereo frames */
+            fm_mp3_pending_off = 0;
+        }
+        int acc = audio_write(fm_mp3_pcm + fm_mp3_pending_off * 2,
+                              fm_mp3_pending);
+        fm_mp3_pending -= acc;
+        fm_mp3_pending_off += acc;
+        fm_audio_frames += (uint64_t)acc;
+        if (fm_audio_frames >= 2048 && !audio_playing()) {
+            audio_play();                  /* enough buffered: start the DAC */
+        }
+        if (acc == 0) break;               /* ring full, come back later */
+    }
+}
+
 /* modal teardown shared by every close path; frees viewer planes */
 static void fm_close_modal(void) {
     if (fm_mode == FM_IMAGE) {
         if (!fm_img_fail) jpeg_image_free(&fm_img);
+        fm_img_fail = 0;
+    }
+    if (fm_mode == FM_AUDIO) {
+        audio_close();
+        if (fm_mp3 != NULL) { mp3_close(fm_mp3); fm_mp3 = NULL; }
+        if (fm_mp3_pcm != NULL) { kfree(fm_mp3_pcm); fm_mp3_pcm = NULL; }
+        if (fm_mp3_data != NULL) { kfree(fm_mp3_data); fm_mp3_data = NULL; }
         fm_img_fail = 0;
     }
     fm_mode = FM_BROWSE;
@@ -1164,6 +1327,10 @@ static void fm_open_selected(void) {
     }
     if (fm_is_jpeg_name(e->name)) {
         fm_image_show(e);
+        return;
+    }
+    if (fm_is_mp3_name(e->name)) {
+        fm_audio_show(e);
         return;
     }
     fm_preview_show(e);
@@ -1383,12 +1550,85 @@ static void fm_image_draw(void) {
     dt_draw_string(x + 8, y + h - 12, "any key closes", 0x08);
 }
 
+/* FM_AUDIO: centered player window with progress bar */
+static void fm_audio_draw(void) {
+    if (fm_img_fail) {
+        int w = 240, h = 64;
+        int x = (dt_w - w) / 2;
+        int y = (dt_h - h) / 2;
+        dt_fill_rect(x, y, w, h, 0x0F);
+        dt_draw_rect(x, y, w, h, 0x04);
+        dt_draw_string(x + 8, y + 6, fm_audio_title, 0x04);
+        dt_draw_string(x + 8, y + 24, fm_img_err, 0x04);
+        dt_draw_string(x + 8, y + 44, "any key closes", 0x08);
+        return;
+    }
+
+    int w = 340;
+    int h = 92;
+    int x = (dt_w - w) / 2;
+    int y = (dt_h - h) / 2;
+    dt_fill_rect(x, y, w, h, 0x0F);
+    dt_draw_rect(x, y, w, h, 0x09);
+    dt_fill_rect(x + 2, y + 2, w - 4, 13, 0x01);
+    char title[112];
+    fm_clipn(title, (int)sizeof(title) - 12, fm_audio_title, (w - 16) / 8 - 6);
+    strcat(title, "  MP3");
+    dt_draw_string(x + 6, y + 4, title, 0x0F);
+
+    dt_draw_string(x + 10, y + 22, fm_audio_info, 0x08);
+
+    /* progress: elapsed = frames handed to ring minus still-queued */
+    char line[48];
+    int rate = mp3_rate(fm_mp3);
+    uint64_t total_sec = 0;
+    if (mp3_bitrate(fm_mp3) > 0) {
+        total_sec = (uint64_t)mp3_total_bytes(fm_mp3) * 8 /
+                    ((uint64_t)mp3_bitrate(fm_mp3) * 1000);
+    }
+    uint64_t queued = (uint64_t)audio_queued();
+    uint64_t played = (fm_audio_frames > queued) ? fm_audio_frames - queued : 0;
+    if (rate > 0) played /= (uint64_t)rate;
+    uint64_t mm = played / 60, ss = played % 60;
+    itoa((int)mm, line, 10, sizeof(line));
+    char t2[48];
+    strcpy(t2, line);
+    strcat(t2, ":");
+    char num[16];
+    itoa((int)ss % 60, num, 10, sizeof(num));
+    if (ss < 10) strcat(t2, "0");
+    strcat(t2, num);
+    strcat(t2, " / ");
+    itoa((int)(total_sec / 60), num, 10, sizeof(num));
+    strcat(t2, num);
+    strcat(t2, ":");
+    itoa((int)(total_sec % 60), num, 10, sizeof(num));
+    if (total_sec % 60 < 10) strcat(t2, "0");
+    strcat(t2, num);
+    dt_draw_string(x + 10, y + 38, t2, 0x08);
+
+    /* progress bar */
+    int bw = w - 20;
+    dt_draw_rect(x + 10, y + 52, bw, 10, 0x08);
+    uint64_t denom = total_sec > 0 ? total_sec : 1;
+    uint64_t fillw = (uint64_t)bw * 10 * played / denom / 10;
+    if (fillw > (uint64_t)bw - 2) fillw = bw - 2;
+    if (fillw > 0) dt_fill_rect(x + 11, y + 53, (int)fillw, 8, 0x02);
+
+    const char* state = fm_audio_done ? "stopping"
+                        : fm_audio_paused ? "paused" : "playing";
+    dt_draw_string(x + 10, y + h - 12, state, 0x08);
+    dt_draw_string(x + w - 10 - 8 * 24, y + h - 12, "Space=pause  any=stop", 0x08);
+}
+
+/* dispatch whatever modal the panel is currently showing */
 static void fm_modal_draw(void) {
     switch (fm_mode) {
         case FM_INPUT:   fm_input_box_draw();   break;
         case FM_CONFIRM: fm_confirm_draw();     break;
         case FM_PREVIEW: fm_preview_draw();     break;
         case FM_IMAGE:   fm_image_draw();       break;
+        case FM_AUDIO:   fm_audio_draw();       break;
         default: break;
     }
 }
@@ -1414,6 +1654,18 @@ static void fm_repaint_all(int cur_x, int cur_y) {
 
 /* Returns 1: the Files panel owns the keyboard while active */
 static int fm_handle_key(unsigned char c, int cur_x, int cur_y) {
+    if (fm_mode == FM_AUDIO) {
+        if (c == ' ') {
+            fm_audio_paused = !fm_audio_paused;
+            if (fm_audio_paused) audio_pause();
+            else if (!fm_audio_done) audio_play();
+            klog(fm_audio_paused ? "[audio] paused\n" : "[audio] resumed\n");
+        } else {
+            fm_close_modal();                 /* any other key stops */
+        }
+        fm_repaint_all(cur_x, cur_y);
+        return 1;
+    }
     if (fm_mode == FM_PREVIEW || fm_mode == FM_IMAGE) {
         fm_close_modal();
         fm_repaint_all(cur_x, cur_y);
@@ -1713,7 +1965,7 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v2.20.0", 0x00);
+    dt_draw_string(4, title_y, "Kil0yOS v2.21.0", 0x00);
     dt_draw_string(dt_w - 84, title_y, "[Win]=Menu", 0x01);
 
     /* left function panel */
@@ -1785,6 +2037,11 @@ static void desktop_run_loop(void) {
             if (active_func == FUNC_SYSTEM) {
                 smp_update_cpu_usage();
                 draw_func_panel(FUNC_SYSTEM);
+            }
+
+            /* MP3 player: tick the elapsed-time readout and progress bar */
+            if (active_func == FUNC_FILES && fm_mode == FM_AUDIO) {
+                fm_modal_draw();
             }
 
             /* pointer back with a fresh background snapshot */
@@ -1896,6 +2153,9 @@ static void desktop_run_loop(void) {
             }
         }
         if (state.buttons != prev.buttons) prev.buttons = state.buttons;
+
+        /* keep the MP3 decoder fed; repaints itself once a second */
+        if (active_func == FUNC_FILES && fm_mode == FM_AUDIO) fm_audio_pump();
 
         __asm__ volatile("hlt");   /* sleep until next interrupt instead of spinning */
     }

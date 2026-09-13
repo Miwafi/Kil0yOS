@@ -43,7 +43,9 @@ DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
                $(SRCDIR)/kernel/drivers/speaker.c \
                $(SRCDIR)/kernel/drivers/efi_gop.c \
                $(SRCDIR)/kernel/drivers/fb.c \
-               $(SRCDIR)/kernel/drivers/jpeg.c
+               $(SRCDIR)/kernel/drivers/jpeg.c \
+               $(SRCDIR)/kernel/drivers/ac97.c \
+               $(SRCDIR)/kernel/drivers/mp3.c
 
 # --- Filesystem ---
 FS_SRCS = $(SRCDIR)/kernel/fs/fs.c \
@@ -291,6 +293,14 @@ $(BUILDDIR)/user_blob_%.o: $(BUILDDIR)/user/%.bin
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# minimp3 is float code, and the x86-64 psABI returns/passes float in XMM,
+# so this one translation unit must be built with SSE even though the rest
+# of the kernel is -mno-sse. mp3.c saves/restores the live FPU/SSE state and
+# masks interrupts around every decode, so no other context ever sees it.
+$(BUILDDIR)/kernel/drivers/mp3.o: $(SRCDIR)/kernel/drivers/mp3.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -msse -msse2 -mmmx -c $< -o $@
 
 $(BOOT_OBJ): $(SRCDIR)/boot/boot.asm
 	@mkdir -p $(dir $@)

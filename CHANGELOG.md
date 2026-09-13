@@ -2,6 +2,28 @@
  All notable changes to this project will be documented in this file.
  The format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [2.21.0] - 2026-09-13
+This release adds **MP3 playback**: an AC'97 (Intel ICH) bus-master DMA audio driver plus a vendored minimp3 decoder, wired into the Files panel as an FM_AUDIO player modal that plays any `.mp3` from `/home/user/art` with elapsed time, a progress bar and Space-to-pause.
+
+### Added
+- **AC'97 audio driver** (`drivers/ac97.c`, `include/drivers/audio.h`): PCI class 0x0401 probe (BAR0 = NAM codec, BAR1 = NABM bus master), codec cold reset, master/PCM-out unmute, and VRA handshake (`0x2A` bit0) before programming the PCM front DAC rate at `0x2C` (read back and logged if rejected). Playback uses the ICH LVI scheme over the full 32-entry descriptor list: BDL entry lengths are in 16-bit samples, the writer publishes each completed slot by advancing LVI (byte access — this is also what restarts the controller after it catches up with `CIV == LVI`), and `SR.DCH` / `CIV` deltas tell the writer which slots are free again. The heap lives in the identity map, so kmalloc addresses double as bus addresses. The register model is the Intel ICH NAM/NABM split, so ICH-family AC'97 controllers and register-compatible clones are driven (verified on QEMU's 82801AA). Detection is a plain PCI class 0x0401 scan taking the first match, so other class-0x0401 controllers (ES1370/ES1371, EMU10K1, CMI8738) are also picked up but not driven — their codec-ready probe fails and playback stays silent with a `[ac97]` log; HD Audio (class 0x0403) is not matched at all, and a candidate without two I/O BARs is rejected before any register access. Playback only (no capture), polled (no interrupt), 32-bit DMA addresses.
+- **minimp3 integration** (`include/drivers/minimp3.h`, `drivers/mp3.c`, `include/drivers/mp3.h`): vendored decoder with `MINIMP3_ONLY_MP3`, wrapped in a handle that probes the first frame for rate/bitrate/channels and streams frames from the caller's buffer (the bit reservoir reads backwards, so the whole file stays resident).
+- **SSE in a `-mno-sse` kernel**: minimp3 is float code and the x86-64 psABI passes floats in XMM, so `mp3.c` is built with `-msse -msse2` while the rest of the kernel stays integer-only. Every decode runs with interrupts masked and the incoming FPU/SSE state parked via `fxsave64`/`fxrstor64`, so neither a timer-IRQ task switch nor our XMM writes can corrupt another context.
+- **Files-panel MP3 player (FM_AUDIO)**: opening a `.mp3` entry loads the file, opens the AC'97 at the stream's own rate and shows a centered player modal (name, `44.1 kHz / kbps / stereo`, elapsed/total time, progress bar). The desktop loop pumps the decoder into the DMA ring every frame; Space pauses/resumes, any other key or ESC stops and frees the file buffer.
+- **`tools/accept_audio.sh`**: end-to-end acceptance — UEFI boot, `cd /home/user/art`, F12 menu → Files panel → open `103.mp3`, two screendumps that must show the progress bar advancing, and a QEMU `-audiodev wav` capture that must be non-silent 16-bit stereo at the MP3's rate with energy in the tail (i.e. playback never stalls). `AUDIO_BACKEND=none,id=snd0` runs it against the dummy backend for driver-only checks.
+
+### Changed
+- Mono MP3 streams are duplicated in place to the stereo pair the DAC expects (the decoder buffer is exactly one 1152-sample frame, so the expansion fits).
+- Version strings bumped to 2.21.0 (boot banner, `uname`, shell `version`, GUI title bar, `accept_gop.sh` checks).
+
+### File Changes
+- `include/drivers/audio.h`, `src/kernel/drivers/ac97.c`: new AC'97 bus-master driver
+- `include/drivers/mp3.h`, `include/drivers/minimp3.h`, `src/kernel/drivers/mp3.c`: MP3 decoder facade over vendored minimp3
+- `src/kernel/shell/shell.c`: FM_AUDIO player (open/pump/draw/key handling), desktop-loop pump and per-second progress repaint
+- `Makefile`: `ac97.c`/`mp3.c` in `DRIVERS_SRCS`, per-file SSE flags for `mp3.o`
+- `tools/accept_audio.sh`: new acceptance script
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [2.20.0] - 2026-09-13
 This release brings **JPEG viewing to the desktop**: a from-scratch baseline-JPEG decoder inside the kernel plus a new FM_IMAGE viewer mode in the Files panel — and the `user/art` sample directory is now embedded into the kernel image and installed to `/home/user/art` at boot, giving the viewer real pictures to open out of the box.
 
