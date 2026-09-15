@@ -20,8 +20,15 @@
  * record table must hold them ALL or alphabetically-late packages
  * silently vanish - at 4096 entries the table cut off right between
  * libx11-6 (~#4000) and libxcb1, breaking "apt-get install libx11-dev"
- * with "depends on 'libxcb1' which is not in the index". 65536 entries
- * cost ~59 MB of static bss - fine next to a 500 MB heap. */
+ * with "depends on 'libxcb1' which is not in the index".
+ *
+ * The table is ~59 MB, so it is NOT a static array: GRUB has to allocate and
+ * clear every byte of the multiboot2 image's memory image, and a 59 MB .bss
+ * turned a 9 MB kernel into a ~69 MB one - which is what made GRUB's loader
+ * fall over on real hardware ("out of range pointer"). It now comes from
+ * contiguous PMM pages on the first index load (identity-mapped, so the
+ * physical address is the pointer), and it stays out of the 64 MB kernel
+ * heap, which the rest of the system needs. */
 #define KILGET_MAX_PKGS 65536
 
 #define TERM_OUT(s) term_puts(s)
@@ -35,8 +42,25 @@ typedef struct {
     char depends[512];
 } pkg_rec_t;
 
-static pkg_rec_t recs[KILGET_MAX_PKGS];
-static int       nrecs;
+static pkg_rec_t* recs;                  /* KILGET_MAX_PKGS entries, lazy */
+static int        nrecs;
+static int        recs_oom_logged;
+
+static pkg_rec_t* recs_get(void) {
+    if (recs != NULL) return recs;
+    size_t bytes = sizeof(pkg_rec_t) * (size_t)KILGET_MAX_PKGS;
+    size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t phys = pmm_alloc_pages(pages);
+    if (phys == 0) {
+        if (!recs_oom_logged) {
+            recs_oom_logged = 1;
+            TERM_OUT("kilget: no contiguous memory for the index table\n");
+        }
+        return NULL;
+    }
+    recs = (pkg_rec_t*)(uintptr_t)phys;
+    return recs;
+}
 
 /* ---------- fs helpers (local copies; dpkg.c keeps its own) ---------- */
 
@@ -225,6 +249,7 @@ static void index_field(const char* para, size_t plen, const char* key,
  * record table. Shared by the streaming feeder and index_load. */
 static void parse_record(const char* para, size_t plen) {
     if (nrecs >= KILGET_MAX_PKGS) return;
+    if (recs_get() == NULL) return;
     pkg_rec_t* r = &recs[nrecs];
     memset(r, 0, sizeof(*r));
     index_field(para, plen, "Package", r->package, sizeof(r->package));

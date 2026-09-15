@@ -84,6 +84,13 @@ static fake_t codec[] = {
 
 /* config default: 0x14 = line-out(0) assoc 1, 0x15 = hp-out(2) assoc 1 or 2 */
 static int hp_assoc = 1;
+static int no_conn_pins;    /* report both output pins as "no connection" */
+
+/* canned Realtek coefficient space, power-on defaults: index 0 advertises
+ * rev3, index 4 gates EAPD (bit10 set = the chip ignores SET_EAPD verbs,
+ * the silent-green-jack bug on real ALC662 rev3 boards) */
+static uint8_t  cur_coef_idx;
+static uint16_t coef_regs[16] = { [0] = 0x0030, [4] = 0x0400 };
 
 static int conn_list(uint8_t nid, int idx, uint32_t* out) {
     static const uint8_t c14[] = { 0x0c, 0x0d };
@@ -136,6 +143,16 @@ static uint32_t did_find(uint8_t nid, uint16_t verb, uint32_t mask, uint32_t wan
     return 0xdeadbeef;
 }
 
+/* patch a canned parameter response (for the odd-node-count scenarios) */
+static void fake_set(uint8_t nid, uint8_t param, uint32_t value) {
+    for (int i = 0; codec[i].verb != 0; i++) {
+        if (codec[i].nid == nid && codec[i].verb == PARAMETRIC && codec[i].payload == param) {
+            codec[i].resp = value;
+            return;
+        }
+    }
+}
+
 static int hda_cmd(uint32_t cmd, uint32_t* resp) {
     uint8_t  nid   = (uint8_t)((cmd >> 20) & 0x7f);
     uint32_t data  = cmd & 0xfffff;
@@ -159,15 +176,29 @@ static int hda_cmd(uint32_t cmd, uint32_t* resp) {
             did[did_count].payload = payload;
             did_count++;
         }
+        if (verb == 0x07ff) {           /* function reset: coef defaults back */
+            cur_coef_idx = 0;
+            coef_regs[4] = 0x0400;
+        } else if (verb == 0x0500) {    /* set coefficient index */
+            cur_coef_idx = (uint8_t)payload;
+        } else if (verb == 0x0400) {    /* write coefficient */
+            coef_regs[cur_coef_idx & 0xf] = (uint16_t)payload;
+        }
         if (resp) *resp = 0;
+        return 0;
+    }
+
+    if (verb == 0x0c00) {                       /* get processing coefficient */
+        if (resp) *resp = coef_regs[cur_coef_idx & 0xf];
         return 0;
     }
 
     uint32_t out = 0;
     if (verb == 0x0f1c) {                       /* get config default */
-        if (nid == 0x14) out = (0u << 30) | (0u << 20) | (1u << 4);
-        else if (nid == 0x15) out = (0u << 30) | (2u << 20) | ((uint32_t)hp_assoc << 4);
-        else out = (0u << 30) | (0x0au << 20) | (1u << 4);
+        uint32_t conn = no_conn_pins ? (1u << 30) : 0u;
+        if (nid == 0x14) out = conn | (0u << 20) | (1u << 4);
+        else if (nid == 0x15) out = conn | (2u << 20) | ((uint32_t)hp_assoc << 4);
+        else out = conn | (0x0au << 20) | (1u << 4);
         if (resp) *resp = out;
         return 0;
     }
@@ -202,6 +233,7 @@ static void scenario(int hp_assoc_value, int expect_pins, int expect_dacs) {
     did_count = 0;
     out_count = 0;
     dac_count = 0;
+    probe_policy = 2;               /* the strict default the driver starts with */
 
     printf("--- scenario: hp pin assoc %d ---\n", hp_assoc_value);
     fflush(stdout);
@@ -215,6 +247,11 @@ static void scenario(int hp_assoc_value, int expect_pins, int expect_dacs) {
     if (expect_dacs == 2) check(dacs[1] == 0x03, "second stream DAC = 0x03");
     check(strstr(codec_name, "ALC662") != NULL, "codec identified as ALC662");
     check(strstr(codec_name, "rev3") != NULL, "revision decoded (rev3)");
+
+    /* the rev3 EAPD gate: probe must clear coef4 bit10 so SET_EAPD verbs work */
+    check(did_has(0x20, 0x0500), "coef index verb issued to vendor widget");
+    check(did_has(0x20, 0x0400), "rev3 coef4 write issued");
+    check((did_get(0x20, 0x0400) & (1u << 10)) == 0, "coef4 bit10 (EAPD gate) cleared");
 
     check(did_has(0x14, 0x0707), "pin 0x14 enabled as output");
     check(did_has(0x14, 0x070c), "EAPD set on 0x14");
@@ -233,15 +270,51 @@ static void scenario(int hp_assoc_value, int expect_pins, int expect_dacs) {
         amp = did_find(0x03, 0x0300, (1u << 15) | (1u << 7), 1u << 15);
         check(amp != 0xdeadbeef, "DAC 0x03 output amp unmuted");
     } else {
-        check(!did_has(0x15, 0x070c), "pin in another association left alone");
+        /* EAPD reaches every output pin (boards share the jack amp across
+         * ports), but the stream itself stays inside the primary association */
+        check(did_has(0x15, 0x070c), "EAPD still set on the other association's pin");
+        check(!did_has(0x15, 0x0707), "other association's pin not enabled into the stream");
         check(did_find(0x03, 0x0300, (1u << 15), 1u << 15) == 0xdeadbeef,
               "other association's DAC left alone");
     }
 }
 
+/* odd node-count encodings, and pins the BIOS forgot to describe: the probe
+ * must still find the same front jack + DAC */
+static void scenario_odd_ranges(void) {
+    printf("--- scenario: odd node counts and unconfigured pins ---\n");
+
+    /* AFG node count with start/count in the other byte order */
+    fake_set(0x01, 0x04, 0x00040002);
+    did_count = 0; out_count = 0; dac_count = 0; probe_policy = 2;
+    check(hda_probe_codec(0) == 0, "probe succeeds with a swapped node count");
+    check(pin == 0x14 && dac == 0x02, "same primary pin/DAC");
+    fake_set(0x01, 0x04, 0x0002001d);
+
+    /* unusable root node count: the AFG is found by scanning nid 1..15 */
+    fake_set(0x00, 0x04, 0x00000000);
+    did_count = 0; out_count = 0; dac_count = 0; probe_policy = 2;
+    check(hda_probe_codec(0) == 0, "probe succeeds with a broken root node count");
+    check(pin == 0x14 && dac == 0x02, "same primary pin/DAC");
+    fake_set(0x00, 0x04, 0x00010001);
+
+    /* both jacks marked "no connection": strict policy finds nothing, the
+     * relaxed policy used on the retry still opens the front jack */
+    no_conn_pins = 1;
+    did_count = 0; out_count = 0; dac_count = 0;
+    probe_policy = 2;
+    check(hda_probe_codec(0) != 0, "strict policy rejects unconnected pins");
+    probe_policy = 1;
+    check(hda_probe_codec(0) == 0 && pin == 0x14 && out_count == 2,
+          "relaxed policy finds the jacks anyway");
+    no_conn_pins = 0;
+    probe_policy = 2;
+}
+
 int main(void) {
     scenario(1, 2, 2);      /* front + hp in association 1: both play */
     scenario(2, 2, 1);      /* hp moved to association 2: only front plays */
+    scenario_odd_ranges();  /* codec reports its node ranges oddly */
     printf(fails ? "HDA_ALC662_TEST_FAILED (%d)\n" : "HDA_ALC662_TEST_OK\n", fails);
     return fails != 0;
 }

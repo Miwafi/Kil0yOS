@@ -10,6 +10,7 @@
  * ring filled. All ports are polled - no IRQ is used. */
 
 int  audio_init(void);                 /* probe PCI, cold-reset codec; -1 = none */
+const char* audio_last_error(void);    /* why audio_init() failed, for the UI */
 int  audio_open(uint32_t sample_rate); /* set DAC rate, clear ring; 0 ok */
 void audio_close(void);                /* stop DMA, free BDL/buffers */
 

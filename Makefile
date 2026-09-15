@@ -326,10 +326,21 @@ DYN_PROG_BLOB := $(if $(MUSL_GCC),$(BUILDDIR)/user_blob_hello-dyn.o,)
 $(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS)
 	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS) -o $@
 
-$(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin
+# GRUB 完整 Unicode 字体（含制表符字形），用于修复 gfxterm 菜单边框显示成 '?' 的问题。
+# 使用构建机自带的 unicode.pf2；缺失时跳过（菜单退回纯文本，仍可正常引导）。
+GRUB_FONT_SRC := $(firstword $(wildcard /usr/share/grub/unicode.pf2 /boot/grub/unicode.pf2))
+GRUB_FONT_DST := $(if $(GRUB_FONT_SRC),$(BUILDDIR)/iso/boot/grub/fonts/unicode.pf2,)
+
+$(BUILDDIR)/iso/boot/grub/fonts/unicode.pf2: $(GRUB_FONT_SRC)
+	@mkdir -p $(dir $@)
+	cp $(GRUB_FONT_SRC) $@
+
+$(BUILDDIR)/kil0yos.iso: $(BUILDDIR)/kernel.bin $(GRUB_FONT_DST)
 	@mkdir -p $(BUILDDIR)/iso/boot/grub
 	cp $(BUILDDIR)/kernel.bin $(BUILDDIR)/iso/boot/kil0yos.bin
 	cp grub.cfg $(BUILDDIR)/iso/boot/grub/grub.cfg
+	# GRUB 主题壁纸（整屏黑底 + 左下角 Logo，随菜单一起打包进 ISO）
+	cp assets/grub/background.png $(BUILDDIR)/iso/boot/grub/background.png
 	# --mbr-force-bootable: grub-mkrescue's default hybrid MBR carries only
 	# a GPT-protective entry (type 0xEE, no boot flag). Real BIOSes often
 	# refuse to boot such a USB stick ("no bootable device"). xorriso adds

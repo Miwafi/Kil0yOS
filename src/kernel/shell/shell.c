@@ -446,7 +446,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v2.23.0\n");
+    vga_puts("Kil0yOS v3.0.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -823,7 +823,8 @@ static char     fm_audio_title[96];
 static char     fm_audio_info[64];              /* "48 kHz  128 kbps  stereo" */
 static uint64_t fm_audio_frames;                /* stereo frames handed over */
 
-#define FM_PV_ROWS 14
+/* 24 rows: tall enough for the whole hda.log probe dump on one screen */
+#define FM_PV_ROWS 24
 #define FM_PV_COLS 76
 static char fm_pv[FM_PV_ROWS][FM_PV_COLS + 1];
 static int fm_pv_count;
@@ -1177,7 +1178,9 @@ static void fm_audio_show(fs_entry_t* e) {
 
     if (audio_init() != 0) {
         fm_img_fail = 1;
-        strcpy(fm_img_err, "no audio device");
+        /* the front-end keeps a short reason (which controller stage failed) */
+        fm_clipn(fm_img_err, (int)sizeof(fm_img_err) - 1, audio_last_error(),
+                 (int)sizeof(fm_img_err) - 1);
         fm_mode = FM_AUDIO;
         return;
     }
@@ -1553,7 +1556,7 @@ static void fm_image_draw(void) {
 /* FM_AUDIO: centered player window with progress bar */
 static void fm_audio_draw(void) {
     if (fm_img_fail) {
-        int w = 240, h = 64;
+        int w = 328, h = 64;      /* wide enough for the probe-failure reason */
         int x = (dt_w - w) / 2;
         int y = (dt_h - h) / 2;
         dt_fill_rect(x, y, w, h, 0x0F);
@@ -1965,7 +1968,7 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v2.23.0", 0x00);
+    dt_draw_string(4, title_y, "Kil0yOS v3.0.0", 0x00);
     dt_draw_string(dt_w - 84, title_y, "[Win]=Menu", 0x01);
 
     /* left function panel */

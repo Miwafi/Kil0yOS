@@ -9,6 +9,7 @@
 
 int  hda_init(void);                             /* probe PCI, reset, enumerate codec */
 const char* hda_codec_name(void);                /* "Realtek ALC..." or "" if unknown */
+const char* hda_last_error(void);                /* short reason when init failed */
 int  hda_open(uint32_t sample_rate);             /* program converter + stream ring */
 void hda_close(void);                            /* stop the stream, free the ring */
 int  hda_write(const int16_t* pcm, int frames);  /* stereo frames accepted */

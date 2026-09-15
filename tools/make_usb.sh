@@ -47,6 +47,15 @@ mformat -i "$OUT@@$OFFSET" -C -T $PART_SECTORS -v KIL0YOS
 mmd   -i "$OUT@@$OFFSET" ::/boot ::/boot/grub ::/boot/grub/i386-pc
 mcopy -i "$OUT@@$OFFSET" "$KERNEL" ::/boot/kil0yos.bin
 mcopy -i "$OUT@@$OFFSET" "$CFG"    ::/boot/grub/grub.cfg
+mcopy -i "$OUT@@$OFFSET" assets/grub/background.png ::/boot/grub/background.png
+# GRUB 完整 Unicode 字体：修复 gfxterm 菜单边框显示成 '?' 的问题
+for f in /usr/share/grub/unicode.pf2 /boot/grub/unicode.pf2; do
+    if [ -f "$f" ]; then
+        mmd -i "$OUT@@$OFFSET" ::/boot/grub/fonts
+        mcopy -i "$OUT@@$OFFSET" "$f" ::/boot/grub/fonts/unicode.pf2
+        break
+    fi
+done
 mcopy -i "$OUT@@$OFFSET" -s "$GRUBDIR"/*.mod ::/boot/grub/i386-pc/
 
 # --- GRUB core for BIOS: prefix (hd0,msdos1)/boot/grub ---

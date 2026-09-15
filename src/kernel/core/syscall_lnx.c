@@ -1160,7 +1160,7 @@ static uint64_t sc_sendmsg(uint64_t fd, uint64_t umsg, uint64_t flags,
         size_t n = iv[i].len;
         if (n > MSG_KBUF_SZ - total) n = MSG_KBUF_SZ - total;
         if (!process_check_user_range((uint64_t)iv[i].base, n)) return -L_EINVAL;
-        memcpy(kbuf + total, iv[i].base, n);
+        memcpy(kbuf + total, (const void*)(uintptr_t)iv[i].base, n);
         total += n;
     }
     if (total == 0) return 0;
@@ -1233,7 +1233,7 @@ static uint64_t sc_recvmsg(uint64_t fd, uint64_t umsg, uint64_t flags,
         if (n > left) n = left;
         if (n != 0) {
             if (!process_check_user_range((uint64_t)iv[i].base, n)) return -L_EINVAL;
-            memcpy(iv[i].base, kbuf + copied, n);
+            memcpy((void*)(uintptr_t)iv[i].base, kbuf + copied, n);
         }
         copied += n;
         left -= n;
@@ -1414,7 +1414,7 @@ static uint64_t sc_uname(uint64_t buf,
     memset(u, 0, sizeof(*u));
     strcpy(u->v[0], "Kil0yOS");
     strcpy(u->v[1], "kil0yos");
-    strcpy(u->v[2], "2.23.0");
+    strcpy(u->v[2], "3.0.0");
     strcpy(u->v[3], "#1 SMP Kil0yOS Phase 1");
     strcpy(u->v[4], "x86_64");
     strcpy(u->v[5], "");

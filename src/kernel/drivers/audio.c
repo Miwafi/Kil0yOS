@@ -4,29 +4,41 @@
 #include "drivers/audio.h"
 #include "drivers/ac97.h"
 #include "drivers/hda.h"
+#include "lib/string.h"
 
 extern void klog(const char* s);
 
 enum { AUDIO_BACKEND_NONE = 0, AUDIO_BACKEND_HDA, AUDIO_BACKEND_AC97 };
 
 static int backend;
+static char last_err[44] = "no audio controller";
+
+const char* audio_last_error(void) { return last_err; }
 
 int audio_init(void) {
     if (backend != AUDIO_BACKEND_NONE) return 0;   /* already probed */
 
     if (hda_init() == 0) {
         backend = AUDIO_BACKEND_HDA;
+        last_err[0] = '\0';
         klog("[audio] backend: HDA ");
         klog(hda_codec_name());
         klog("\n");
         return 0;
     }
+    /* keep the HDA reason: on an HDA-only board this is the whole story */
+    strncpy(last_err, hda_last_error(), sizeof(last_err) - 1);
+    last_err[sizeof(last_err) - 1] = '\0';
+
     if (ac97_init() == 0) {
         backend = AUDIO_BACKEND_AC97;
+        last_err[0] = '\0';
         klog("[audio] backend: AC97\n");
         return 0;
     }
-    klog("[audio] no supported audio controller\n");
+    klog("[audio] no supported audio controller: ");
+    klog(last_err);
+    klog("\n");
     return -1;
 }
 

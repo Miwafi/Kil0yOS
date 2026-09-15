@@ -1,6 +1,57 @@
 # Changelog
  All notable changes to this project will be documented in this file.
- The format follows Keep a Changelog and this project adheres to Semantic Versioning.
+ This format follows Keep a Changelog and this project adheres to Semantic Versioning.
+
+## [3.0.0] - 2026-09-15
+First release where **onboard analog audio actually plays** on the target ALC662 rev3 board (the HDA driver and ALC662 support landed in 2.22/2.23, but the green rear line-out stayed silent until now).
+
+### Fixed
+- **Silent output on the ALC662 line-out (root cause)**: the codec's line-out pin (0x14) is a "mute-only" output amplifier — it advertises `AMPCAP_MUTE` but **no gain steps** (`AMPCAP_STEPS == 0`), so it powers up **MUTED** after a codec reset. `hda_set_amp` bailed out whenever `AMPCAP_STEPS == 0`, so this amplifier was never written and the DAC's correctly-unmuted signal was killed at the jack. Every other verb read back as correct, which is why the earlier GPIO / selector-index fixes (2.23.2) did not restore sound. The amp is now written whenever the widget reports any amp capability, clearing the mute bit at gain 0. Verified on the real board: MP3 plays, LPIB moves, green rear line-out is audible.
+
+### Added
+- **Pin-amplifier triage + verify diagnostics**: the probe now logs the pin's output-amp capability word (including the `mute` bit) and reads the pin output amp back after setup (`pinamp=`), so a stuck-muted amplifier is visible in `/home/user/hda.log`. The log is also flushed at `hda_open` and after the first DMA check, so the `stream` and `dma check` lines land in the file instead of only the boot tail.
+
+### Changed
+- Version strings bumped to 3.0.0 (boot banner, `uname`, shell `version`, GUI title bar, `accept_gop.sh` checks).
+
+### File Changes
+- `src/kernel/drivers/hda.c`: `hda_set_amp` unmutes mute-only amplifiers; pin-amp triage/verify + log flush
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
+## [2.23.2] - 2026-09-14
+Fixes the silent analog output on the real ALC662 rev3 board (MP3 plays, DMA moves, but the green rear line-out jack stays silent).
+
+### Fixed
+- **GPIO registers wiped by reset and never restored**: the controller link reset and the AFG function-group reset both return the codec's GPIO registers to power-on defaults, and on boards that wire a jack/speaker amplifier (or the analog-supply switch) to a codec GPIO line that leaves the output amplifier unpowered even though every verb reads back correct. The probe now drives every GPIO line the codec advertises high (the usual active-high amp enable) and logs the before/after values, so a board needing the opposite polarity is easy to spot.
+- **GPIO verb ids were swapped**: GET_GPIO_DATA is 0xF17 and GET_GPIO_DIRECTION is 0xF16, but the driver read the MASK (0xF15) as "data" and DATA (0xF17) as "dir" - every gpio triage line reported the wrong registers. SET_MASK/SET_DIR/SET_DATA (0x715/0x716/0x717) were added for the restore above.
+- **Mixer input-amp / selector index used the wrong connection index**: `hda_setup_path` indexed a MIX/SEL node's input amp with the node's own index in its PARENT's connection list instead of the child's index in the mixer's own list. On the ALC662 both happen to be 0, which masked the bug; on codecs whose pins list more than one mixer it would unmute the wrong input. The same fix applies to the selector's connect index kept for `hda_open`.
+
+### Added
+- **Verb read-back verification**: after path setup the probe reads pin control, EAPD, power state, the DAC output amp and the mixer input amp back and logs them (`[hda] verify: pinctl=.. eapd=.. pwr=.. dac .. amp=.. mix ..`), so a write that silently failed shows in the log instead of hiding behind jack silence. The AFG is powered to D0 after the function-group reset.
+- **DMA health check**: ~1/5 s into the first playback `hda_write` logs the stream's LPIB once (`[hda] dma check: lpib=.. (moving/NOT moving)`), separating a controller-side stream that never started from a dead analog path.
+
+### File Changes
+- `src/kernel/drivers/hda.c`: GPIO restore with corrected verbs, child-index mixer/selector setup, AFG power, verify + dma-check logging
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
+## [2.23.1] - 2026-09-13
+Fixes the HDA probe reporting "no audio device" on real boards whose codec is clearly present (reported on an onboard Realtek ALC662 rev3 detected by Arch).
+
+### Fixed
+- **HD Audio registers were accessed through a cacheable mapping**: the kernel identity-maps the first 4 GiB with write-back 2 MiB pages, so every HDA register read went through the cache. A polling loop (RIRBWP after a verb, CIV/LPIB during playback) can then be served from a stale cache line and never see the device move — on the reporter's board the controller answered but every verb looked unanswered ("codec verbs dead") while QEMU, which has no cache, hid it. The BAR is now aliased through a dedicated uncached 4 KiB window (`vmm_map_page` with `VMM_CD`, the same trick `power.c` uses for ACPI tables above 4 GiB). The CORB/RIRB/BDL buffers stay in normal cached RAM, which is what their DMA wants on a coherent x86 system.
+- **Multiple HD Audio controllers**: a board with a discrete GPU exposes a second class-0x0403 controller — the graphics card's HDMI audio. The driver only probed the first match in the PCI list, which is the *last* device scanned and therefore normally the graphics one, then gave up because that codec has no analog output. Every class-0x0403 controller is now tried in turn, preferring one whose codec has an analog output pin (line-out / speaker / headphone); a digital-only (HDMI) codec is used only when nothing else exists.
+- **Link reset**: the reset now watches STATESTS both while CRST is asserted and after it is released, retries once (firmware often leaves the link in an odd state), and no longer aborts when CRST does not read back set — controllers differ there. A short settle delay now precedes the first codec verb.
+- **Node ranges and pin filters are no longer take-it-or-leave-it**: the codec's audio function group is looked up through the reported node count, the same parameter read the other way round, and finally by scanning nid 1..15; the widget range gets the same three attempts; and the output-pin filter runs in three stages (analog + connected → analog → anything, HDMI included) so a board whose BIOS describes its jacks oddly still finds them. On the last stage every rejected pin is logged with its caps, connection-list length and first connections.
+
+### Changed
+- **Probe diagnostics**: each controller logs its address/BAR/PCI command register/GCAP and the reset outcome (`gctl`, `crst`, `statests`), the codec with its output pins; a command timeout logs `CORBRP/CORBWP/RIRBWP/CORBSTS/RIRBCTL/GCTL` plus the command word (and the CORB memory-error flag is cleared at setup). The failure popup now carries the codec id and the stage that failed (`HDA: no codec on link`, `HDA: codec verbs dead`, `HDA: 10ec:0662 no out pin`, `HDA: 10ec:0662 no dac path`, `HDA: BAR above 4 GiB`, …) instead of a flat "no audio device".
+- `tools/hda_host_test.c` gained scenarios for the swapped/broken node counts and for jacks the BIOS marks "no connection".
+
+### File Changes
+- `src/kernel/drivers/hda.c`, `include/drivers/hda.h`: per-controller probe, hardened reset, reason strings
+- `src/kernel/drivers/audio.c`, `include/drivers/audio.h`: `audio_last_error()` for the UI
+- `src/kernel/shell/shell.c`: player popup shows the probe failure reason
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
 
 ## [2.23.0] - 2026-09-13
 This release adds **onboard Realtek ALC662 / ALC662-VD support** on top of the HDA driver: the codec walk now handles the ALC662's topology (three DACs, front mixer plus a second mixer, front line-out and headphone/second-output pins), names the part by model and revision, and treats the board's output jacks of one association as a single output group so front panel and headphone/speaker all play. Since QEMU cannot emulate a Realtek codec, the ALC662 paths are covered by a host-side test against a canned topology and are waiting on real-board confirmation.
