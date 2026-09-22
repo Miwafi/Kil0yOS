@@ -77,10 +77,14 @@ void     vmm_set_root_ptr(uint64_t phys);   /* walk target only, no CR3 */
 void     vmm_switch_cr3(uint64_t phys);     /* pointer + CR3 load */
 
 /* --- Panic / Assert --- */
-void panic(const char* msg, const char* file, int line);
+void panic(const char* msg, const char* file, int line, uint64_t code);
 void panic_assert(const char* cond, const char* file, int line);
+/* Non-zero while a panic is printing/halting (NMI watchdog defers to it). */
+int  panic_in_progress(void);
 
-#define PANIC(msg) panic(msg, __FILE__, __LINE__)
+#define PANIC(msg) panic((msg), __FILE__, __LINE__, 0)
+/* Variant with a machine-readable error code shown on the panic screen. */
+#define PANIC_CODE(msg, code) panic((msg), __FILE__, __LINE__, (uint64_t)(code))
 #define ASSERT(cond) ((cond) ? (void)0 : panic_assert(#cond, __FILE__, __LINE__))
 
 #endif

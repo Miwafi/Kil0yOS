@@ -4,6 +4,7 @@
 #include "drivers/vga.h"
 #include "drivers/fb.h"
 #include "core/interrupts.h"
+#include "core/nmi_wdt.h"
 #include "sched/scheduler.h"
 #include "timer/pit.h"
 #include "core/syscall.h"
@@ -114,6 +115,13 @@ static void utohex(uint64_t v, char* out) {
 }
 
 uint64_t isr_handler(interrupt_frame_t* frame) {
+    /* Vector 2 (NMI) belongs to the watchdog when armed - runs even under
+     * cli, which is its whole point. Not armed: fall through to the
+     * generic exception report (an un-armed NMI really is anomalous). */
+    if (frame->interrupt_number == 2 && nmi_wdt_claim()) {
+        return (uint64_t)frame;
+    }
+
     char buf[24];
     ex_serial_puts("\n[EXCEPTION] ISR #");
     utohex(frame->interrupt_number, buf);

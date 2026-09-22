@@ -7,6 +7,7 @@
 #include "drivers/fb.h"
 #include "drivers/efi_gop.h"
 #include "core/interrupts.h"
+#include "timer/pit.h"
 
 /* ======================================================================== */
 /*  Legacy Heap Allocator (unchanged behaviour)                             */
@@ -937,6 +938,10 @@ void vmm_destroy_address_space(uint64_t root) {
 /*  Panic / Assert                                                          */
 /* ======================================================================== */
 
+/* Set for the duration of a panic; visible to nmi_wdt_claim() so the NMI
+ * watchdog defers to an in-flight panic instead of interrupting it. */
+volatile int panic_flag = 0;
+
 static void panic_serial_puts(const char* s) {
     while (*s) {
         if (*s == '\n') {
@@ -965,52 +970,136 @@ static void panic_itoa(int num, char* buf, int base) {
     buf[j] = '\0';
 }
 
-void panic(const char* msg, const char* file, int line) {
+/* --- Panic screen helpers -------------------------------------------------
+ * The panic screen is mirrored to BOTH text backends: the VGA terminal
+ * (inert no-op under GOP) and the fb console (inactive on BIOS boots).
+ * Every line is centered within each backend's own width, so the layout
+ * holds on both 80x25 text mode and the wide GOP glyph grid. */
+static void panic_puts2(const char* s) {
+    vga_puts(s);
+    fb_puts(s);
+}
+
+static void panic_putc2(char c) {
+    vga_putchar(c);
+    fb_putchar(c);
+}
+
+static void panic_color(uint8_t vga_color) {
+    vga_set_color(vga_entry_color(vga_color, COLOR_BLACK));
+    fb_set_color(vga_color);        /* EGA index numbering is shared */
+}
+
+static void panic_center(const char* s) {
+    int len = 0;
+    while (s[len]) len++;
+
+    int pad = (len < 78) ? (80 - len) / 2 : 0;      /* VGA text: 80 cols */
+    for (int i = 0; i < pad; i++) vga_putchar(' ');
+    vga_puts(s);
+    vga_putchar('\n');
+
+    if (fb_is_active()) {
+        int cols = fb_cols();
+        int fpad = (len < cols - 2) ? (cols - len) / 2 : 0;
+        for (int i = 0; i < fpad; i++) fb_putchar(' ');
+        fb_puts(s);
+        fb_putchar('\n');
+    }
+}
+
+static void panic_hex(char* out, uint64_t v) {
+    static const char hx[] = "0123456789abcdef";
+    out[0] = '0';
+    out[1] = 'x';
+    for (int i = 0; i < 16; i++) out[2 + i] = hx[(v >> (60 - i * 4)) & 0xF];
+    out[18] = '\0';
+}
+
+void panic(const char* msg, const char* file, int line, uint64_t code) {
+    /* Re-entry guard: the NMI watchdog can fire while a panic is already
+     * being printed (NMIs are not maskable, so cli does not stop them).
+     * Never re-print - just join the halt loop. */
+    extern volatile int panic_flag;
+    if (panic_flag) {
+        __asm__ volatile("cli");
+        for (;;) { __asm__ volatile("hlt"); }
+    }
+    panic_flag = 1;
+
     disable_interrupts();
 
     char buf[16];
     panic_itoa(line, buf, 10);
 
-    /* Serial output */
+    char codebuf[24];
+    panic_hex(codebuf, code);
+
+    uint64_t up_s = pit_uptime_us() / 1000000ULL;
+    if (up_s > 999999) up_s = 999999;
+    char upbuf[16];
+    panic_itoa((int)up_s, upbuf, 10);
+
+    /* Serial output (plain, greppable) */
     panic_serial_puts("\n\n*** KERNEL PANIC ***\n");
     panic_serial_puts("Message: ");
     panic_serial_puts(msg);
+    panic_serial_puts("\nError code: ");
+    panic_serial_puts(codebuf);
     panic_serial_puts("\nFile: ");
     panic_serial_puts(file);
     panic_serial_puts("\nLine: ");
     panic_serial_puts(buf);
-    panic_serial_puts("\nSystem halted.\n");
+    panic_serial_puts("\nUptime: ");
+    panic_serial_puts(upbuf);
+    panic_serial_puts(" s\nSystem halted.\n");
 
-    /* VGA output */
-    vga_set_color(vga_entry_color(COLOR_LIGHT_RED, COLOR_BLACK));
-    vga_puts("\n\n*** KERNEL PANIC ***\n");
-    vga_puts("Message: ");
-    vga_puts(msg);
-    vga_puts("\nFile: ");
-    vga_puts(file);
-    vga_puts("\nLine: ");
-    vga_puts(buf);
-    vga_puts("\nSystem halted.\n");
-
-    /* GOP path: vga_* is inert under the desktop - mirror the panic into
-     * the fb console, unmuting it first (a panic outranks the desktop UI;
-     * same philosophy as isr.c's exception dump). */
+    /* Screen output: clear both backends, then a centered layout -
+     * red title, white detail block, grey halt notice. */
+    vga_clear();
     if (fb_is_active()) {
-        fb_console_mute(0);
-        fb_puts("\n\n*** KERNEL PANIC ***\n");
-        fb_puts("Message: ");
-        fb_puts(msg);
-        fb_puts("\nFile: ");
-        fb_puts(file);
-        fb_puts("\nLine: ");
-        fb_puts(buf);
-        fb_puts("\nSystem halted.\n");
+        fb_console_mute(0);      /* a panic outranks the desktop UI */
+        fb_clear();
     }
+
+    panic_color(COLOR_LIGHT_RED);
+    panic_center("");
+    panic_center("K E R N E L   P A N I C");
+    panic_center("");
+    panic_center("--------------------------------------------------------");
+
+    panic_color(COLOR_WHITE);
+    panic_center("");
+    char row[192];
+    strcpy(row, "Message : ");
+    strcat(row, msg);
+    panic_center(row);
+    strcpy(row, "Error   : ");
+    strcat(row, codebuf);
+    panic_center(row);
+    strcpy(row, "Location: ");
+    strcat(row, file);
+    strcat(row, ":");
+    strcat(row, buf);
+    panic_center(row);
+    strcpy(row, "Uptime  : ");
+    strcat(row, upbuf);
+    strcat(row, " s");
+    panic_center(row);
+
+    panic_color(COLOR_GREY);
+    panic_center("");
+    panic_center("The system has been halted.");
 
     __asm__ volatile("cli");
     for (;;) { __asm__ volatile("hlt"); }
 }
 
 void panic_assert(const char* cond, const char* file, int line) {
-    panic(cond, file, line);
+    panic(cond, file, line, 0);
+}
+
+int panic_in_progress(void) {
+    extern volatile int panic_flag;
+    return panic_flag;
 }

@@ -281,9 +281,9 @@ uint64_t kernel_heartbeat_read(void) {
  *  - While a user process runs, kernel main is legitimately parked (wait4,
  *    shell hlt-wait) and stops touching - checks are skipped then
  *    (process_any_active) and monitoring resumes once the process exits.
- *  - A wedge with interrupts disabled stops IRQ0 itself, so nothing (not
- *    even this thread) can run; that hang class would need an NMI
- *    watchdog, out of scope here. */
+ *  - A wedge with interrupts disabled stops IRQ0 itself, so this thread
+ *    can no longer run; that hang class is covered by the NMI watchdog
+ *    (core/nmi_wdt.c - APIC timer NMI delivery is not maskable by cli). */
 static void heartbeat_watchdog_main(void) {
     uint64_t last_seen = kernel_heartbeat;
 

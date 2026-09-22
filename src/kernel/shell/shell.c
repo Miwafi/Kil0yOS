@@ -12,6 +12,7 @@
 #include "sched/scheduler.h"
 #include "core/interrupts.h"
 #include "core/smp.h"
+#include "core/nmi_wdt.h"
 #include "core/process.h"
 #include "drivers/power.h"
 #include "drivers/pci.h"
@@ -67,6 +68,8 @@ static int cmd_tftp(int argc, char** argv);
 static int cmd_dpkg(int argc, char** argv);
 static int cmd_kilget(int argc, char** argv);
 static int cmd_memstat(int argc, char** argv);
+static int cmd_nmi(int argc, char** argv);
+static int cmd_painme(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -94,6 +97,8 @@ static shell_command_t commands[] = {
     {"kilget", "Repo client: kilget update|install|show|list|installed", cmd_kilget},
     {"apt-get", "Alias of kilget (update|install)", cmd_kilget},
     {"memstat", "Show memory usage (PMM/kernel/heap/fb/index)", cmd_memstat},
+    {"nmi", "NMI watchdog status (armed, delivery ticks)", cmd_nmi},
+    {"painme", "Trigger a kernel panic (test)", cmd_painme},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
     {"exec", "Execute a user program", cmd_exec},
@@ -449,7 +454,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.2.0\n");
+    vga_puts("Kil0yOS v3.3.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -2304,7 +2309,7 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v3.2.0", 0x00);
+    dt_draw_string(4, title_y, "Kil0yOS v3.3.0", 0x00);
     dt_draw_string(dt_w - 148, title_y, "[Win]=Menu  F1-F4", 0x01);
 
     /* left function panel */
@@ -3046,6 +3051,40 @@ static int cmd_dpkg(int argc, char** argv) {
     return 1;
 }
 
+/* Watchdog visibility: does the LAPIC timer actually deliver NMIs? Run
+ * twice a few seconds apart - a growing tick count means deliveries are
+ * arriving; armed=0 means init bailed out (see the boot log reason). */
+static int cmd_nmi(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    char b[24];
+    int armed = nmi_wdt_armed();
+    uint32_t ticks = nmi_wdt_tick_count();
+
+    vga_puts("nmi: armed=");
+    vga_puts(armed ? "1" : "0");
+    vga_puts(" ticks=");
+    utoa(ticks, b, 10, sizeof(b));
+    vga_puts(b);
+    vga_puts("\n");
+    klog("nmi: armed=");
+    klog(armed ? "1" : "0");
+    klog(" ticks=");
+    klog(b);
+    klog("\n");
+    return 0;
+}
+
+/* Test entry: invoke panic() directly to exercise the panic path (serial
+ * + VGA + framebuffer dump, halt loop, NMI re-entry guard). */
+static int cmd_painme(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    klog("painme: test panic requested from shell\n");
+    PANIC_CODE("painme: test panic requested from shell", 0x54455354); /* 'TEST' */
+    return 0;   /* unreachable - panic() halts */
+}
+
 /* Memory usage report: PMM pages, kernel image, static reserves, heap
  * arena, framebuffer and the transient kilget index table. All KB
  * figures are 1024-byte units. */
@@ -3157,7 +3196,7 @@ static int execute_command(char* cmd) {
     argv[argc] = NULL;
     
     if (argc == 0) return 0;
-    
+
     for (int i = 0; commands[i].name != NULL; i++) {
         if (strcmp(argv[0], commands[i].name) == 0) {
             return commands[i].func(argc, argv);

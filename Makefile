@@ -19,6 +19,7 @@ CORE_SRCS = $(SRCDIR)/kernel/core/main.c \
             $(SRCDIR)/kernel/core/isr.c \
             $(SRCDIR)/kernel/core/interrupts.c \
             $(SRCDIR)/kernel/core/smp.c \
+            $(SRCDIR)/kernel/core/nmi_wdt.c \
             $(SRCDIR)/kernel/core/tss.c \
             $(SRCDIR)/kernel/core/process.c \
             $(SRCDIR)/kernel/core/uvm.c \

@@ -204,6 +204,19 @@ uint32_t smp_get_cpu_count(void) {
     return ap_ready_count + 1;
 }
 
+/* LAPIC register accessors for other core modules (nmi watchdog). */
+int lapic_available(void) {
+    return lapic_base != NULL;
+}
+
+uint32_t lapic_read_reg(uint32_t reg) {
+    return lapic_read(reg);
+}
+
+void lapic_write_reg(uint32_t reg, uint32_t val) {
+    lapic_write(reg, val);
+}
+
 void smp_update_cpu_usage(void) {
     extern volatile uint64_t cpu_busy_ticks;
     extern volatile uint64_t cpu_idle_ticks;

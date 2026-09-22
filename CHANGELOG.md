@@ -2,6 +2,30 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.3.0] - 2026-09-22
+The NMI watchdog closes the kwatchdog's blind spot: a kernel main task wedged inside a **cli'd loop** freezes IRQ0 (so no thread can run) but cannot stop an **NMI**.
+
+### Added
+- **NMI watchdog (`core/nmi_wdt.c`)**: the local APIC timer is programmed for periodic NMI delivery (LVT timer, delivery mode NMI, ~100 ms, calibrated against the TSC clock over a 50 ms window). Every NMI samples the kernel heartbeat in NMI context — same 10 s / no-user-process policy as the thread watchdog, but it keeps running no matter what IF=0 code is doing. Frozen heartbeat → `panic()` straight from NMI context with count + uptime. APIC is force-enabled (MSR `IA32_APIC_BASE`.AE + spurious-register enable); if no LAPIC is found or the timer does not count, init bails out cleanly and the thread watchdog stays the sole monitor.
+- **`isr_handler` vector-2 claim**: armed NMIs are claimed by the watchdog (LAPIC EOI included — the local APIC needs one even for NMI); an un-armed NMI still falls through to the generic exception report.
+- **Panic re-entry protection**: `panic_flag` + `panic_in_progress()` — the NMI watchdog defers to (EOI + exit) instead of interrupting an in-flight panic, and a second panic joins the halt loop.
+- **Panic screen redesign**: the screen is cleared, then a centered layout is painted — red `K E R N E L   P A N I C` title, white detail block (`Message` / `Error` / `Location file:line` / `Uptime`), grey "The system has been halted." notice. Mirrored to the VGA text terminal and the GOP fb console, each centered at its own width. `panic()` gains an error-code parameter (`PANIC_CODE(msg, code)`; `PANIC` passes 0); the serial report gains `Error code` and `Uptime` lines.
+- **LAPIC accessors** (`smp.h`): `lapic_available/read_reg/write_reg` — the MADT-derived MMIO base is now usable from other core modules on single-CPU boots too.
+- **`nmi` shell command**: prints watchdog armed state and the delivery tick count; run twice a few seconds apart — a growing count proves the LAPIC timer really delivers NMIs on the current machine.
+- **`painme` shell command**: triggers `panic()` directly — exercises the full panic path (serial + VGA + framebuffer dump, halt loop, NMI re-entry guard) on any build, no special flags.
+- **Test tooling**: `tools/test_nmi_probe.py` (NMI delivery probe) and `tools/test_panic_smoke.py` (painme -> KERNEL PANIC on serial).
+
+### File Changes
+- `include/core/nmi_wdt.h`, `src/kernel/core/nmi_wdt.c`: new NMI watchdog module (APIC timer calibration, arming, NMI-context sampling)
+- `include/core/smp.h`, `src/kernel/core/smp.c`: LAPIC register accessors
+- `src/kernel/core/isr.c`: vector-2 claim hook in `isr_handler`
+- `src/kernel/core/main.c`: `nmi_wdt_init()` after the thread watchdog
+- `src/kernel/mm/memory.c`, `include/mm/memory.h`: `panic_flag` / `panic_in_progress()` + centered panic screen, `code` parameter, `PANIC_CODE`
+- `src/kernel/shell/shell.c`: `nmi` and `painme` commands
+- `tools/test_nmi_probe.py`, `tools/test_panic_smoke.py`: watchdog / panic verification tools
+- `Makefile`: new core source file
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [3.2.0] - 2026-09-22
 The kernel's first independent kernel thread: a low-level **heartbeat watchdog** (`kwatchdog`) that samples the kernel heartbeat every 10 seconds and panics when the main task stops responding.
 
