@@ -2,6 +2,7 @@
 #include "shell/terminal.h"
 #include "drivers/vga.h"
 #include "drivers/fb.h"
+#include "drivers/efi_gop.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "lib/string.h"
@@ -65,6 +66,7 @@ static int cmd_exec(int argc, char** argv);
 static int cmd_tftp(int argc, char** argv);
 static int cmd_dpkg(int argc, char** argv);
 static int cmd_kilget(int argc, char** argv);
+static int cmd_memstat(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -91,6 +93,7 @@ static shell_command_t commands[] = {
     {"dpkg", "Package tool: dpkg -i file.deb | -r pkg | -l | -L pkg", cmd_dpkg},
     {"kilget", "Repo client: kilget update|install|show|list|installed", cmd_kilget},
     {"apt-get", "Alias of kilget (update|install)", cmd_kilget},
+    {"memstat", "Show memory usage (PMM/kernel/heap/fb/index)", cmd_memstat},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
     {"exec", "Execute a user program", cmd_exec},
@@ -446,7 +449,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.0.0\n");
+    vga_puts("Kil0yOS v3.1.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -529,6 +532,14 @@ static const char* dt_menu_items[DT_MENU_COUNT] = {
     "Editor", "Files", "System", "CATs"
 };
 static int active_func = FUNC_EDITOR;
+
+/* Fixed function-selector block at the top of the left panel: one row per
+ * function with its F-key hint; panel content starts below it. */
+#define SEL_ROWS   DT_MENU_COUNT
+#define SEL_ROW_H  12
+static int panel_content_top(void) {
+    return lay_header_h + 1 + SEL_ROWS * SEL_ROW_H + 6;
+}
 
 static void dt_fill_rect(int x, int y, int w, int h, uint8_t c) {
     if (dt_use_fb) fb_gfx_fill_rect(x, y, w, h, c);
@@ -749,18 +760,19 @@ static int cmd_gfx(int argc, char** argv) {
 #define GUI_SHELL_BUF_SIZE 64
 static char gui_shell_buf[GUI_SHELL_BUF_SIZE];
 static int gui_shell_len = 0;
-static int gui_shell_x = 0;
-static int gui_shell_y = 0;
 
+/* The prompt lives in the terminal cell grid (term_gui_prompt): it is
+ * painted at the current cell cursor, so typed characters always land
+ * after it and full re-renders keep it visible. */
 static void gui_shell_draw_prompt(void) {
-    dt_draw_string(gui_shell_x, gui_shell_y, "> ", 0x00);
+    term_gui_prompt();
 }
 
 static void gui_shell_init(int prompt_x, int prompt_y) {
+    (void)prompt_x;
+    (void)prompt_y;   /* position comes from the cell cursor (base corner) */
     gui_shell_len = 0;
     gui_shell_buf[0] = '\0';
-    gui_shell_x = prompt_x;
-    gui_shell_y = prompt_y;
     gui_shell_draw_prompt();
 }
 
@@ -774,14 +786,16 @@ static void gui_shell_execute(void) {
     cmd_buf[GUI_SHELL_BUF_SIZE - 1] = '\0';
 
     term_putchar('\n');
+    klog("[dsh] exec: ");         /* TEMP: when did this command run */
+    klog(cmd_buf);
+    klog("\n");
     execute_command(cmd_buf);
     term_putchar('\n');
-    term_gui_render();
+    gui_shell_draw_prompt();      /* "> " into cells at the new cursor */
+    term_gui_render();            /* repaint incl. the prompt cells */
 
     gui_shell_len = 0;
     gui_shell_buf[0] = '\0';
-    gui_shell_y = term_gui_get_cursor_y();
-    gui_shell_draw_prompt();
 }
 
 /* ===== Files panel: graphical file manager =====
@@ -957,11 +971,11 @@ static void fm_size_str(uint32_t sz, char* out) {
 
 static void fm_render(void) {
     int cx = 4;
-    int y = lay_header_h + 3;
-    int content_h = dt_h - lay_header_h - lay_footer_h;
+    int ctop = panel_content_top();
+    int y = ctop + 2;
     int bottom = dt_h - lay_footer_h - 1;
 
-    dt_fill_rect(1, lay_header_h + 1, lay_left_w - 2, content_h - 2, 0x0F);
+    dt_fill_rect(1, ctop, lay_left_w - 2, bottom - ctop, 0x0F);
 
     fm_sclip(cx, y, "Files", 0x09);
     if (fm_dir != NULL) {
@@ -1775,22 +1789,344 @@ static int fm_handle_click(int mx, int my, int cur_x, int cur_y) {
     return 1;
 }
 
+/* ===== Editor panel: desktop file editor over the edit.c core =====
+ * ED_PICK lists the files of the shell's cwd; Enter opens the file in
+ * ED_EDIT (edit_core_* line buffer, rendered into the panel, viewport
+ * scrolls with the cursor). N opens ED_INPUT to type a new file name —
+ * the file itself is only created on the first Ctrl+S save. The desktop
+ * loop stays alive: no blocking keyboard waits here. */
+enum { ED_IDLE = 0, ED_PICK, ED_EDIT, ED_INPUT };
+static int ed_mode = ED_IDLE;
+static fs_entry_t* ed_list[MAX_DIR_ENTRIES];
+static int ed_count = 0;
+static int ed_sel = 0;
+static int ed_scroll = 0;
+static char ed_path[MAX_PATH_LENGTH];   /* file being edited (absolute) */
+static char ed_status[48];              /* save results / errors */
+static char ed_input_buf[40];
+static int  ed_input_len;
+/* picker list geometry captured by ed_pick_draw for mouse hit testing */
+static int ed_list_y0, ed_row_h, ed_vis;
+
+static void draw_func_panel(int func);   /* fwd: editor repaints the panel */
+static void ed_refresh(void);            /* fwd: called by ed_enter_picker */
+static int  ed_view_rows(void);          /* fwd: viewport sizing on entry */
+
+static void ed_enter_picker(void) {
+    ed_mode = ED_PICK;
+    ed_status[0] = '\0';
+    ed_refresh();
+}
+
+static void ed_enter_edit(void) {
+    edit_core_open(ed_path);
+    edit_core_set_viewport(ed_view_rows());
+    ed_status[0] = '\0';
+    ed_mode = ED_EDIT;
+}
+
+/* visible text rows in the editor panel (title/path/status reserved) */
+static int ed_view_rows(void) {
+    int top_y = panel_content_top() + 28;
+    int bottom = dt_h - lay_footer_h - 24;
+    int rows = (bottom - top_y) / 10;
+    return (rows < 1) ? 1 : rows;
+}
+
+static void ed_repaint_panel(int cur_x, int cur_y) {
+    dt_cursor_erase(cur_x, cur_y);
+    draw_func_panel(active_func);
+    dt_cursor_draw(cur_x, cur_y);
+}
+
+static void ed_repaint_all(int cur_x, int cur_y) {
+    dt_cursor_erase(cur_x, cur_y);
+    desktop_repaint();
+    dt_cursor_draw(cur_x, cur_y);
+}
+
+/* Rebuild the picker list from the shell's cwd: files only,
+ * case-insensitive alphabetical. */
+static void ed_refresh(void) {
+    fs_entry_t* dir = fs_current();
+    if (dir == NULL || dir->type != FS_TYPE_DIRECTORY) dir = fs_root();
+
+    int t = 0;
+    for (int i = 0; i < MAX_DIR_ENTRIES && t < MAX_DIR_ENTRIES; i++) {
+        fs_entry_t* e = dir->children[i];
+        if (e != NULL && e->type == FS_TYPE_FILE) ed_list[t++] = e;
+    }
+    for (int i = 1; i < t; i++) {
+        fs_entry_t* key = ed_list[i];
+        int j = i - 1;
+        while (j >= 0 && fm_ci_cmp(ed_list[j]->name, key->name) > 0) {
+            ed_list[j + 1] = ed_list[j];
+            j--;
+        }
+        ed_list[j + 1] = key;
+    }
+    ed_count = t;
+    if (ed_sel >= ed_count) ed_sel = (ed_count > 0) ? ed_count - 1 : 0;
+    if (ed_sel < 0) ed_sel = 0;
+    if (ed_scroll > ed_count - 1) ed_scroll = ed_count - 1;
+    if (ed_scroll < 0) ed_scroll = 0;
+}
+
+static void ed_pick_draw(void) {
+    int cx = 4;
+    int ctop = panel_content_top();
+    int bottom = dt_h - lay_footer_h - 1;
+
+    dt_fill_rect(1, ctop, lay_left_w - 2, bottom - ctop, 0x0F);
+
+    fm_sclip(cx, ctop + 2, "Editor", 0x09);
+
+    char p[MAX_PATH_LENGTH];
+    fm_abs_path(fs_current(), p, (int)sizeof(p));
+    fm_sclip(cx, ctop + 12, p, 0x08);
+    dt_fill_rect(cx, ctop + 23, lay_left_w - 8, 1, 0x07);
+
+    ed_row_h = 12;
+    ed_list_y0 = ctop + 28;
+    int list_h = bottom - 26 - ed_list_y0;
+    ed_vis = (list_h > 0) ? list_h / ed_row_h : 1;
+    if (ed_vis < 1) ed_vis = 1;
+
+    if (ed_scroll > ed_sel) ed_scroll = ed_sel;
+    if (ed_sel >= ed_scroll + ed_vis) ed_scroll = ed_sel - ed_vis + 1;
+
+    if (ed_count == 0) {
+        fm_sclip(cx + 2, ed_list_y0 + 2, "(no files)", 0x08);
+    }
+    for (int r = 0; r < ed_vis; r++) {
+        int idx = ed_scroll + r;
+        if (idx >= ed_count) break;
+        int ry = ed_list_y0 + r * ed_row_h;
+        if (idx == ed_sel) {
+            dt_fill_rect(cx + 1, ry - 1, lay_left_w - 7 - cx, ed_row_h - 1, 0x01);
+        }
+        fm_sclip(cx + 2, ry, ed_list[idx]->name,
+                 (idx == ed_sel) ? 0x0F : 0x00);
+    }
+
+    if (ed_status[0]) fm_sclip(cx, bottom - 22, ed_status, 0x04);
+    fm_sclip(cx, bottom - 12, "Enter:open N:new", 0x08);
+}
+
+static void ed_edit_draw(void) {
+    int cx = 4;
+    int ctop = panel_content_top();
+    int bottom = dt_h - lay_footer_h - 1;
+
+    dt_fill_rect(1, ctop, lay_left_w - 2, bottom - ctop, 0x0F);
+
+    fm_sclip(cx, ctop + 2, "Editor", 0x09);
+    fm_sclip(cx, ctop + 12, ed_path, 0x08);
+    dt_fill_rect(cx, ctop + 23, lay_left_w - 8, 1, 0x07);
+
+    int y0 = ctop + 28;
+    int rows = ed_view_rows();
+    int top = edit_core_top();
+    int count = edit_core_line_count();
+    for (int r = 0; r < rows; r++) {
+        int idx = top + r;
+        if (idx >= count) break;
+        fm_sclip(cx, y0 + r * 10, edit_core_line(idx), 0x00);
+    }
+
+    /* caret bar at the cursor cell (only when the row is on screen) */
+    int cury = edit_core_cur_y();
+    if (cury >= top && cury < top + rows) {
+        int px = cx + edit_core_cur_x() * 8;
+        int py = y0 + (cury - top) * 10;
+        if (px + 2 <= lay_left_w - 4) {
+            dt_fill_rect(px, py, 2, 9, 0x04);
+        }
+    }
+
+    if (ed_status[0]) fm_sclip(cx, bottom - 22, ed_status, 0x04);
+    fm_sclip(cx, bottom - 12, "Ctrl+S:save X:close", 0x08);
+}
+
+/* centered "new file" name input (overlay, drawn after the panel) */
+static void ed_input_draw(void) {
+    int w = dt_w - 40; if (w > 300) w = 300; if (w < 180) w = 180;
+    int h = 64;
+    int x = (dt_w - w) / 2;
+    int y = (dt_h - h) / 2;
+
+    dt_fill_rect(x, y, w, h, 0x0F);
+    dt_draw_rect(x, y, w, h, 0x09);
+    dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
+    dt_draw_string(x + 8, y + 6, "New file", 0x09);
+
+    char line[sizeof(ed_input_buf) + 2];
+    fm_clipn(line, (int)sizeof(line), ed_input_buf, (w - 20) / 8 - 1);
+    strcat(line, "_");
+    dt_draw_string(x + 8, y + 24, line, 0x00);
+    dt_fill_rect(x + 8, y + 34, w - 16, 1, 0x07);
+    dt_draw_string(x + 8, y + 42, "Enter:ok  Esc:cancel", 0x08);
+}
+
+static void ed_open_selected(void) {
+    if (ed_count == 0 || ed_sel < 0 || ed_sel >= ed_count) return;
+    fs_entry_t* e = ed_list[ed_sel];
+    if (e == NULL || e->type != FS_TYPE_FILE) return;
+    fm_abs_path(e, ed_path, (int)sizeof(ed_path));
+    ed_enter_edit();
+}
+
+static void ed_input_confirm(void) {
+    const char* name = ed_input_buf;
+    if (name[0] == '\0' || !strcmp(name, ".") || !strcmp(name, "..") ||
+        strchr(name, '/') != NULL || strchr(name, '\\') != NULL) {
+        strcpy(ed_status, "invalid name");
+        return;                              /* stay in ED_INPUT */
+    }
+
+    char base[MAX_PATH_LENGTH];
+    fm_abs_path(fs_current(), base, (int)sizeof(base));
+    if (strlen(base) > 1) strcat(base, "/");
+    if (strlen(base) + strlen(name) >= sizeof(base)) {
+        strcpy(ed_status, "name too long");
+        return;
+    }
+    strcat(base, name);
+    strcpy(ed_path, base);
+    ed_enter_edit();                         /* created on first save */
+}
+
+/* Returns 1: the editor panel owns the keyboard while not idle */
+static int ed_handle_key(unsigned char c, int cur_x, int cur_y) {
+    if (ed_mode == ED_INPUT) {
+        if (c == '\n') {
+            ed_input_confirm();
+            ed_repaint_all(cur_x, cur_y);
+        } else if (c == KEY_ESC) {
+            ed_mode = ED_PICK;
+            ed_repaint_all(cur_x, cur_y);
+        } else if (c == '\b') {
+            if (ed_input_len > 0) {
+                ed_input_buf[--ed_input_len] = '\0';
+                ed_repaint_all(cur_x, cur_y);
+            }
+        } else if (c >= 32 && c <= 126 &&
+                   ed_input_len < (int)sizeof(ed_input_buf) - 1) {
+            ed_input_buf[ed_input_len++] = (char)c;
+            ed_input_buf[ed_input_len] = '\0';
+            ed_repaint_all(cur_x, cur_y);
+        }
+        return 1;
+    }
+
+    if (ed_mode == ED_EDIT) {
+        if (c == 0x13) {                     /* Ctrl+S */
+            edit_core_save(ed_path);
+            strcpy(ed_status, "saved");
+            klog("[edit] saved ");
+            klog(ed_path);
+            klog("\n");
+            ed_repaint_panel(cur_x, cur_y);
+        } else if (c == 0x18) {              /* Ctrl+X */
+            ed_mode = ED_PICK;
+            ed_refresh();
+            ed_repaint_all(cur_x, cur_y);
+        } else {
+            edit_core_key(c);
+            ed_repaint_panel(cur_x, cur_y);
+        }
+        return 1;
+    }
+
+    /* ED_PICK */
+    switch (c) {
+        case KEY_UP:
+            if (ed_sel > 0) {
+                ed_sel--;
+                ed_repaint_panel(cur_x, cur_y);
+            }
+            return 1;
+        case KEY_DOWN:
+            if (ed_sel < ed_count - 1) {
+                ed_sel++;
+                ed_repaint_panel(cur_x, cur_y);
+            }
+            return 1;
+        case '\n':
+            ed_open_selected();
+            ed_repaint_all(cur_x, cur_y);
+            return 1;
+        case 'n': case 'N':
+            ed_input_len = 0;
+            ed_input_buf[0] = '\0';
+            ed_mode = ED_INPUT;
+            ed_repaint_all(cur_x, cur_y);
+            return 1;
+        case KEY_ESC:
+            ed_mode = ED_IDLE;               /* keyboard back to the shell */
+            ed_repaint_all(cur_x, cur_y);
+            return 1;
+        default:
+            return 1;                        /* picker is modal */
+    }
+}
+
+/* Left click in the picker: select a row; clicking the selected row opens */
+static int ed_handle_click(int mx, int my, int cur_x, int cur_y) {
+    if (ed_mode != ED_PICK) return 1;
+    if (ed_count == 0 || ed_vis <= 0) return 1;
+    if (mx < 1 || mx >= lay_left_w - 1) return 1;
+    if (my < ed_list_y0 || my >= ed_list_y0 + ed_vis * ed_row_h) return 1;
+
+    int idx = ed_scroll + (my - ed_list_y0) / ed_row_h;
+    if (idx >= ed_count) return 1;
+    if (idx == ed_sel) {
+        ed_open_selected();
+        ed_repaint_all(cur_x, cur_y);
+    } else {
+        ed_sel = idx;
+        ed_repaint_panel(cur_x, cur_y);
+    }
+    return 1;
+}
+
+/* Fixed selector block at the top of the left panel: one row per function
+ * with its F-key hint, active row highlighted. Clicking a row switches. */
+static void draw_func_selector(void) {
+    for (int i = 0; i < SEL_ROWS; i++) {
+        int ry = lay_header_h + 3 + i * SEL_ROW_H;
+        int sel = (i == active_func);
+        if (sel) {
+            dt_fill_rect(1, ry - 1, lay_left_w - 2, SEL_ROW_H - 1, 0x01);
+        }
+        dt_draw_string(4, ry, dt_menu_items[i], sel ? 0x0F : 0x00);
+        char fk[3] = { 'F', (char)('1' + i), '\0' };
+        dt_draw_string(lay_left_w - 6 - 16, ry, fk, sel ? 0x0F : 0x08);
+    }
+}
+
 /* Left function panel: target of the Win-key menu. Default = text editor. */
 static void draw_func_panel(int func) {
     int cx = 4;
-    int cy = lay_header_h + 4;
+    int cy = panel_content_top() + 3;
     int content_h = dt_h - lay_header_h - lay_footer_h;
 
     /* clear interior (inside border) */
     dt_fill_rect(1, lay_header_h + 1, lay_left_w - 2, content_h - 2, 0x0F);
 
+    draw_func_selector();
+
     switch (func) {
         case FUNC_EDITOR:
-            dt_draw_string(cx, cy, "Text Editor", 0x09);
-            dt_draw_string(cx, cy + 16, "Default view.", 0x00);
-            dt_draw_string(cx, cy + 30, "Edit a file", 0x00);
-            dt_draw_string(cx, cy + 42, "from shell:", 0x00);
-            dt_draw_string(cx, cy + 58, "edit <file>", 0x01);
+            if (ed_mode == ED_PICK) {
+                ed_pick_draw();
+            } else if (ed_mode == ED_EDIT) {
+                ed_edit_draw();
+            } else {
+                dt_draw_string(cx, cy, "Text Editor", 0x09);
+                dt_draw_string(cx, cy + 16, "F1: file list", 0x00);
+                dt_draw_string(cx, cy + 30, "Keyboard: shell", 0x00);
+            }
             break;
         case FUNC_FILES:
             fm_refresh();
@@ -1968,8 +2304,8 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v3.0.0", 0x00);
-    dt_draw_string(dt_w - 84, title_y, "[Win]=Menu", 0x01);
+    dt_draw_string(4, title_y, "Kil0yOS v3.1.0", 0x00);
+    dt_draw_string(dt_w - 148, title_y, "[Win]=Menu  F1-F4", 0x01);
 
     /* left function panel */
     dt_fill_rect(0, lay_header_h, lay_left_w, content_h, 0x0F);
@@ -1991,6 +2327,12 @@ static void desktop_draw_chrome(void) {
     /* bottom footer bar */
     dt_fill_rect(0, dt_h - lay_footer_h, dt_w, lay_footer_h, 0x0F);
     dt_draw_rect(0, dt_h - lay_footer_h, dt_w, lay_footer_h, 0x03);
+    {
+        char pl[40];
+        strcpy(pl, "Panel: ");
+        strcat(pl, dt_menu_items[active_func]);
+        dt_draw_string(4, dt_h - lay_footer_h + 6, pl, 0x08);
+    }
     gui_draw_datetime(lay_footer_h);
 
     draw_func_panel(active_func);
@@ -1998,13 +2340,32 @@ static void desktop_draw_chrome(void) {
 
 /* Full repaint after the menu popup closes (chrome + panes + prompt + log).
  * An open Files modal popup (input/confirm/preview) is drawn last so it
- * survives the repaint that closes the Win-key menu over it. */
+ * survives the repaint that closes the Win-key menu over it; same for the
+ * editor's centered new-file input. */
 static void desktop_repaint(void) {
     desktop_draw_chrome();
-    term_gui_render();
-    gui_shell_draw_prompt();
+    term_gui_render();   /* paints the prompt too: it lives in the cells */
     klog_view_render();
-    if (active_func == FUNC_FILES) fm_modal_draw();
+    if (active_func == FUNC_FILES) {
+        fm_modal_draw();
+    } else if (active_func == FUNC_EDITOR && ed_mode == ED_INPUT) {
+        ed_input_draw();
+    }
+}
+
+/* Switch the active left-panel function (F-keys, arrows, selector clicks,
+ * Win menu) with a full repaint; the Editor panel re-opens its file picker
+ * on every entry. */
+static void desktop_switch_func(int f, mouse_state_t* prev) {
+    if (f == active_func) return;
+    active_func = f;
+    if (f == FUNC_EDITOR) ed_enter_picker();
+    dt_cursor_erase(prev->x, prev->y);
+    desktop_repaint();
+    dt_cursor_draw(prev->x, prev->y);
+    klog("[desktop] func -> ");
+    klog(dt_menu_items[active_func]);
+    klog("\n");
 }
 
 /* Shared desktop main loop: Win-key menu popup, shell input, kernel-log
@@ -2029,6 +2390,7 @@ static void desktop_run_loop(void) {
         rtc_time_t t;
         if (rtc_read(&t) == 0 && t.second != last_second) {
             last_second = t.second;
+            klog(".");   /* TEMP heartbeat: proves the loop is alive */
 
             /* hide pointer first so repaints are not clobbered by stale restore pixels */
             dt_cursor_erase(prev.x, prev.y);
@@ -2056,9 +2418,12 @@ static void desktop_run_loop(void) {
             dt_cursor_erase(prev.x, prev.y);
             klog_view_render();
             /* the log pane overlaps the centered Files modal (e.g. the
-             * image viewer) - repaint it above the fresh log lines */
+             * image viewer) - repaint it above the fresh log lines; same
+             * for the editor's centered new-file input */
             if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
                 fm_modal_draw();
+            } else if (active_func == FUNC_EDITOR && ed_mode == ED_INPUT) {
+                ed_input_draw();
             }
             dt_cursor_draw(prev.x, prev.y);
         }
@@ -2077,11 +2442,14 @@ static void desktop_run_loop(void) {
                     dt_cursor_erase(prev.x, prev.y);
                     desktop_repaint();
                     dt_cursor_draw(prev.x, prev.y);
+                } else if (active_func == FUNC_EDITOR && ed_mode != ED_IDLE) {
+                    ed_handle_key(KEY_ESC, prev.x, prev.y);
                 } else {
                     break;   /* exit desktop */
                 }
             } else if (c == KEY_WIN) {
-                if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
+                if ((active_func == FUNC_FILES && fm_mode != FM_BROWSE) ||
+                    (active_func == FUNC_EDITOR && ed_mode != ED_IDLE)) {
                     /* modal dialog owns the keyboard: swallow */
                 } else {
                     menu_open = !menu_open;
@@ -2109,16 +2477,38 @@ static void desktop_run_loop(void) {
                     }
                 } else if (c == '\n') {
                     menu_open = 0;
-                    active_func = menu_sel;
-                    dt_cursor_erase(prev.x, prev.y);
-                    desktop_repaint();
-                    dt_cursor_draw(prev.x, prev.y);
-                    klog("[desktop] func -> ");
-                    klog(dt_menu_items[active_func]);
-                    klog("\n");
+                    desktop_switch_func(menu_sel, &prev);
                 }
+            } else if (c >= KEY_F1 && c <= KEY_F4) {
+                /* panel shortcuts, unless a modal editor/viewer owns the
+                 * keyboard; F1 on the idle editor reopens the file list */
+                int f = c - KEY_F1;
+                int files_modal = (active_func == FUNC_FILES &&
+                                   fm_mode != FM_BROWSE);
+                int ed_modal = (active_func == FUNC_EDITOR &&
+                                (ed_mode == ED_EDIT || ed_mode == ED_INPUT));
+                if (f == active_func && f == FUNC_EDITOR && ed_mode == ED_IDLE) {
+                    ed_enter_picker();
+                    dt_cursor_erase(prev.x, prev.y);
+                    draw_func_panel(FUNC_EDITOR);
+                    dt_cursor_draw(prev.x, prev.y);
+                } else if (!files_modal && !ed_modal) {
+                    desktop_switch_func(f, &prev);
+                }
+            } else if ((c == KEY_UP || c == KEY_DOWN) &&
+                       active_func != FUNC_FILES &&
+                       !(active_func == FUNC_EDITOR && ed_mode != ED_IDLE)) {
+                /* arrows cycle the panel selector when the panel itself
+                 * does not consume them (Files uses them for its list) */
+                int d = (c == KEY_DOWN) ? 1 : -1;
+                int f = active_func + d;
+                if (f < 0) f = DT_MENU_COUNT - 1;
+                if (f >= DT_MENU_COUNT) f = 0;
+                desktop_switch_func(f, &prev);
             } else if (active_func == FUNC_FILES) {
                 fm_handle_key(c, prev.x, prev.y);
+            } else if (active_func == FUNC_EDITOR && ed_mode != ED_IDLE) {
+                ed_handle_key(c, prev.x, prev.y);
             } else {
                 /* keyboard focus: right-top shell pane */
                 if (c == '\n') {
@@ -2153,6 +2543,22 @@ static void desktop_run_loop(void) {
         if (left_now && !left_was) {
             if (active_func == FUNC_FILES) {
                 fm_handle_click(state.x, state.y, state.x, state.y);
+            } else if (active_func == FUNC_EDITOR) {
+                ed_handle_click(state.x, state.y, state.x, state.y);
+            }
+            /* selector band at the top of the left panel: click to switch */
+            int files_modal = (active_func == FUNC_FILES &&
+                               fm_mode != FM_BROWSE);
+            int ed_modal = (active_func == FUNC_EDITOR &&
+                            (ed_mode == ED_EDIT || ed_mode == ED_INPUT));
+            if (!files_modal && !ed_modal &&
+                state.x < lay_left_w &&
+                state.y >= lay_header_h + 2 &&
+                state.y < panel_content_top() - 4) {
+                int f = (state.y - (lay_header_h + 3)) / SEL_ROW_H;
+                if (f >= 0 && f < DT_MENU_COUNT) {
+                    desktop_switch_func(f, &state);
+                }
             }
         }
         if (state.buttons != prev.buttons) prev.buttons = state.buttons;
@@ -2277,6 +2683,7 @@ static int cmd_desktop(int argc, char** argv) {
      * console so klog diagnostics go to serial only and never paint over
      * the UI (unmute + full repaint on exit below). */
     fb_console_mute(1);
+
     desktop_run_loop();
     fb_console_mute(0);
 
@@ -2636,6 +3043,69 @@ static int cmd_dpkg(int argc, char** argv) {
     vga_puts(argv[1]);
     vga_puts("\n");
     return 1;
+}
+
+/* Memory usage report: PMM pages, kernel image, static reserves, heap
+ * arena, framebuffer and the transient kilget index table. All KB
+ * figures are 1024-byte units. */
+static int cmd_memstat(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    char b[24];
+
+    vga_puts("=== memstat ===\n");
+
+    uint64_t pmm_total = 0, pmm_used = 0, pmm_free = 0;
+    pmm_get_stats(&pmm_total, &pmm_used, &pmm_free);
+    vga_puts("PMM     : ");
+    utoa((uint32_t)pmm_used, b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" used / ");
+    utoa((uint32_t)pmm_free, b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" free / ");
+    utoa((uint32_t)pmm_total, b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" pages (4 KB)\n");
+
+    extern char kernel_start[];
+    extern char kernel_end[];
+    uint32_t kimg_kb = (uint32_t)((uint64_t)kernel_end - (uint64_t)kernel_start) / 1024;
+    vga_puts("kernel  : ");
+    utoa(kimg_kb, b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" KB image + ");
+    utoa((uint32_t)(PMM_MAX_PAGES / 8) / 1024, b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" KB pmm bitmap\n");
+
+    heap_stats_t hs;
+    heap_get_stats(&hs);
+    vga_puts("heap    : ");
+    utoa((uint32_t)(hs.used_bytes / 1024), b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" KB used / ");
+    utoa((uint32_t)(hs.free_bytes / 1024), b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" KB free (arena ");
+    utoa((uint32_t)(hs.arena / 1024), b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" KB)\n");
+    vga_puts("          ");
+    utoa((uint32_t)hs.free_blocks, b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" free blocks, largest ");
+    utoa((uint32_t)(hs.largest_free / 1024), b, 10, sizeof(b)); vga_puts(b);
+    vga_puts(" KB\n");
+
+    if (fb_base() != 0 && fb_size() != 0) {
+        vga_puts("fb      : ");
+        utoa((uint32_t)(fb_size() / 1024), b, 10, sizeof(b)); vga_puts(b);
+        vga_puts(" KB framebuffer @ ");
+        utoa((uint32_t)(fb_base() >> 4), b, 16, sizeof(b)); vga_puts(b);
+        vga_puts("x\n");
+    }
+
+    size_t idx_bytes = kilget_index_bytes();
+    vga_puts("kilget  : ");
+    if (idx_bytes == 0) {
+        vga_puts("index not loaded\n");
+    } else {
+        utoa((uint32_t)(idx_bytes / 1024), b, 10, sizeof(b)); vga_puts(b);
+        vga_puts(" KB index table (transient)\n");
+    }
+    return 0;
 }
 
 /* Phase 4.4/4.5: kilget repo client (apt-get equivalent) */

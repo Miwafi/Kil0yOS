@@ -2,6 +2,38 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.1.0] - 2026-09-22
+Two fronts: a **desktop modal text editor** (a drawing-free engine shared with the text-mode editor) plus F1-F4 panel shortcuts, and a **memory-footprint pass** that cuts the loaded kernel image by ~22 % and idle heap use from 33 MB to 514 KB.
+
+### Added
+- **Desktop modal editor**: the line buffer, cursor and viewport of `edit.c` are factored into a drawing-free `edit_core_*` engine (`edit_core_open/save/key/set_viewport` + accessors). The Files-panel editor drives it key-by-key and renders it into the panel with its own scrolling viewport; a centered overlay input asks for the name of a new file. Control codes (save/exit) stay the caller's business, so the text-mode `edit` command keeps its original full-screen path.
+- **F1-F4 panel shortcuts**: scancodes 0x3B-0x3E map to `KEY_F1`..`KEY_F4` and switch desktop panels (wrapping); the header hint reads `[Win]=Menu  F1-F4`. Modal editors/viewers keep the keyboard while active, so typing in the editor never jumps panels.
+- **`memstat` shell command**: PMM / kernel image / heap / framebuffer / kilget-index at a glance, backed by new `heap_get_stats()` and a `pmm_get_stats()` that derives the real RAM top from the boot memory map instead of reporting the fixed 4 GiB bitmap span.
+- **`term_gui_prompt()`**: the GUI terminal's `> ` prompt is written into the cell grid, so typed characters never land on top of it and it survives full re-renders.
+
+### Changed (memory footprint)
+- **Embedded ELF blobs are zstd-compressed at build time**: the Makefile stages payloads through `blob_stage/` with `zstd -19` when available, and `process.c` `blob_raw()` detects the zstd frame magic `28 B5 2F FD` and decompresses transiently at install time — no separate format bookkeeping, and art assets (mp3/jpg) stay raw. kernel.bin 9.59 → 7.28 MB, loaded image 10.9 → 8.6 MB.
+- **The 32 MB RAM disk no longer lives on the kernel heap**: `disk.c` allocates it from identity-mapped PMM pages (kmalloc fallback on tiny RAM). It used to pin the heap bump pointer and show up as ~32 MB of permanent "heap used"; idle heap usage drops from 33,282 KB to 514 KB.
+- **Kernel heap arena capped at 32 MB** (was 64 MB); boot-time heap use is now ~514 KB total.
+- **kilget index slimmed to a compact line format** (Package/Version/Filename/SHA256/Size/Depends) — the 59 MB PMM reservation-table scheme is gone. The string pool is pre-sized from the index file length at load (`pool_reserve`, the file is a hard upper bound of the pool contents) and grows in +2 MB steps instead of doubling, so a full index load no longer transiently holds old+new pool copies inside the 32 MB heap arena.
+
+### Fixed
+- keyboard: the temporary IRQ1 remote-debug scancode dump (UEFI LAPIC virtual-wire probe) is removed; F1-F4 handling takes its place.
+
+### File Changes
+- `Makefile`: zstd detection + `BLOB_RULE` staging through `$(BUILDDIR)/blob_stage`
+- `src/kernel/core/process.c`: `blob_raw()` zstd detection/decompress + `install_embedded()` helper
+- `src/kernel/drivers/disk.c`, `include/drivers/disk.h`: PMM-backed RAM disk
+- `src/kernel/mm/memory.c`, `include/mm/memory.h`: 32 MB arena cap, `heap_get_stats()`, real-RAM `pmm_get_stats()`
+- `src/kernel/pkg/kilget.c`, `include/pkg/kilget.h`: compact index format, `pool_reserve()`, +2 MB pool growth, `kilget_index_bytes()`
+- `src/kernel/shell/shell.c`: `cmd_memstat`, desktop modal editor, F1-F4 panel switching
+- `src/kernel/fs/edit.c`, `include/fs/edit.h`: drawing-free `edit_core_*` engine
+- `src/kernel/shell/terminal.c`, `include/shell/terminal.h`: `term_gui_prompt()`
+- `src/kernel/drivers/keyboard.c`, `include/drivers/keyboard.h`: F1-F4 scancodes, debug dump removed
+- `user/art/memory.jpg`: recompressed (419 → 334 KB embedded)
+- `tools/probe_cd_timing.sh`, `tools/repro_cd_core.sh`, `tools/repro_cd_hang.sh`: CD boot probes
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [3.0.0] - 2026-09-15
 First release where **onboard analog audio actually plays** on the target ALC662 rev3 board (the HDA driver and ALC662 support landed in 2.22/2.23, but the green rear line-out stayed silent until now).
 

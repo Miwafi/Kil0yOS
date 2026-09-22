@@ -8,6 +8,7 @@
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "fs/fs.h"
+#include "pkg/zstd.h"
 #include "timer/pit.h"
 #include "drivers/vga.h"
 
@@ -717,6 +718,33 @@ extern const uint8_t user_art_cat_jpg_end[] __attribute__((weak));
 extern const uint8_t user_art_memory_jpg_start[] __attribute__((weak));
 extern const uint8_t user_art_memory_jpg_end[] __attribute__((weak));
 
+/* A blob is embedded either raw or zstd-compressed: the build stages
+ * ELF payloads through zstd when the host has it (Makefile blob_stage);
+ * art assets stay raw since mp3/jpg are already compressed formats.
+ * blob_raw hands back raw bytes - either the embedded image itself, or
+ * a transient kmalloc'd decompression the caller must kfree via
+ * *scratch. Detection is by zstd frame magic, so a payload's storage
+ * format needs no separate bookkeeping. */
+static const uint8_t* blob_raw(const uint8_t* start, const uint8_t* end,
+                               size_t* size, uint8_t** scratch) {
+    *size = (start != NULL && end > start) ? (size_t)(end - start) : 0;
+    *scratch = NULL;
+    if (*size < 4) return start;
+    if (start[0] == 0x28 && start[1] == 0xB5 &&
+        start[2] == 0x2F && start[3] == 0xFD) {
+        uint8_t* out = NULL;
+        size_t out_len = 0;
+        if (zstd_decompress_heap(start, *size, &out, &out_len) != 0 || out == NULL) {
+            klog("[user] blob decompress failed\n");
+            return NULL;
+        }
+        *size = out_len;
+        *scratch = out;
+        return out;
+    }
+    return start;
+}
+
 /* Phase 3: deploy an embedded file under a root directory (created on
  * demand), e.g. ("lib64", "ld-linux-x86-64.so.2", ...). Skipped when the
  * blob is absent (weak symbols) or the file already exists. */
@@ -751,16 +779,22 @@ static void user_install_blob(const char* dir, const char* name,
     fs_set_current(d);
     fs_entry_t* f = fs_create_file(name);
     if (f != NULL) {
-        fs_write_file(f, start, (size_t)(end - start));
-        klog("[user] ");
-        klog(full);
-        klog(" installed");
-        if (note && note[0]) {
-            klog(" (");
-            klog(note);
-            klog(")");
+        size_t size = 0;
+        uint8_t* scratch = NULL;
+        const uint8_t* raw = blob_raw(start, end, &size, &scratch);
+        if (raw != NULL) {
+            fs_write_file(f, raw, size);
+            klog("[user] ");
+            klog(full);
+            klog(" installed");
+            if (note && note[0]) {
+                klog(" (");
+                klog(note);
+                klog(")");
+            }
+            klog("\n");
         }
-        klog("\n");
+        if (scratch != NULL) kfree(scratch);
     }
     fs_set_current(prev);
 }
@@ -770,14 +804,20 @@ static void user_install_blob(const char* dir, const char* name,
  * FAT spilling entries into the data area) right where it happens. */
 static void verify_hello_lnx(void) {
     static uint8_t chk[36864];
-    const uint8_t* blob = user_hello_lnx_start;
-    size_t size = (size_t)(user_hello_lnx_end - user_hello_lnx_start);
-    if (blob == NULL || size == 0 || size > sizeof(chk)) return;
+    size_t size = 0;
+    uint8_t* scratch = NULL;
+    const uint8_t* blob = blob_raw(user_hello_lnx_start, user_hello_lnx_end,
+                                   &size, &scratch);
+    if (blob == NULL || size == 0 || size > sizeof(chk)) {
+        if (scratch != NULL) kfree(scratch);
+        return;
+    }
 
     fs_entry_t* vf = fs_resolve_path("/bin/hello-lnx");
     if (vf == NULL || (size_t)vf->size != size ||
         fs_read_file(vf, chk, size) != (int)size) {
         klog("[chk] hello-lnx readback size failed\n");
+        if (scratch != NULL) kfree(scratch);
         return;
     }
     int bad = -1;
@@ -793,6 +833,34 @@ static void verify_hello_lnx(void) {
         klog_hex(" want=", blob[bad]);
         klog("\n");
     }
+    if (scratch != NULL) kfree(scratch);
+}
+
+/* Install one embedded blob as <name> under the fs cwd (preset by
+ * user_programs_install). Handles zstd-compressed payloads via a
+ * transient decompression buffer; no-op when the target already exists
+ * or the blob is absent (weak symbols). */
+static void install_embedded(const char* path, const char* name,
+                             const uint8_t* start, const uint8_t* end,
+                             const char* note) {
+    if (start == NULL || end == NULL || end <= start) return;
+    if (fs_resolve_path(path) != NULL) return;
+    size_t size = 0;
+    uint8_t* scratch = NULL;
+    const uint8_t* raw = blob_raw(start, end, &size, &scratch);
+    if (raw == NULL) return;
+    fs_entry_t* f = fs_create_file(name);
+    if (f != NULL) {
+        fs_write_file(f, raw, size);
+        if (note && note[0]) {
+            klog("[user] ");
+            klog(path);
+            klog(" installed (");
+            klog(note);
+            klog(")\n");
+        }
+    }
+    if (scratch != NULL) kfree(scratch);
 }
 
 void user_programs_install(void) {
@@ -804,57 +872,21 @@ void user_programs_install(void) {
     fs_entry_t* prev = fs_current();
     fs_set_current(bin);
 
-    if (fs_resolve_path("/bin/hello.bin") == NULL) {
-        fs_entry_t* f = fs_create_file("hello.bin");
-        if (f != NULL) {
-            size_t size = (size_t)(user_hello_end - user_hello_start);
-            fs_write_file(f, user_hello_start, size);
-        }
-    }
-    if (fs_resolve_path("/bin/pong.bin") == NULL) {
-        fs_entry_t* f = fs_create_file("pong.bin");
-        if (f != NULL) {
-            size_t size = (size_t)(user_pong_end - user_pong_start);
-            fs_write_file(f, user_pong_start, size);
-        }
-    }
-    if (&user_hello_lnx_start != NULL &&
-        &user_hello_lnx_end > &user_hello_lnx_start &&
-        fs_resolve_path("/bin/hello-lnx") == NULL) {
-        fs_entry_t* f = fs_create_file("hello-lnx");
-        if (f != NULL) {
-            size_t size = (size_t)(user_hello_lnx_end - user_hello_lnx_start);
-            fs_write_file(f, user_hello_lnx_start, size);
-            klog("[user] /bin/hello-lnx installed (musl static ELF)\n");
-        }
-    }
+    install_embedded("/bin/hello.bin", "hello.bin", user_hello_start,
+                     user_hello_end, NULL);
+    install_embedded("/bin/pong.bin", "pong.bin", user_pong_start,
+                     user_pong_end, NULL);
+    install_embedded("/bin/hello-lnx", "hello-lnx", user_hello_lnx_start,
+                     user_hello_lnx_end, "musl static ELF");
 
-    if (fs_resolve_path("/bin/mini") == NULL) {
-        fs_entry_t* f = fs_create_file("mini");
-        if (f != NULL) {
-            size_t size = (size_t)(user_mini_end - user_mini_start);
-            fs_write_file(f, user_mini_start, size);
-            klog("[user] /bin/mini installed (syscall probe)\n");
-        }
-    }
+    install_embedded("/bin/mini", "mini", user_mini_start,
+                     user_mini_end, "syscall probe");
 
-    if (fs_resolve_path("/bin/mmt") == NULL) {
-        fs_entry_t* f = fs_create_file("mmt");
-        if (f != NULL) {
-            size_t size = (size_t)(user_mmt_end - user_mmt_start);
-            fs_write_file(f, user_mmt_start, size);
-            klog("[user] /bin/mmt installed (brk/mmap/mprotect probe)\n");
-        }
-    }
+    install_embedded("/bin/mmt", "mmt", user_mmt_start,
+                     user_mmt_end, "brk/mmap/mprotect probe");
 
-    if (fs_resolve_path("/bin/nettest") == NULL) {
-        fs_entry_t* f = fs_create_file("nettest");
-        if (f != NULL) {
-            size_t size = (size_t)(user_nettest_end - user_nettest_start);
-            fs_write_file(f, user_nettest_start, size);
-            klog("[user] /bin/nettest installed (TCP probe)\n");
-        }
-    }
+    install_embedded("/bin/nettest", "nettest", user_nettest_start,
+                     user_nettest_end, "TCP probe");
 
     user_install_blob("/bin", "busybox", user_busybox_start, user_busybox_end,
                       "musl static");

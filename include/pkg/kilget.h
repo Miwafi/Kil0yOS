@@ -23,4 +23,9 @@ int  kilget_install(const char* package);
 void kilget_show(const char* package);
 void kilget_list(void);
 
+/* Bytes currently held by the parsed index table (0 = not loaded).
+ * memstat surfaces this; the table is transient and released when the
+ * kilget command that loaded it finishes. */
+size_t kilget_index_bytes(void);
+
 #endif

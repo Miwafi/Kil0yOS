@@ -14,6 +14,10 @@
 #define KEY_LEFT   0x82
 #define KEY_RIGHT  0x83
 #define KEY_WIN    0x84   /* either Windows key (E0 5B / E0 5C) */
+#define KEY_F1     0x85   /* F1-F4: desktop panel shortcuts (0x3B-0x3E) */
+#define KEY_F2     0x86
+#define KEY_F3     0x87
+#define KEY_F4     0x88
 
 void keyboard_init();
 char keyboard_getc();

@@ -10,6 +10,7 @@ static int line_count = 0;
 static int cursor_x = 0;
 static int cursor_y = 0;
 static int screen_top = 0;
+static int viewport_rows = VGA_HEIGHT;  /* scroll window (core engine) */
 static const char* filename = NULL;
 
 static void edit_draw_status_bar() {
@@ -142,7 +143,7 @@ static void edit_move_down() {
         }
     }
     
-    if (cursor_y >= screen_top + VGA_HEIGHT - 1) {
+    if (cursor_y >= screen_top + viewport_rows - 1) {
         screen_top++;
     }
 }
@@ -266,68 +267,82 @@ static void edit_save_file(const char* fname) {
 }
 
 void edit_file(const char* fname) {
+    edit_core_open(fname);
+    edit_core_set_viewport(VGA_HEIGHT);
     filename = fname;
-    
-    cursor_x = 0;
-    cursor_y = 0;
-    screen_top = 0;
-    
-    for (int i = 0; i < EDIT_MAX_LINES; i++) {
-        lines[i][0] = '\0';
-    }
-    
-    edit_load_file(fname);
-    
+
     edit_draw();
-    
+
     while (1) {
         char c = keyboard_getc();
-        
+
         if (c == 0x13) {
             edit_save_file(fname);
             edit_draw();
             continue;
         }
-        
+
         if (c == 0x18) {
             return;
         }
-        
-        if (c == '\n') {
-            edit_new_line();
-            edit_draw();
-            continue;
-        }
-        
-        if (c == '\b') {
-            edit_delete_char();
-            edit_draw();
-            continue;
-        }
-        
-        unsigned char uc = (unsigned char)c;
-        switch (uc) {
-            case 0x80:
-                edit_move_up();
-                edit_draw();
-                continue;
-            case 0x81:
-                edit_move_down();
-                edit_draw();
-                continue;
-            case 0x82:
-                edit_move_left();
-                edit_draw();
-                continue;
-            case 0x83:
-                edit_move_right();
-                edit_draw();
-                continue;
-        }
-        
-        if (c >= 0x20 && c <= 0x7E) {
-            edit_insert_char(c);
-            edit_draw();
-        }
+
+        edit_core_key((unsigned char)c);
+        edit_draw();
+    }
+}
+
+/* ===== Core engine: drawing-free, shared with the desktop modal ===== */
+
+int edit_core_open(const char* fname) {
+    filename = fname;
+
+    cursor_x = 0;
+    cursor_y = 0;
+    screen_top = 0;
+
+    for (int i = 0; i < EDIT_MAX_LINES; i++) {
+        lines[i][0] = '\0';
+    }
+
+    edit_load_file(fname);
+    return 0;
+}
+
+void edit_core_save(const char* fname) {
+    edit_save_file(fname);
+}
+
+void edit_core_set_viewport(int rows) {
+    if (rows > 1) viewport_rows = rows;
+}
+
+int edit_core_line_count(void) {
+    return line_count;
+}
+
+const char* edit_core_line(int idx) {
+    if (idx < 0 || idx >= line_count) return "";
+    return lines[idx];
+}
+
+int edit_core_cur_x(void) { return cursor_x; }
+int edit_core_cur_y(void) { return cursor_y; }
+int edit_core_top(void)   { return screen_top; }
+
+/* One editing key. Printable chars, newline, backspace and the arrow
+ * codes 0x80-0x83; everything else (save/exit control codes) is the
+ * caller's business. */
+void edit_core_key(unsigned char c) {
+    switch (c) {
+        case '\n': edit_new_line();    return;
+        case '\b': edit_delete_char(); return;
+        case 0x80: edit_move_up();     return;
+        case 0x81: edit_move_down();   return;
+        case 0x82: edit_move_left();   return;
+        case 0x83: edit_move_right();  return;
+        default: break;
+    }
+    if (c >= 0x20 && c <= 0x7E) {
+        edit_insert_char(c);
     }
 }

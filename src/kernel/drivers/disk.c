@@ -51,9 +51,14 @@ static uint16_t bm_base = 0; /* Bus Master I/O base */
 static uint8_t* dma_buffer = NULL;
 static uint8_t* prdt_buffer = NULL;
 
-/* RAM disk fallback used when no ATA disk is present (e.g. QEMU without -hda). */
+/* RAM disk fallback used when no ATA disk is present (e.g. QEMU without
+ * -hda). Backed by contiguous identity-mapped PMM pages instead of the
+ * kernel heap: a 32 MB block used to pin the heap bump pointer and show
+ * up as ~32 MB of permanent "heap used" in memstat. Sizing rationale
+ * lives in disk.h (DISK_MAX_SECTORS). */
 static uint8_t* ram_disk = NULL;
 #define RAM_DISK_SECTORS DISK_MAX_SECTORS
+#define RAM_DISK_BYTES   ((size_t)RAM_DISK_SECTORS * DISK_SECTOR_SIZE)
 
 
 typedef struct __attribute__((packed)) {
@@ -199,12 +204,20 @@ static int ata_do_dma(uint32_t sector, uint8_t* buffer, int is_write) {
 
 /* Initialize RAM disk fallback when no real ATA disk is present. */
 static void disk_init_ram_fallback(void) {
-    ram_disk = (uint8_t*)kmalloc((size_t)RAM_DISK_SECTORS * DISK_SECTOR_SIZE);
-    if (ram_disk == NULL) {
-        klog("disk: failed to allocate RAM disk\n");
-        return;
+    size_t pages = (RAM_DISK_BYTES + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t phys = pmm_alloc_pages(pages);
+    if (phys != 0) {
+        ram_disk = (uint8_t*)(uintptr_t)phys;
+    } else {
+        /* tiny-RAM fallback: the heap arena (up to 32 MiB) still spans
+         * one contiguous run this size */
+        ram_disk = (uint8_t*)kmalloc(RAM_DISK_BYTES);
+        if (ram_disk == NULL) {
+            klog("disk: failed to allocate RAM disk\n");
+            return;
+        }
     }
-    memset(ram_disk, 0, (size_t)RAM_DISK_SECTORS * DISK_SECTOR_SIZE);
+    memset(ram_disk, 0, RAM_DISK_BYTES);
     disk_present = 1; /* route read/write through RAM disk */
     klog("disk: no ATA disk found, using RAM disk fallback\n");
 }

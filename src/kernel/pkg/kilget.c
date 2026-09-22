@@ -22,44 +22,140 @@
  * libx11-6 (~#4000) and libxcb1, breaking "apt-get install libx11-dev"
  * with "depends on 'libxcb1' which is not in the index".
  *
- * The table is ~59 MB, so it is NOT a static array: GRUB has to allocate and
- * clear every byte of the multiboot2 image's memory image, and a 59 MB .bss
- * turned a 9 MB kernel into a ~69 MB one - which is what made GRUB's loader
- * fall over on real hardware ("out of range pointer"). It now comes from
- * contiguous PMM pages on the first index load (identity-mapped, so the
- * physical address is the pointer), and it stays out of the 64 MB kernel
- * heap, which the rest of the system needs. */
+ * The table used to be a fixed 59 MB PMM reservation (65536 x 904-byte
+ * fixed-size records, never released once mapped). It is now a compact
+ * growable structure: ~56 B/record plus a shared string pool, heap
+ * backed, and released as soon as the owning kilget command finishes -
+ * the compact on-disk index rebuilds it in well under a second, so
+ * nothing needs to stay pinned between commands. */
 #define KILGET_MAX_PKGS 65536
 
 #define TERM_OUT(s) term_puts(s)
 
+/* Compact in-memory record. The five strings live in an append-only pool
+ * (pool[0] is a NUL sentinel, so offset 0 doubles as the "absent" marker);
+ * SHA256 is the raw 32-byte digest, hexified only for display/verify. */
 typedef struct {
-    char package[64];
-    char version[64];
-    char filename[192];
-    char sha[65];
+    uint32_t name;      /* pool offsets, NUL-terminated strings */
+    uint32_t version;
+    uint32_t filename;
+    uint32_t depends;   /* 0 = no Depends field */
     uint32_t size;
-    char depends[512];
-} pkg_rec_t;
+    uint32_t flags;
+    uint8_t  sha[32];   /* raw digest (valid when PKG_REC_SHA set) */
+} pkg_rec_t;            /* 56 bytes */
 
-static pkg_rec_t* recs;                  /* KILGET_MAX_PKGS entries, lazy */
+#define PKG_REC_SHA 0x1u
+
+static pkg_rec_t* recs;
+static uint32_t   recs_cap;               /* records currently allocated */
 static int        nrecs;
+static char*      pool;
+static size_t     pool_len, pool_cap;
 static int        recs_oom_logged;
 
-static pkg_rec_t* recs_get(void) {
-    if (recs != NULL) return recs;
-    size_t bytes = sizeof(pkg_rec_t) * (size_t)KILGET_MAX_PKGS;
-    size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint64_t phys = pmm_alloc_pages(pages);
-    if (phys == 0) {
-        if (!recs_oom_logged) {
-            recs_oom_logged = 1;
-            TERM_OUT("kilget: no contiguous memory for the index table\n");
-        }
-        return NULL;
+static void recs_oom(void) {
+    if (!recs_oom_logged) {
+        recs_oom_logged = 1;
+        TERM_OUT("kilget: out of memory building the package index\n");
+        klog("[kilget] index table OOM\n");
     }
-    recs = (pkg_rec_t*)(uintptr_t)phys;
-    return recs;
+}
+
+/* Append s to the string pool (stepped growth). Returns the copy's
+ * offset, or 0 on OOM - which the record path treats as fatal because
+ * offset 0 doubles as the "absent" marker. */
+static uint32_t pool_append(const char* s) {
+    size_t slen = strlen(s) + 1;
+    if (pool == NULL) {
+        pool = (char*)kmalloc(1024 * 1024);
+        if (pool == NULL) { recs_oom(); return 0; }
+        pool[0] = '\0';
+        pool_len = 1;
+        pool_cap = 1024 * 1024;
+    }
+    if (pool_len + slen > pool_cap) {
+        /* +2 MB steps instead of doubling: doubling an 8 MB pool
+         * transiently holds 24 MB (old block + new copy), which sits
+         * badly next to the record table inside the 32 MB heap arena. */
+        size_t ncap = pool_cap;
+        do {
+            ncap += 2 * 1024 * 1024;
+        } while (pool_len + slen > ncap);
+        char* np = (char*)krealloc(pool, ncap);
+        if (np == NULL) { recs_oom(); return 0; }
+        pool = np;
+        pool_cap = ncap;
+    }
+    uint32_t off = (uint32_t)pool_len;
+    memcpy(pool + pool_len, s, slen);
+    pool_len += slen;
+    return off;
+}
+
+/* Pre-size the string pool. After fs_read_all the compact index's own
+ * length is a hard upper bound on the pool's final content (every pool
+ * byte comes from the file), so one up-front reserve removes all growth
+ * transients from the load path. Non-fatal on OOM: pool_append's stepped
+ * growth still tries to carry on. */
+static int pool_reserve(size_t want) {
+    if (pool != NULL && pool_cap >= want) return 0;
+    char* np = (pool != NULL) ? (char*)krealloc(pool, want)
+                              : (char*)kmalloc(want);
+    if (np == NULL) return -1;
+    if (pool == NULL) { np[0] = '\0'; pool_len = 1; }
+    pool = np;
+    pool_cap = want;
+    return 0;
+}
+
+static const char* rec_str(uint32_t off) {
+    return (pool != NULL && off != 0) ? pool + off : "";
+}
+
+/* Make room for one more record (doubling). 0 = ok, -1 = OOM or cap hit.
+ * Never shrinks: krealloc copies the OLD block size, so a shrink would
+ * overflow the new buffer. */
+static int recs_reserve(void) {
+    if ((uint32_t)nrecs < recs_cap) return 0;
+    uint32_t ncap = recs_cap ? recs_cap * 2 : 4096;
+    if (ncap > KILGET_MAX_PKGS) ncap = KILGET_MAX_PKGS;
+    if (ncap <= recs_cap) return -1;
+    pkg_rec_t* nr = (pkg_rec_t*)krealloc(recs, sizeof(pkg_rec_t) * (size_t)ncap);
+    if (nr == NULL) return -1;
+    recs = nr;
+    recs_cap = ncap;
+    return 0;
+}
+
+/* Release the parsed index entirely (records + pool). */
+static void index_release(void) {
+    if (recs != NULL) { kfree(recs); recs = NULL; }
+    recs_cap = 0;
+    nrecs = 0;
+    if (pool != NULL) { kfree(pool); pool = NULL; }
+    pool_len = pool_cap = 0;
+}
+
+size_t kilget_index_bytes(void) {
+    return (size_t)nrecs * sizeof(pkg_rec_t) + pool_len;
+}
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Hexify a stored raw digest (show / verify paths). */
+static void sha_to_hex(const uint8_t* d, char* out) {
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[2 * i]     = hexd[d[i] >> 4];
+        out[2 * i + 1] = hexd[d[i] & 0xF];
+    }
+    out[64] = '\0';
 }
 
 /* ---------- fs helpers (local copies; dpkg.c keeps its own) ---------- */
@@ -249,18 +345,44 @@ static void index_field(const char* para, size_t plen, const char* key,
  * record table. Shared by the streaming feeder and index_load. */
 static void parse_record(const char* para, size_t plen) {
     if (nrecs >= KILGET_MAX_PKGS) return;
-    if (recs_get() == NULL) return;
-    pkg_rec_t* r = &recs[nrecs];
-    memset(r, 0, sizeof(*r));
-    index_field(para, plen, "Package", r->package, sizeof(r->package));
-    index_field(para, plen, "Version", r->version, sizeof(r->version));
-    index_field(para, plen, "Filename", r->filename, sizeof(r->filename));
-    index_field(para, plen, "SHA256", r->sha, sizeof(r->sha));
-    index_field(para, plen, "Depends", r->depends, sizeof(r->depends));
+    char package[64], version[64], filename[192], sha_hex[65], depends[512];
+    index_field(para, plen, "Package", package, sizeof(package));
+    index_field(para, plen, "Version", version, sizeof(version));
+    index_field(para, plen, "Filename", filename, sizeof(filename));
+    index_field(para, plen, "SHA256", sha_hex, sizeof(sha_hex));
+    index_field(para, plen, "Depends", depends, sizeof(depends));
     char sizebuf[16];
     index_field(para, plen, "Size", sizebuf, sizeof(sizebuf));
-    r->size = (uint32_t)strtoul(sizebuf, NULL, 10);
-    if (r->package[0] && r->filename[0]) nrecs++;
+    if (package[0] == '\0' || filename[0] == '\0') return;
+
+    if (recs_reserve() != 0) { recs_oom(); return; }
+    uint32_t name_off = pool_append(package);
+    uint32_t ver_off  = pool_append(version);
+    uint32_t file_off = pool_append(filename);
+    uint32_t dep_off  = depends[0] ? pool_append(depends) : 0;
+    if (name_off == 0 || file_off == 0 || (depends[0] && dep_off == 0)) {
+        recs_oom();
+        return;
+    }
+
+    pkg_rec_t* r = &recs[nrecs];
+    memset(r, 0, sizeof(*r));
+    r->name     = name_off;
+    r->version  = ver_off;
+    r->filename = file_off;
+    r->depends  = dep_off;
+    r->size     = (uint32_t)strtoul(sizebuf, NULL, 10);
+    if (sha_hex[0] && strlen(sha_hex) == 64) {
+        int ok = 1;
+        for (int i = 0; i < 32; i++) {
+            int hi = hexval(sha_hex[2 * i]);
+            int lo = hexval(sha_hex[2 * i + 1]);
+            if (hi < 0 || lo < 0) { ok = 0; break; }
+            r->sha[i] = (uint8_t)((hi << 4) | lo);
+        }
+        if (ok) r->flags |= PKG_REC_SHA;
+    }
+    nrecs++;
 }
 
 /* Streaming feeder: assembles paragraphs from inflate chunks. Real
@@ -325,13 +447,17 @@ static void index_feed_finish(index_feed_t* f) {
 
 /* Reload /var/lib/kilget/Packages into the record array. */
 static int index_load(void) {
-    nrecs = 0;
+    index_release();   /* never shrink via krealloc: rebuild from empty */
     uint8_t* buf;
     size_t len;
     if (fs_read_all(KILGET_INDEX, &buf, &len) != 0 || buf == NULL) {
         TERM_OUT("kilget: no package index - run 'kilget update'\n");
         return -1;
     }
+
+    /* Pre-size the pool from the file length (upper bound) so the parse
+     * loop below never triggers a growth copy. */
+    pool_reserve(len + 1024);
 
     char* p = (char*)buf;
     char* end = (char*)buf + len;
@@ -346,6 +472,7 @@ static int index_load(void) {
     }
     kfree(buf);
     if (nrecs == 0) {
+        index_release();
         TERM_OUT("kilget: package index is empty\n");
         return -1;
     }
@@ -354,7 +481,7 @@ static int index_load(void) {
 
 static int index_find(const char* package) {
     for (int i = 0; i < nrecs; i++)
-        if (strcmp(recs[i].package, package) == 0) return i;
+        if (strcmp(rec_str(recs[i].name), package) == 0) return i;
     return -1;
 }
 
@@ -407,14 +534,14 @@ static void plan_visit(plan_t* plan, int idx, int depth) {
     plan->cycle[idx] = 1;
 
     char names[16][64];
-    int nn = plan_dep_names(recs[idx].depends, names, 16);
+    int nn = plan_dep_names(rec_str(recs[idx].depends), names, 16);
     for (int i = 0; i < nn; i++) {
         const char* tok = names[i];
         if (dpkg_is_installed(tok)) continue;
         int di = index_find(tok);
         if (di < 0) {
             TERM_OUT("kilget: ");
-            TERM_OUT(recs[idx].package);
+            TERM_OUT(rec_str(recs[idx].name));
             TERM_OUT(" depends on '");
             TERM_OUT(tok);
             TERM_OUT("' which is not in the index\n");
@@ -431,10 +558,8 @@ static void plan_visit(plan_t* plan, int idx, int depth) {
 /* ---------- download + verify ---------- */
 
 static int fetch_and_install(const repo_src_t* src, int idx) {
-    pkg_rec_t* r = &recs[idx];
-
     /* Filename is relative to the repo base; normalize "./a/b" -> "/a/b" */
-    const char* fname = r->filename;
+    const char* fname = rec_str(recs[idx].filename);
     if (fname[0] == '.' && fname[1] == '/') fname += 2;
 
     char path[256];
@@ -482,12 +607,13 @@ static int fetch_and_install(const repo_src_t* src, int idx) {
     }
 
     /* checksum + size verification against the index */
-    if (r->sha[0]) {
+    if (recs[idx].flags & PKG_REC_SHA) {
         uint8_t digest[32];
-        char hex[65];
+        char hex[65], want[65];
         sha256(body, blen, digest);
         sha256_hex(digest, hex);
-        if (strcmp(hex, r->sha) != 0) {
+        sha_to_hex(recs[idx].sha, want);
+        if (strcmp(hex, want) != 0) {
             TERM_OUT("kilget: SHA256 mismatch for ");
             TERM_OUT(fname);
             TERM_OUT("\n");
@@ -498,9 +624,9 @@ static int fetch_and_install(const repo_src_t* src, int idx) {
             return -1;
         }
     }
-    if (r->size && blen != r->size) {
+    if (recs[idx].size && blen != recs[idx].size) {
         char want[16], got[16];
-        utoa(r->size, want, 10, sizeof(want));
+        utoa(recs[idx].size, want, 10, sizeof(want));
         utoa((uint32_t)blen, got, 10, sizeof(got));
         TERM_OUT("kilget: size mismatch for ");
         TERM_OUT(fname);
@@ -522,7 +648,7 @@ static int fetch_and_install(const repo_src_t* src, int idx) {
 
     if (dpkg_install_file(cache) != 0) {
         klog("[kilget] dpkg install failed: ");
-        klog(r->package);
+        klog(rec_str(recs[idx].name));
         klog("\n");
         return -1;
     }
@@ -530,7 +656,7 @@ static int fetch_and_install(const repo_src_t* src, int idx) {
      * the archive and its extracted payload (libc6 alone is ~2.7 + 3.2 MB). */
     fs_delete_entry(cache);
     klog("[kilget] installed ");
-    klog(r->package);
+    klog(rec_str(recs[idx].name));
     klog("\n");
     return 0;
 }
@@ -540,28 +666,42 @@ static int fetch_and_install(const repo_src_t* src, int idx) {
 /* Persist the parsed record table as a compact Packages-format index.
  * The raw dists index is far too large for the FAT ramdisk (jammy main
  * is ~48 MB plain), but we only ever need the extracted fields, and the
- * regenerated text (~0.9 MB) parses back through index_load unchanged. */
+ * regenerated text parses back through index_load unchanged. The buffer
+ * is sized exactly in a first pass - the old 768 B/record estimate made
+ * this a ~39 MB allocation for a 53 K-package index. */
 static int index_store_compact(void) {
-    size_t cap = 768 * (size_t)nrecs + 64;
+    size_t cap = 64;
+    for (int i = 0; i < nrecs; i++) {
+        pkg_rec_t* r = &recs[i];
+        cap += 9  + 1 + strlen(rec_str(r->name));      /* "Package: X\n" */
+        cap += 10 + 1 + strlen(rec_str(r->version));   /* "Version: X\n" */
+        cap += 11 + 1 + strlen(rec_str(r->filename));  /* "Filename: X\n" */
+        cap += 17;                                     /* "Size: <10 digits>\n" */
+        if (r->flags & PKG_REC_SHA) cap += 8 + 64 + 1; /* "SHA256: <64>\n" */
+        if (r->depends) cap += 10 + 1 + strlen(rec_str(r->depends));
+        cap += 1;                                      /* blank separator */
+    }
     char* buf = (char*)kmalloc(cap);
     if (buf == NULL) {
         klog("[kilget] compact index alloc failed\n");
         return -1;
     }
     size_t off = 0;
-    char tmp[768];
+    char tmp[1024];
     for (int i = 0; i < nrecs; i++) {
         pkg_rec_t* r = &recs[i];
         ksprintf(tmp, sizeof(tmp),
                  "Package: %s\nVersion: %s\nFilename: %s\nSize: %u\n",
-                 r->package, r->version, r->filename, r->size);
+                 rec_str(r->name), rec_str(r->version), rec_str(r->filename), r->size);
         size_t tlen = strlen(tmp);
-        if (r->sha[0]) {
-            ksprintf(tmp + tlen, sizeof(tmp) - tlen, "SHA256: %s\n", r->sha);
+        if (r->flags & PKG_REC_SHA) {
+            char hex[65];
+            sha_to_hex(r->sha, hex);
+            ksprintf(tmp + tlen, sizeof(tmp) - tlen, "SHA256: %s\n", hex);
             tlen += strlen(tmp + tlen);
         }
-        if (r->depends[0]) {
-            ksprintf(tmp + tlen, sizeof(tmp) - tlen, "Depends: %s\n", r->depends);
+        if (r->depends) {
+            ksprintf(tmp + tlen, sizeof(tmp) - tlen, "Depends: %s\n", rec_str(r->depends));
             tlen += strlen(tmp + tlen);
         }
         ksprintf(tmp + tlen, sizeof(tmp) - tlen, "\n");
@@ -643,12 +783,13 @@ int kilget_update(void) {
         /* dists layout: stream-parse dists/<suite>/<comp>/binary-amd64/
          * Packages.gz for every component into the record table, then
          * persist a compact regenerated index */
-        nrecs = 0;
+        index_release();
         int ok = 0;
         for (int c = 0; c < src.ncomps; c++)
             if (fetch_component_index(&src, src.comps[c]) == 0)
                 ok++;
         if (ok == 0 || nrecs == 0) {
+            index_release();
             TERM_OUT("kilget: update failed - no component index available\n");
             klog("[kilget] index download failed (dists)\n");
             return -1;
@@ -669,6 +810,7 @@ int kilget_update(void) {
         TERM_OUT(" components)\n");
 
         if (index_store_compact() != 0) {
+            index_release();
             TERM_OUT("kilget: failed to store index\n");
             return -1;
         }
@@ -684,6 +826,7 @@ int kilget_update(void) {
         klog(" packages, dists ");
         klog(src.suite);
         klog(")\n");
+        index_release();
         return 0;
     }
 
@@ -717,6 +860,7 @@ int kilget_update(void) {
         if (gzip_inflate_cb(body, blen, index_feed, &f, &isz) != 0) {
             kfree(body);
             index_feed_finish(&f);
+            index_release();
             TERM_OUT("kilget: gunzip failed\n");
             return -1;
         }
@@ -726,6 +870,7 @@ int kilget_update(void) {
     index_feed_finish(&f);
     kfree(body);
     if (nrecs == 0 || index_store_compact() != 0) {
+        index_release();
         TERM_OUT("kilget: failed to store index\n");
         return -1;
     }
@@ -735,6 +880,7 @@ int kilget_update(void) {
     itoa(nrecs, nb, 10, sizeof(nb));
     klog(nb);
     klog(" packages)\n");
+    index_release();
     return 0;
 }
 
@@ -744,6 +890,7 @@ int kilget_install(const char* package) {
         TERM_OUT("kilget: ");
         TERM_OUT(package);
         TERM_OUT(" is already installed\n");
+        index_release();
         return 0;
     }
     int idx = index_find(package);
@@ -751,44 +898,62 @@ int kilget_install(const char* package) {
         TERM_OUT("kilget: package '");
         TERM_OUT(package);
         TERM_OUT("' not found in the index\n");
+        index_release();
         return -1;
     }
 
-    /* plan_t with KILGET_MAX_PKGS=65536 is ~320 KB - far beyond the
-     * 16 KB kernel stack, so it lives in static storage (shell context
-     * only). */
-    static plan_t plan;
-    memset(&plan, 0, sizeof(plan));
-    plan_visit(&plan, idx, 0);
-    if (plan.failed || plan.norder == 0) {
+    /* plan_t is ~320 KB for KILGET_MAX_PKGS=65536 - far beyond the 16 KB
+     * kernel stack and too big to keep as a permanent .bss resident, so
+     * it is heap-allocated here and freed together with the index. */
+    plan_t* plan = (plan_t*)kmalloc(sizeof(plan_t));
+    if (plan == NULL) {
+        TERM_OUT("kilget: out of memory for the install plan\n");
+        index_release();
+        return -1;
+    }
+    memset(plan, 0, sizeof(plan_t));
+    plan_visit(plan, idx, 0);
+    if (plan->failed || plan->norder == 0) {
+        kfree(plan);
         TERM_OUT("kilget: unable to resolve dependencies\n");
+        index_release();
         return -1;
     }
 
     repo_src_t src;
-    if (parse_sources(&src) != 0) return -1;
+    if (parse_sources(&src) != 0) {
+        kfree(plan);
+        index_release();
+        return -1;
+    }
 
     /* Transaction mode: the planner may not be able to satisfy every
      * Depends before its member installs (real cycles like
      * libc6 <-> libgcc-s1), so missing deps only warn inside the
      * transaction. The final state after the loop is consistent. */
     dpkg_set_force_deps(1);
-    for (int i = 0; i < plan.norder; i++) {
-        int ri = plan.order[i];
-        if (dpkg_is_installed(recs[ri].package)) continue;
+    int rc = 0;
+    for (int i = 0; i < plan->norder; i++) {
+        int ri = plan->order[i];
+        if (dpkg_is_installed(rec_str(recs[ri].name))) continue;
         if (fetch_and_install(&src, ri) != 0) {
             dpkg_set_force_deps(0);
             TERM_OUT("kilget: install aborted at ");
-            TERM_OUT(recs[ri].package);
+            TERM_OUT(rec_str(recs[ri].name));
             TERM_OUT("\n");
-            return -1;
+            rc = -1;
+            break;
         }
     }
     dpkg_set_force_deps(0);
-    klog("[kilget] install complete: ");
-    klog(package);
-    klog("\n");
-    return 0;
+    kfree(plan);
+    if (rc == 0) {
+        klog("[kilget] install complete: ");
+        klog(package);
+        klog("\n");
+    }
+    index_release();
+    return rc;
 }
 
 void kilget_show(const char* package) {
@@ -798,25 +963,34 @@ void kilget_show(const char* package) {
         TERM_OUT("kilget: package '");
         TERM_OUT(package);
         TERM_OUT("' not found\n");
+        index_release();
         return;
     }
     pkg_rec_t* r = &recs[idx];
-    TERM_OUT("Package: ");   TERM_OUT(r->package);   TERM_OUT("\n");
-    TERM_OUT("Version: ");   TERM_OUT(r->version);   TERM_OUT("\n");
-    TERM_OUT("Filename: ");  TERM_OUT(r->filename);  TERM_OUT("\n");
-    TERM_OUT("SHA256: ");    TERM_OUT(r->sha);       TERM_OUT("\n");
+    TERM_OUT("Package: ");   TERM_OUT(rec_str(r->name));     TERM_OUT("\n");
+    TERM_OUT("Version: ");   TERM_OUT(rec_str(r->version));  TERM_OUT("\n");
+    TERM_OUT("Filename: ");  TERM_OUT(rec_str(r->filename)); TERM_OUT("\n");
+    if (r->flags & PKG_REC_SHA) {
+        char hex[65];
+        sha_to_hex(r->sha, hex);
+        TERM_OUT("SHA256: ");    TERM_OUT(hex);          TERM_OUT("\n");
+    }
     char sb[16];
     utoa(r->size, sb, 10, sizeof(sb));
     TERM_OUT("Size: ");      TERM_OUT(sb);           TERM_OUT("\n");
-    TERM_OUT("Depends: ");   TERM_OUT(r->depends);   TERM_OUT("\n");
+    if (r->depends) {
+        TERM_OUT("Depends: ");   TERM_OUT(rec_str(r->depends)); TERM_OUT("\n");
+    }
+    index_release();
 }
 
 void kilget_list(void) {
     if (index_load() != 0) return;
     for (int i = 0; i < nrecs; i++) {
-        TERM_OUT(recs[i].package);
+        TERM_OUT(rec_str(recs[i].name));
         TERM_OUT("  ");
-        TERM_OUT(recs[i].version);
-        TERM_OUT(dpkg_is_installed(recs[i].package) ? "  [installed]\n" : "\n");
+        TERM_OUT(rec_str(recs[i].version));
+        TERM_OUT(dpkg_is_installed(rec_str(recs[i].name)) ? "  [installed]\n" : "\n");
     }
+    index_release();
 }

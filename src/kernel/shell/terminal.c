@@ -341,3 +341,21 @@ void term_gui_backspace(void) {
                       p->base_y + p->cursor_y * 8, 8, 8, 0x0F);
     }
 }
+
+/* Shell prompt goes INTO the cell grid: cells advance past "> " so the
+ * next typed char lands after it (never on top of it), and the prompt
+ * survives term_gui_render() because it lives in the cells. */
+void term_gui_prompt(void) {
+    if (g_current_term != &g_gui_term) return;
+    gui_term_priv_t* p = &g_gui_priv;
+
+    gui_putchar(&g_gui_term, '>');
+    gui_putchar(&g_gui_term, ' ');
+
+    /* paint the '>' just written (two cells back); the ' ' cell keeps the
+     * white background, no glyph needed */
+    int px = p->base_x + (p->cursor_x - 2) * 8;
+    int py = p->base_y + p->cursor_y * 8;
+    if (p->use_fb) fb_gfx_draw_char(px, py, '>', p->color);
+    else           vga_draw_char(px, py, '>', p->color);
+}

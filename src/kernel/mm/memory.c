@@ -36,6 +36,25 @@ size_t heap_free_bytes(void) {
     return total;
 }
 
+/* Full heap snapshot for the memstat shell command: arena size, used/free
+ * bytes, free-block count and the largest free block (fragmentation
+ * indicator: used - free tells how much live data the arena carries). */
+void heap_get_stats(heap_stats_t* out) {
+    if (out == NULL) return;
+    out->arena        = (size_t)(heap_end - heap_start);
+    out->free_bytes   = 0;
+    out->free_blocks  = 0;
+    out->largest_free = 0;
+    for (heap_block_t* it = heap_list; it != NULL; it = it->next) {
+        if (it->free) {
+            out->free_bytes += it->size;
+            out->free_blocks++;
+            if (it->size > out->largest_free) out->largest_free = it->size;
+        }
+    }
+    out->used_bytes = out->arena - out->free_bytes;
+}
+
 /* Public heap integrity check. Walks the block list verifying range,
  * monotonic order, header magic AND physical adjacency
  * (next must equal cur + sizeof(header) + size). Returns 0 if clean,
@@ -134,7 +153,10 @@ static void pmm_mark_region(uint64_t base, uint64_t length, int used);
 void memory_init(memory_map_t* map, size_t count) {
     /* The kernel heap must NOT swallow all of RAM: the PMM still needs
      * free pages for user processes, page tables, DMA buffers, etc.
-     * Cap the arena at 64 MiB - with RAM == 256 MiB the old [2 MiB,
+     * Cap the arena at 32 MiB: its historic 32 MB occupant (the RAM
+     * disk) now comes from contiguous PMM pages, so the arena only
+     * carries fs/ext2 caches, http bodies and the transient kilget
+     * index (~22 MB peak). With RAM == 256 MiB the old [2 MiB,
      * 256 MiB) arena left the PMM with zero free pages and exec died
      * with "PMM out of pages". USER_CODE_BASE (256 MB) stays well above
      * the capped arena in every configuration. */
@@ -147,7 +169,7 @@ void memory_init(memory_map_t* map, size_t count) {
     if (heap_base < 0x200000) heap_base = 0x200000;
 
     uint8_t* default_start = (uint8_t*)heap_base;
-    uint8_t* default_end   = (uint8_t*)(heap_base + 0x4000000); /* + 64 MiB */
+    uint8_t* default_end   = (uint8_t*)(heap_base + 0x2000000); /* + 32 MiB */
 
     if (map != NULL && count > 0) {
         uint64_t largest_size = 0;
@@ -168,7 +190,7 @@ void memory_init(memory_map_t* map, size_t count) {
 
         if (largest_size > 0x100000) {
             heap_start = largest_start;
-            heap_end   = largest_start + (largest_size > 0x4000000 ? 0x4000000 : largest_size);
+            heap_end   = largest_start + (largest_size > 0x2000000 ? 0x2000000 : largest_size);
         } else {
             heap_start = default_start;
             heap_end   = default_end;
@@ -354,6 +376,12 @@ void* krealloc(void* ptr, size_t size) {
 static uint8_t pmm_bitmap[PMM_MAX_PAGES / 8];
 static uint64_t pmm_last_page = 0;
 
+/* Highest usable-RAM byte reported by the boot memory map (multiboot2
+ * type-1 or EFI type-7 entries). pmm_get_stats reports total pages from
+ * this instead of the fixed 4 GB bitmap span, so memstat shows the real
+ * RAM size (a -m 512M VM used to claim 1048576 total pages). */
+static uint64_t pmm_ram_top = 0;
+
 static inline void bitmap_set(uint64_t page) {
     if (page < PMM_MAX_PAGES)
         pmm_bitmap[page / 8] |= (1 << (page % 8));
@@ -427,6 +455,7 @@ void pmm_init(uint64_t mb_info_phys) {
                         if (base + len > (PMM_MAX_PAGES * PAGE_SIZE))
                             len = (PMM_MAX_PAGES * PAGE_SIZE) - base;
                         pmm_mark_region(base, len, 0);
+                        if (base + len > pmm_ram_top) pmm_ram_top = base + len;
                     }
                 }
             }
@@ -455,6 +484,7 @@ void pmm_init(uint64_t mb_info_phys) {
                 if (base + len > (PMM_MAX_PAGES * PAGE_SIZE))
                     len = (PMM_MAX_PAGES * PAGE_SIZE) - base;
                 pmm_mark_region(base, len, 0);
+                if (base + len > pmm_ram_top) pmm_ram_top = base + len;
             }
         }
         klog("PMM: using EFI memory map fallback\n");
@@ -540,13 +570,15 @@ void pmm_free_pages(uint64_t phys, size_t count) {
 
 void pmm_get_stats(uint64_t* total_pages, uint64_t* used_pages, uint64_t* free_pages) {
     uint64_t used = 0;
-    for (uint64_t i = 0; i < PMM_MAX_PAGES; i++) {
+    uint64_t total = pmm_ram_top / PAGE_SIZE;
+    if (total == 0) total = PMM_MAX_PAGES;   /* pre-init fallback */
+    for (uint64_t i = 0; i < total; i++) {
         if (bitmap_test(i))
             used++;
     }
-    if (total_pages) *total_pages = PMM_MAX_PAGES;
+    if (total_pages) *total_pages = total;
     if (used_pages)  *used_pages  = used;
-    if (free_pages)  *free_pages  = PMM_MAX_PAGES - used;
+    if (free_pages)  *free_pages  = total - used;
 }
 
 /* ======================================================================== */

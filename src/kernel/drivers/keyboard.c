@@ -59,6 +59,10 @@ static void process_scancode(uint8_t scancode) {
         buf_push(KEY_WIN);
         return;
     }
+    if (scancode >= 0x3B && scancode <= 0x3E) {   /* F1-F4: panel shortcuts */
+        buf_push(KEY_F1 + (scancode - 0x3B));
+        return;
+    }
     if (scancode == 42 || scancode == 54) {
         shift_pressed = 1;
         return;
@@ -127,15 +131,7 @@ void keyboard_set_ps2_enabled(int enabled) {
 
 void keyboard_handler(interrupt_frame_t* frame) {
     (void)frame;
-    static int dbg_n = 0;
     uint8_t scancode = inb(KEYBOARD_PORT);
-
-    /* remote-debug: proves IRQ1 delivery through the LAPIC virtual wire
-     * (UEFI firmware masks LINT0 and silently kills all 8259 IRQs) */
-    if (dbg_n < 12) {
-        dbg_n++;
-        klog_hex("[kbd] irq1 sc=", scancode);
-    }
 
     if (!ps2_enabled) {
         /* USB keyboard owns the console: drain the 8042 output buffer and

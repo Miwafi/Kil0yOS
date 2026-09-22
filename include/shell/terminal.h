@@ -33,5 +33,9 @@ void term_gui_render(void);
 int term_gui_get_cursor_y(void);
 void term_gui_type_char(char c);
 void term_gui_backspace(void);
+/* Write the "> " prompt into the cell grid at the current cursor position
+ * and paint it. Keeping the prompt inside the cells prevents typed
+ * characters from overlapping it and survives full re-renders. */
+void term_gui_prompt(void);
 
 #endif

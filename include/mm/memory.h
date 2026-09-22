@@ -25,6 +25,16 @@ void* krealloc(void* ptr, size_t size);
 int heap_verify(const char* stage); /* 0 = clean, -1 = corrupted (logged) */
 size_t heap_free_bytes(void);       /* free-list total, for OOM diagnostics */
 
+/* Heap snapshot for memstat (all values in bytes) */
+typedef struct heap_stats {
+    size_t arena;        /* total heap reservation */
+    size_t used_bytes;   /* arena - free (headers included) */
+    size_t free_bytes;   /* sum of free blocks */
+    size_t largest_free; /* biggest contiguous free block */
+    size_t free_blocks;  /* free-list length */
+} heap_stats_t;
+void heap_get_stats(heap_stats_t* out);
+
 /* --- PMM --- */
 #define PMM_MAX_PAGES (1024ULL * 1024ULL)  /* 4GB / 4KB */
 

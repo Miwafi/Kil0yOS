@@ -123,6 +123,34 @@ USER_BINS = $(patsubst %, $(BUILDDIR)/user/%.bin, $(USER_PROGRAMS))
 USER_BLOB_OBJS = $(patsubst %, $(BUILDDIR)/user_blob_%.o, $(USER_PROGRAMS))
 .SECONDARY: $(USER_BINS) $(BUILDDIR)/user/hello.o $(BUILDDIR)/user/pong.o
 
+# --- Embedded blob staging (zstd) ----------------------------------------
+# User-program blobs are staged through $(STAGE)/: when zstd exists on the
+# build host the payload is stored zstd-compressed in the kernel image and
+# decompressed at install time (kernel side: process.c blob_raw, detection
+# by zstd frame magic - no separate format bookkeeping). Art assets
+# (mp3/jpg) are already compressed formats and keep their raw verbatim
+# rule below. $(MAKEFILE_LIST) as a stage prerequisite re-stages whenever
+# the Makefile changes, so a zstd-availability flip cannot leave a stale
+# mix of compressed and raw payloads behind.
+ZSTD := $(shell command -v zstd 2>/dev/null)
+STAGE := $(BUILDDIR)/blob_stage
+
+# $(1) = blob/file name, $(2) = symbol base (user_<2>_start/_end),
+# $(3) = source, $(4) = 1 compress via zstd when available.
+# NOTE: $(if)/$(and) expansion functions, NOT ifeq/ifneq - conditionals
+# inside a define are evaluated once at parse time, when $(1)..$(4) are
+# still empty, which silently kept only the cp branch.
+define BLOB_RULE
+BLOB_STAGE_FILES += $(STAGE)/$(1).blob
+$(STAGE)/$(1).blob: $(3) $(MAKEFILE_LIST)
+	@mkdir -p $(STAGE)
+	$(if $(and $(filter 1,$(4)),$(ZSTD)),zstd -19 -q -f $$< -o $$@,cp $$< $$@)
+
+$(BUILDDIR)/user_blob_$(1).o: $(STAGE)/$(1).blob
+	printf 'section .rodata\nglobal user_$(2)_start\nuser_$(2)_start:\nincbin "%s"\nglobal user_$(2)_end\nuser_$(2)_end:\n' '$$<' > $(BUILDDIR)/user_blob_$(1).s
+	$$(AS) -f elf64 $(BUILDDIR)/user_blob_$(1).s -o $$@
+endef
+
 .PHONY: all clean run iso usb
 
 all: iso
@@ -144,10 +172,6 @@ $(BUILDDIR)/user/hello-lnx: user/elf/hello.c
 	@mkdir -p $(dir $@)
 	$(MUSL_GCC) -static -no-pie -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
 
-$(BUILDDIR)/user_blob_hello-lnx.o: $(BUILDDIR)/user/hello-lnx
-	printf 'section .rodata\nglobal user_hello_lnx_start\nuser_hello_lnx_start:\nincbin "%s"\nglobal user_hello_lnx_end\nuser_hello_lnx_end:\n' '$<' > $(BUILDDIR)/user_blob_hello-lnx.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_hello-lnx.s -o $@
-
 # --- hello-dyn: musl DYNAMIC PIE + interpreter blob (Phase 3.0) ---------
 # hello-dyn keeps default dynamic PIE linking; PT_INTERP points at
 # /lib/ld-musl-x86_64.so.1 which is deployed from ~/musl/lib/libc.so
@@ -156,16 +180,8 @@ $(BUILDDIR)/user/hello-dyn: user/elf/hello.c
 	@mkdir -p $(dir $@)
 	$(MUSL_GCC) -O2 $< -o $@
 
-$(BUILDDIR)/user_blob_hello-dyn.o: $(BUILDDIR)/user/hello-dyn
-	printf 'section .rodata\nglobal user_hello_dyn_start\nuser_hello_dyn_start:\nincbin "%s"\nglobal user_hello_dyn_end\nuser_hello_dyn_end:\n' '$<' > $(BUILDDIR)/user_blob_hello-dyn.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_hello-dyn.s -o $@
-
 LDSO_SRC := $(HOME)/musl/lib/libc.so
 LDSO_BLOB := $(if $(wildcard $(LDSO_SRC)),$(BUILDDIR)/user_blob_ldmusl.o,)
-
-$(BUILDDIR)/user_blob_ldmusl.o: $(LDSO_SRC)
-	printf 'section .rodata\nglobal user_ldmusl_start\nuser_ldmusl_start:\nincbin "%s"\nglobal user_ldmusl_end\nuser_ldmusl_end:\n' '$<' > $(BUILDDIR)/user_blob_ldmusl.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_ldmusl.s -o $@
 
 SECONDARY_EXTRA := $(if $(MUSL_GCC),$(BUILDDIR)/user/hello-dyn $(BUILDDIR)/user/hello-lnx,)
 .SECONDARY: $(SECONDARY_EXTRA)
@@ -184,28 +200,12 @@ $(BUILDDIR)/user/hello-glibc: user/elf/hello.c
 	@mkdir -p $(dir $@)
 	$(GCC) -O2 $< -o $@
 
-$(BUILDDIR)/user_blob_hello-glibc.o: $(BUILDDIR)/user/hello-glibc
-	printf 'section .rodata\nglobal user_hello_glibc_start\nuser_hello_glibc_start:\nincbin "%s"\nglobal user_hello_glibc_end\nuser_hello_glibc_end:\n' '$<' > $(BUILDDIR)/user_blob_hello-glibc.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_hello-glibc.s -o $@
-
-$(BUILDDIR)/user_blob_ldlinux.o: $(GLIBC_LD_SRC)
-	printf 'section .rodata\nglobal user_ldlinux_start\nuser_ldlinux_start:\nincbin "%s"\nglobal user_ldlinux_end\nuser_ldlinux_end:\n' '$<' > $(BUILDDIR)/user_blob_ldlinux.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_ldlinux.s -o $@
-
-$(BUILDDIR)/user_blob_glibc.o: $(GLIBC_LIBC_SRC)
-	printf 'section .rodata\nglobal user_glibc_start\nuser_glibc_start:\nincbin "%s"\nglobal user_glibc_end\nuser_glibc_end:\n' '$<' > $(BUILDDIR)/user_blob_glibc.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_glibc.s -o $@
-
 # --- hello-pthread: glibc dynamic + pthread primitives (Phase 3.2) ------
 PTHREAD_BLOB := $(if $(GCC),$(BUILDDIR)/user_blob_pthread.o,)
 
 $(BUILDDIR)/user/hello-pthread: user/elf/hello_pthread.c
 	@mkdir -p $(dir $@)
 	$(GCC) -O2 $< -o $@ -lpthread
-
-$(BUILDDIR)/user_blob_pthread.o: $(BUILDDIR)/user/hello-pthread
-	printf 'section .rodata\nglobal user_pthread_start\nuser_pthread_start:\nincbin "%s"\nglobal user_pthread_end\nuser_pthread_end:\n' '$<' > $(BUILDDIR)/user_blob_pthread.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_pthread.s -o $@
 
 # --- mini: freestanding Linux-ABI syscall probe (no libc needed) ---
 .SECONDARY: $(BUILDDIR)/user/mini
@@ -219,17 +219,9 @@ $(BUILDDIR)/user/probe-ld: user/elf/probe_ld.c
 	@mkdir -p $(dir $@)
 	$(MUSL_GCC) -static -no-pie -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
 
-$(BUILDDIR)/user_blob_probe-ld.o: $(BUILDDIR)/user/probe-ld
-	printf 'section .rodata\nglobal user_probe_ld_start\nuser_probe_ld_start:\nincbin "%s"\nglobal user_probe_ld_end\nuser_probe_ld_end:\n' '$<' > $(BUILDDIR)/user_blob_probe-ld.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_probe-ld.s -o $@
-
 $(BUILDDIR)/user/mini: user/elf/mini.c
 	@mkdir -p $(dir $@)
 	$(CC) -static -no-pie -nostdlib -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
-
-$(BUILDDIR)/user_blob_mini.o: $(BUILDDIR)/user/mini
-	printf 'section .rodata\nglobal user_mini_start\nuser_mini_start:\nincbin "%s"\nglobal user_mini_end\nuser_mini_end:\n' '$<' > $(BUILDDIR)/user_blob_mini.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_mini.s -o $@
 
 # --- mmt: freestanding brk/mmap/mprotect acceptance probe (no libc) ---
 .SECONDARY: $(BUILDDIR)/user/mmt
@@ -243,17 +235,9 @@ $(BUILDDIR)/user/nettest: user/elf/nettest.c
 	@mkdir -p $(dir $@)
 	$(CC) -static -no-pie -nostdlib -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
 
-$(BUILDDIR)/user_blob_nettest.o: $(BUILDDIR)/user/nettest
-	printf 'section .rodata\nglobal user_nettest_start\nuser_nettest_start:\nincbin "%s"\nglobal user_nettest_end\nuser_nettest_end:\n' '$<' > $(BUILDDIR)/user_blob_nettest.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_nettest.s -o $@
-
 $(BUILDDIR)/user/mmt: user/elf/mmt.c
 	@mkdir -p $(dir $@)
 	$(CC) -static -no-pie -nostdlib -fno-builtin -O2 -Wl,-Ttext-segment=0x10000000 $< -o $@
-
-$(BUILDDIR)/user_blob_mmt.o: $(BUILDDIR)/user/mmt
-	printf 'section .rodata\nglobal user_mmt_start\nuser_mmt_start:\nincbin "%s"\nglobal user_mmt_end\nuser_mmt_end:\n' '$<' > $(BUILDDIR)/user_blob_mmt.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_mmt.s -o $@
 
 # --- busybox: musl static multi-call binary (Phase 1.3) -----------------
 # Built in WSL at $(BUSYBOX_SRC) (see tools/build_busybox.sh). Embedded
@@ -261,9 +245,22 @@ $(BUILDDIR)/user_blob_mmt.o: $(BUILDDIR)/user/mmt
 BUSYBOX_SRC := $(HOME)/busybox-1.36.1/busybox
 BUSYBOX_BLOB := $(if $(wildcard $(BUSYBOX_SRC)),$(BUILDDIR)/user_blob_busybox.o,)
 
-$(BUILDDIR)/user_blob_busybox.o: $(BUSYBOX_SRC)
-	printf 'section .rodata\nglobal user_busybox_start\nuser_busybox_start:\nincbin "%s"\nglobal user_busybox_end\nuser_busybox_end:\n' '$<' > $(BUILDDIR)/user_blob_busybox.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_busybox.s -o $@
+# --- all staged blob rules (see "Embedded blob staging" above) ----------
+$(eval $(call BLOB_RULE,hello,hello,$(BUILDDIR)/user/hello.bin,1))
+$(eval $(call BLOB_RULE,pong,pong,$(BUILDDIR)/user/pong.bin,1))
+$(eval $(call BLOB_RULE,hello-lnx,hello_lnx,$(BUILDDIR)/user/hello-lnx,1))
+$(eval $(call BLOB_RULE,hello-dyn,hello_dyn,$(BUILDDIR)/user/hello-dyn,1))
+$(eval $(call BLOB_RULE,ldmusl,ldmusl,$(LDSO_SRC),1))
+$(eval $(call BLOB_RULE,hello-glibc,hello_glibc,$(BUILDDIR)/user/hello-glibc,1))
+$(eval $(call BLOB_RULE,ldlinux,ldlinux,$(GLIBC_LD_SRC),1))
+$(eval $(call BLOB_RULE,glibc,glibc,$(GLIBC_LIBC_SRC),1))
+$(eval $(call BLOB_RULE,pthread,pthread,$(BUILDDIR)/user/hello-pthread,1))
+$(eval $(call BLOB_RULE,probe-ld,probe_ld,$(BUILDDIR)/user/probe-ld,1))
+$(eval $(call BLOB_RULE,mini,mini,$(BUILDDIR)/user/mini,1))
+$(eval $(call BLOB_RULE,nettest,nettest,$(BUILDDIR)/user/nettest,1))
+$(eval $(call BLOB_RULE,mmt,mmt,$(BUILDDIR)/user/mmt,1))
+$(eval $(call BLOB_RULE,busybox,busybox,$(BUSYBOX_SRC),1))
+.SECONDARY: $(BLOB_STAGE_FILES)
 
 # Desktop art assets: every file in user/art/ is embedded verbatim and
 # installed to /home/user/art at boot (process.c: user_install_blob).
@@ -287,10 +284,6 @@ $(BUILDDIR)/user/pong.o: user/pong.c
 $(BUILDDIR)/user/%.bin: $(BUILDDIR)/user/%.o user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) -T user/user.ld -nostdlib -m elf_x86_64 $< -o $@
-
-$(BUILDDIR)/user_blob_%.o: $(BUILDDIR)/user/%.bin
-	printf 'section .rodata\nglobal user_$*_start\nuser_$*_start:\nincbin "%s"\nglobal user_$*_end\nuser_$*_end:\n' '$<' > $(BUILDDIR)/user_blob_$*.s
-	$(AS) -f elf64 $(BUILDDIR)/user_blob_$*.s -o $@
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(dir $@)
