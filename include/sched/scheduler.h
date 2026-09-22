@@ -14,13 +14,27 @@ typedef struct task {
     int status;
     char name[32];
     uint8_t stack[TASK_STACK_SIZE];
+    uint8_t background;   /* kernel thread: excluded from idle/busy accounting */
 } task_t;
 
 void scheduler_init();
 int  task_create(void (*entry)(void), const char* name);
+/* Background kernel thread (e.g. watchdog): scheduled like any task but
+ * its existence does not make idle ticks count as "busy". */
+int  task_create_bg(void (*entry)(void), const char* name);
 uint64_t scheduler_tick(uint64_t current_rsp);
 int  task_kill(int task_id);
 void task_exit(void);
+
+/* Kernel heartbeat: the kernel main task touches this counter on every
+ * pass through its loops (shell prompt, desktop loop, keyboard wait, ...).
+ * The watchdog thread samples it every 10 s; a frozen counter means the
+ * main task stopped making progress -> kernel panic. */
+void kernel_heartbeat_touch(void);
+uint64_t kernel_heartbeat_read(void);
+
+/* Create the heartbeat watchdog kernel thread ("kwatchdog"). */
+void heartbeat_watchdog_init(void);
 
 /* Called by process_exit(): next scheduler_tick() must return the saved
  * kernel-main frame instead of the dying user process frame. */

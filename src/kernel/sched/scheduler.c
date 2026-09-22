@@ -4,6 +4,8 @@
 #include "core/tss.h"
 #include "mm/memory.h"
 #include "lib/string.h"
+#include "lib/stdlib.h"
+#include "timer/pit.h"
 
 static task_t tasks[MAX_TASKS];
 static int task_count = 0;
@@ -130,9 +132,16 @@ int task_create(void (*entry)(void), const char* name) {
 
     tasks[idx].status = TASK_READY;
     strcpy(tasks[idx].name, name);
+    tasks[idx].background = 0;
     setup_task_stack(&tasks[idx], entry);
 
     task_count++;
+    return idx;
+}
+
+int task_create_bg(void (*entry)(void), const char* name) {
+    int idx = task_create(entry, name);
+    if (idx >= 0) tasks[idx].background = 1;
     return idx;
 }
 
@@ -183,7 +192,14 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
         return tasks[current_task_idx].rsp;
     }
 
-    cpu_busy_ticks++;
+    /* Busy/idle accounting ignores background kernel threads: a tick that
+     * only alternates kernel_main with idle kthreads (watchdog) is still
+     * logically idle, otherwise the System Monitor would pin at 100 %. */
+    int fg = 0;
+    for (int i = 1; i < MAX_TASKS; i++) {
+        if (tasks[i].status != TASK_DEAD && !tasks[i].background) fg++;
+    }
+    if (fg == 0) cpu_idle_ticks++; else cpu_busy_ticks++;
 
     int next = current_task_idx;
     do {
@@ -237,4 +253,66 @@ const char* task_status_str(int status) {
         case TASK_DEAD:    return "Dead";
         default:           return "???";
     }
+}
+
+/* =====================  Kernel heartbeat watchdog  ====================== */
+
+/* Touched by the kernel main task on every pass through its loops (shell
+ * prompt, desktop loop, keyboard wait, busy delays, tar extraction...).
+ * A frozen counter means the main task stopped making forward progress.
+ * IRQ0 firing deliberately does NOT advance it: a main task wedged in a
+ * spin with IF=1 still gets preempted, but its loops never touch. */
+static volatile uint64_t kernel_heartbeat = 0;
+
+void kernel_heartbeat_touch(void) {
+    kernel_heartbeat++;
+}
+
+uint64_t kernel_heartbeat_read(void) {
+    return kernel_heartbeat;
+}
+
+#define HEARTBEAT_CHECK_INTERVAL_US  (10ULL * 1000000ULL)   /* 10 s */
+
+/* kwatchdog: independent kernel thread, samples the heartbeat every 10 s
+ * and panics when the main task has shown no progress in that window.
+ *
+ * Scope / known limits, by design:
+ *  - While a user process runs, kernel main is legitimately parked (wait4,
+ *    shell hlt-wait) and stops touching - checks are skipped then
+ *    (process_any_active) and monitoring resumes once the process exits.
+ *  - A wedge with interrupts disabled stops IRQ0 itself, so nothing (not
+ *    even this thread) can run; that hang class would need an NMI
+ *    watchdog, out of scope here. */
+static void heartbeat_watchdog_main(void) {
+    uint64_t last_seen = kernel_heartbeat;
+
+    for (;;) {
+        uint64_t deadline = pit_uptime_us() + HEARTBEAT_CHECK_INTERVAL_US;
+        while (pit_uptime_us() < deadline) {
+            __asm__ volatile("hlt");
+        }
+
+        /* A user process owns the CPU time right now: kernel main is
+         * parked on purpose - not a hang. Re-arm and keep waiting. */
+        if (process_any_active()) continue;
+
+        if (kernel_heartbeat == last_seen) {
+            char msg[96];
+            char num[16];
+            strcpy(msg, "kernel heartbeat stalled: main task unresponsive >10s (count=");
+            utoa((uint32_t)last_seen, num, 10, sizeof(num));
+            strcat(msg, num);
+            strcat(msg, ", uptime=");
+            utoa((uint32_t)(pit_uptime_us() / 1000000ULL), num, 10, sizeof(num));
+            strcat(msg, num);
+            strcat(msg, "s)");
+            PANIC(msg);
+        }
+        last_seen = kernel_heartbeat;
+    }
+}
+
+void heartbeat_watchdog_init(void) {
+    task_create_bg(heartbeat_watchdog_main, "kwatchdog");
 }

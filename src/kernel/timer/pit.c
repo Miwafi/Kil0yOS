@@ -1,6 +1,7 @@
 #include "timer/pit.h"
 #include "drivers/io.h"
 #include "core/interrupts.h"
+#include "sched/scheduler.h"
 
 #define PIT_COMMAND   0x43
 #define PIT_CHANNEL0  0x40
@@ -186,6 +187,7 @@ void pit_delay_ms(uint32_t ms) {
     uint16_t last = pit_read_counter();
 
     while (ticks_elapsed < ticks_needed) {
+        kernel_heartbeat_touch();   /* kwatchdog: caller is busy-waiting, alive */
         uint16_t cur = pit_read_counter();
         uint16_t delta;
         if (cur <= last) {

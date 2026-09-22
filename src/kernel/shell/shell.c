@@ -449,7 +449,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.1.0\n");
+    vga_puts("Kil0yOS v3.2.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -2304,7 +2304,7 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v3.1.0", 0x00);
+    dt_draw_string(4, title_y, "Kil0yOS v3.2.0", 0x00);
     dt_draw_string(dt_w - 148, title_y, "[Win]=Menu  F1-F4", 0x01);
 
     /* left function panel */
@@ -2386,6 +2386,7 @@ static void desktop_run_loop(void) {
     klog("[desktop] loop enter\n");
 
     while (1) {
+        kernel_heartbeat_touch();   /* kwatchdog: desktop loop is alive */
         /* update clock every second */
         rtc_time_t t;
         if (rtc_read(&t) == 0 && t.second != last_second) {
@@ -3358,6 +3359,7 @@ void shell_run() {
         
         cmd_len = 0;
         while (cmd_len < MAX_COMMAND_LENGTH - 1) {
+            kernel_heartbeat_touch();   /* kwatchdog: main task is cycling */
             /* While a user process is running (time-sliced with us),
              * leave the keyboard buffer alone - its sys_read owns it. */
             if (process_any_active()) {

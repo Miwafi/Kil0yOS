@@ -5,6 +5,7 @@
 #include "fs/fs.h"
 #include "drivers/vga.h"
 #include "mm/memory.h"
+#include "sched/scheduler.h"
 
 #define TAR_BLOCK 512
 
@@ -155,6 +156,7 @@ static int tar_iterate(const uint8_t* data, size_t len, tar_iter_cb cb, void* ct
     int have_longname = 0;
 
     while (pos + TAR_BLOCK <= len) {
+        kernel_heartbeat_touch();   /* kwatchdog: per-entry extraction progress */
         const uint8_t* hdr = data + pos;
         if (hdr[0] == 0) {
             int all_zero = 1;

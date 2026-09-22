@@ -4,6 +4,7 @@
 #include "lib/stdlib.h"
 #include "drivers/io.h"
 #include "drivers/vga.h"
+#include "drivers/fb.h"
 #include "drivers/efi_gop.h"
 #include "core/interrupts.h"
 
@@ -990,6 +991,21 @@ void panic(const char* msg, const char* file, int line) {
     vga_puts("\nLine: ");
     vga_puts(buf);
     vga_puts("\nSystem halted.\n");
+
+    /* GOP path: vga_* is inert under the desktop - mirror the panic into
+     * the fb console, unmuting it first (a panic outranks the desktop UI;
+     * same philosophy as isr.c's exception dump). */
+    if (fb_is_active()) {
+        fb_console_mute(0);
+        fb_puts("\n\n*** KERNEL PANIC ***\n");
+        fb_puts("Message: ");
+        fb_puts(msg);
+        fb_puts("\nFile: ");
+        fb_puts(file);
+        fb_puts("\nLine: ");
+        fb_puts(buf);
+        fb_puts("\nSystem halted.\n");
+    }
 
     __asm__ volatile("cli");
     for (;;) { __asm__ volatile("hlt"); }

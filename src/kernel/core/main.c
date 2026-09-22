@@ -162,7 +162,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 3.1.0\n");
+    klog("Kil0yOS version 3.2.0\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
@@ -282,6 +282,10 @@ void kernel_main(uint64_t mb_info_phys) {
     klog("SMP: initializing multiprocessor...\n");
     smp_init();
     klog("[init] smp_init done\n");
+
+    klog("watchdog: starting kernel heartbeat thread (10s poll)...\n");
+    heartbeat_watchdog_init();
+    klog("[init] heartbeat watchdog ready\n");
 
     klog("\n");
     klog("Welcome to Kil0yOS!\n");

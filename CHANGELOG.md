@@ -2,6 +2,20 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.2.0] - 2026-09-22
+The kernel's first independent kernel thread: a low-level **heartbeat watchdog** (`kwatchdog`) that samples the kernel heartbeat every 10 seconds and panics when the main task stops responding.
+
+### Added
+- **Kernel heartbeat watchdog (`kwatchdog`)**: the first background kernel thread (`task_create_bg`) samples a heartbeat counter every 10 s. The counter is touched by every kernel-main progress point (shell prompt loop, desktop loop, keyboard wait, `pit_delay_ms` busy waits, per-entry tar extraction); IRQ0 firing deliberately does not advance it, so a main task wedged in a spin with IF=1 is still caught. No progress for >10 s with no user process active → `PANIC()` with count + uptime. The watchdog suspends while user processes run (kernel main is legitimately parked in wait4/hlt) and background threads are excluded from the busy/idle tick accounting so the System Monitor stays honest.
+- **`panic()` fb-console mirror**: on GOP boots the panic text is unmuted and painted onto the desktop framebuffer, so panics are visible on screen, not just serial.
+
+### File Changes
+- `include/sched/scheduler.h`, `src/kernel/sched/scheduler.c`: heartbeat counter + `kwatchdog` thread, `task_create_bg`, background-aware idle accounting
+- `src/kernel/core/main.c`: `heartbeat_watchdog_init()` before interrupts are enabled
+- `src/kernel/shell/shell.c`, `src/kernel/drivers/keyboard.c`, `src/kernel/timer/pit.c`, `src/kernel/pkg/tar.c`: heartbeat touch points
+- `src/kernel/mm/memory.c`: `panic()` fb-console mirror for GOP boots
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [3.1.0] - 2026-09-22
 Two fronts: a **desktop modal text editor** (a drawing-free engine shared with the text-mode editor) plus F1-F4 panel shortcuts, and a **memory-footprint pass** that cuts the loaded kernel image by ~22 % and idle heap use from 33 MB to 514 KB.
 

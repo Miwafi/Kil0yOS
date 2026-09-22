@@ -4,6 +4,7 @@
 #include "core/interrupts.h"
 #include "drivers/device.h"
 #include "drivers/vga.h"
+#include "sched/scheduler.h"
 
 #define BUFFER_SIZE 256
 #define KEYBOARD_STATUS_PORT 0x64
@@ -394,6 +395,7 @@ void keyboard_rearm_interrupt(void) {
 
 char keyboard_getc() {
     while (1) {
+        kernel_heartbeat_touch();   /* kwatchdog: woken per IRQ while waiting */
         disable_interrupts();
         int count = buffer_count;
         if (count > 0) {
