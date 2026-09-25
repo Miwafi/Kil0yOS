@@ -47,8 +47,10 @@ void fb_puts(const char* s);
 /* solid color rectangle for boot-time diagnostics (visible pre-terminal);
  * rgb is 0x00RRGGBB, mapped through the active pixel format */
 void fb_debug_block(int x, int y, int w, int h, uint32_t rgb);
-/* EGA 16-color palette index (same numbering as vga_color) -> 24-bit RGB */
+/* EGA 16-color palette index (same numbering as vga_color) -> 24-bit RGB
+ * for the glyph foreground; bg sets the cell/fill background color */
 void fb_set_color(uint8_t ega_index);
+void fb_set_bg_color(uint8_t ega_index);
 void fb_scroll(void);
 
 #endif /* FB_H */

@@ -378,6 +378,33 @@ void* krealloc(void* ptr, size_t size) {
 static uint8_t pmm_bitmap[PMM_MAX_PAGES / 8];
 static uint64_t pmm_last_page = 0;
 
+/* Snapshot of the usable-RAM ranges from the boot memory map (multiboot2
+ * type-1 / EFI type-7), taken while pmm_init parses them.  The panic memory
+ * dump walks this instead of re-parsing the boot-info body - the body is
+ * reserved, but it sits in low RAM that other early boot stages have been
+ * observed to disturb, and a snapshot removes that failure mode entirely. */
+#define PMM_USABLE_MAX 32
+typedef struct {
+    uint64_t base;
+    uint64_t len;
+} pmm_usable_t;
+static pmm_usable_t pmm_usable[PMM_USABLE_MAX];
+static int pmm_usable_count = 0;
+
+static void pmm_note_usable(uint64_t base, uint64_t len) {
+    const uint64_t cap4g = PMM_MAX_PAGES * PAGE_SIZE;
+    if (base + len > cap4g) len = cap4g - base;
+    if (base >= cap4g || len == 0) return;
+    if (pmm_usable_count < PMM_USABLE_MAX) {
+        pmm_usable[pmm_usable_count].base = base;
+        pmm_usable[pmm_usable_count].len  = len;
+        pmm_usable_count++;
+    } else {
+        /* table full: fold into the last entry so the dump stays bounded */
+        pmm_usable[PMM_USABLE_MAX - 1].len += len;
+    }
+}
+
 /* Highest usable-RAM byte reported by the boot memory map (multiboot2
  * type-1 or EFI type-7 entries). pmm_get_stats reports total pages from
  * this instead of the fixed 4 GB bitmap span, so memstat shows the real
@@ -423,6 +450,8 @@ struct mb2_tag {
 #define MB2_TAG_MMAP 6
 
 void pmm_init(uint64_t mb_info_phys) {
+    (void)mb_info_phys;
+
     /* Everything reserved by default */
     memset(pmm_bitmap, 0xFF, sizeof(pmm_bitmap));
 
@@ -457,6 +486,7 @@ void pmm_init(uint64_t mb_info_phys) {
                         if (base + len > (PMM_MAX_PAGES * PAGE_SIZE))
                             len = (PMM_MAX_PAGES * PAGE_SIZE) - base;
                         pmm_mark_region(base, len, 0);
+                        pmm_note_usable(base, len);
                         if (base + len > pmm_ram_top) pmm_ram_top = base + len;
                     }
                 }
@@ -486,6 +516,7 @@ void pmm_init(uint64_t mb_info_phys) {
                 if (base + len > (PMM_MAX_PAGES * PAGE_SIZE))
                     len = (PMM_MAX_PAGES * PAGE_SIZE) - base;
                 pmm_mark_region(base, len, 0);
+                pmm_note_usable(base, len);
                 if (base + len > pmm_ram_top) pmm_ram_top = base + len;
             }
         }
@@ -973,39 +1004,15 @@ static void panic_itoa(int num, char* buf, int base) {
 /* --- Panic screen helpers -------------------------------------------------
  * The panic screen is mirrored to BOTH text backends: the VGA terminal
  * (inert no-op under GOP) and the fb console (inactive on BIOS boots).
- * Every line is centered within each backend's own width, so the layout
- * holds on both 80x25 text mode and the wide GOP glyph grid. */
+ * Layout follows the classic Windows stop screen: a solid blue field with
+ * white text, warning prose left-aligned, the technical info as a
+ * "*** STOP:" block and the dump/press-any-key footer.  Both backends get
+ * the same white-on-blue attribute so the blue field covers the full
+ * screen in text mode (clear paints the attribute) and on the framebuffer
+ * (every glyph cell repaints with bg). */
 static void panic_puts2(const char* s) {
     vga_puts(s);
     fb_puts(s);
-}
-
-static void panic_putc2(char c) {
-    vga_putchar(c);
-    fb_putchar(c);
-}
-
-static void panic_color(uint8_t vga_color) {
-    vga_set_color(vga_entry_color(vga_color, COLOR_BLACK));
-    fb_set_color(vga_color);        /* EGA index numbering is shared */
-}
-
-static void panic_center(const char* s) {
-    int len = 0;
-    while (s[len]) len++;
-
-    int pad = (len < 78) ? (80 - len) / 2 : 0;      /* VGA text: 80 cols */
-    for (int i = 0; i < pad; i++) vga_putchar(' ');
-    vga_puts(s);
-    vga_putchar('\n');
-
-    if (fb_is_active()) {
-        int cols = fb_cols();
-        int fpad = (len < cols - 2) ? (cols - len) / 2 : 0;
-        for (int i = 0; i < fpad; i++) fb_putchar(' ');
-        fb_puts(s);
-        fb_putchar('\n');
-    }
 }
 
 static void panic_hex(char* out, uint64_t v) {
@@ -1014,6 +1021,123 @@ static void panic_hex(char* out, uint64_t v) {
     out[1] = 'x';
     for (int i = 0; i < 16; i++) out[2 + i] = hx[(v >> (60 - i * 4)) & 0xF];
     out[18] = '\0';
+}
+
+/* --- Panic memory dump ----------------------------------------------------
+ * Classic stop-screen behaviour: on panic, the beginning of physical memory
+ * is dumped to the serial log as greppable hex lines while the blue screen
+ * shows an in-place "Dumping physical memory: NNN %" counter.
+ *
+ * Source regions: the usable-RAM snapshot pmm_init recorded at boot, so only
+ * ranges the firmware marked as RAM are read - MMIO holes are never touched.
+ * Everything is identity-mapped (clamped to the first 4 GB), reads are pure
+ * loads, and serial output is polled, so the dump works with interrupts
+ * disabled.  The byte budget keeps real UARTs (115200 baud) bounded. */
+#ifndef PANIC_DUMP_LIMIT
+#define PANIC_DUMP_LIMIT (2ULL << 20)    /* bytes; -DPANIC_DUMP_LIMIT=0 skips */
+#endif
+
+/* Invoke cb(base, len, ctx) for every usable-RAM range recorded at boot */
+static void panic_for_each_usable(void (*cb)(uint64_t, uint64_t, uint64_t*),
+                                  uint64_t* ctx) {
+    for (int i = 0; i < pmm_usable_count; i++)
+        cb(pmm_usable[i].base, pmm_usable[i].len, ctx);
+}
+
+/* one "00000000: 4b 8d .. \n" line (up to 16 bytes) on the serial log */
+static void panic_dump_line(uint64_t addr, const uint8_t* p, uint32_t n) {
+    static const char hx[] = "0123456789abcdef";
+    char line[16 * 3 + 11];
+    int i = 0;
+    for (int k = 7; k >= 0; k--) line[i++] = hx[(addr >> (k * 4)) & 0xF];
+    line[i++] = ':';
+    line[i++] = ' ';
+    for (uint32_t b = 0; b < n; b++) {
+        line[i++] = hx[(p[b] >> 4) & 0xF];
+        line[i++] = hx[p[b] & 0xF];
+        line[i++] = ' ';
+    }
+    line[i++] = '\n';
+    line[i] = '\0';
+    panic_serial_puts(line);
+}
+
+/* in-place "Dumping physical memory: NNN %" on the stop screen */
+static void panic_dump_progress(uint64_t done, uint64_t total) {
+    char line[48];
+    int i = 0;
+    for (const char* p = "\rDumping physical memory: "; *p; p++) line[i++] = *p;
+    int pct = (total == 0) ? 100 : (int)(done * 100 / total);
+    if (pct > 100) pct = 100;
+    if (pct >= 100) {
+        line[i++] = '1'; line[i++] = '0'; line[i++] = '0';
+    } else {
+        line[i++] = ' ';
+        line[i++] = (pct >= 10) ? (char)('0' + pct / 10) : ' ';
+        line[i++] = (char)('0' + pct % 10);
+    }
+    line[i++] = ' ';
+    line[i++] = '%';
+    line[i] = '\0';
+    panic_puts2(line);
+}
+
+/* ctx[0] = planned total, ctx[1] = bytes done so far */
+static void panic_dump_region(uint64_t base, uint64_t len, uint64_t* ctx) {
+    const uint64_t plan = ctx[0];
+    if (ctx[1] + len > plan) len = plan - ctx[1];   /* honour the cap */
+
+    const uint8_t* p = (const uint8_t*)base;
+    uint64_t last64k = ctx[1] >> 16;
+    while (len >= 16) {
+        panic_dump_line(base, p, 16);
+        p += 16;
+        base += 16;
+        len -= 16;
+        ctx[1] += 16;
+        if ((ctx[1] >> 16) != last64k) {            /* progress every 64 KiB */
+            last64k = ctx[1] >> 16;
+            panic_dump_progress(ctx[1], plan);
+        }
+    }
+    if (len) {
+        panic_dump_line(base, p, (uint32_t)len);
+        ctx[1] += len;
+    }
+}
+
+/* pass 1: sum usable RAM */
+static void panic_dump_plan_cb(uint64_t base, uint64_t len, uint64_t* ctx) {
+    (void)base;
+    *ctx += len;
+}
+
+/* pass 2: dump, capped at the plan, with on-screen progress */
+static uint64_t panic_dump_memory(void) {
+    if (PANIC_DUMP_LIMIT == 0) return 0;
+
+    uint64_t ctx[2] = {0, 0};
+    panic_for_each_usable(panic_dump_plan_cb, &ctx[0]);
+    if (ctx[0] > PANIC_DUMP_LIMIT) ctx[0] = PANIC_DUMP_LIMIT;
+
+    if (ctx[0] == 0) {                       /* no usable-RAM snapshot */
+        panic_puts2("Physical memory dump skipped.\n\n");
+        panic_serial_puts("*** MEMORY DUMP SKIPPED (no usable RAM regions) ***\n");
+        return 0;
+    }
+
+    panic_puts2("Beginning dump of physical memory...\n");
+    panic_serial_puts("*** MEMORY DUMP BEGIN ***\n");
+    panic_for_each_usable(panic_dump_region, ctx);
+    panic_dump_progress(ctx[1], ctx[0]);     /* pin the counter at 100% */
+    panic_puts2("\nPhysical memory dump complete.\n\n");
+
+    panic_serial_puts("*** MEMORY DUMP END (");
+    char nb[16];
+    panic_itoa((int)ctx[1], nb, 10);
+    panic_serial_puts(nb);
+    panic_serial_puts(" bytes) ***\n");
+    return ctx[1];
 }
 
 void panic(const char* msg, const char* file, int line, uint64_t code) {
@@ -1054,42 +1178,57 @@ void panic(const char* msg, const char* file, int line, uint64_t code) {
     panic_serial_puts(upbuf);
     panic_serial_puts(" s\nSystem halted.\n");
 
-    /* Screen output: clear both backends, then a centered layout -
-     * red title, white detail block, grey halt notice. */
+    /* Screen output: white-on-blue stop screen on both backends.  The
+     * attribute is set BEFORE the clear so vga_clear fills the whole text
+     * grid with the blue field and fb_clear fills the framebuffer with
+     * the matching EGA blue. */
+    vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLUE));
+    fb_set_color(COLOR_WHITE);
+    fb_set_bg_color(COLOR_BLUE);
     vga_clear();
     if (fb_is_active()) {
         fb_console_mute(0);      /* a panic outranks the desktop UI */
         fb_clear();
     }
 
-    panic_color(COLOR_LIGHT_RED);
-    panic_center("");
-    panic_center("K E R N E L   P A N I C");
-    panic_center("");
-    panic_center("--------------------------------------------------------");
+    /* Bugcheck name: the panic message uppercased like a stop-code name
+     * (screen only - the serial log keeps the original casing). */
+    char ubuf[80];
+    int ulen = 0;
+    while (msg[ulen] && ulen < 78) {
+        char c = msg[ulen];
+        ubuf[ulen] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+        ulen++;
+    }
+    ubuf[ulen] = '\0';
 
-    panic_color(COLOR_WHITE);
-    panic_center("");
-    char row[192];
-    strcpy(row, "Message : ");
-    strcat(row, msg);
-    panic_center(row);
-    strcpy(row, "Error   : ");
-    strcat(row, codebuf);
-    panic_center(row);
-    strcpy(row, "Location: ");
-    strcat(row, file);
-    strcat(row, ":");
-    strcat(row, buf);
-    panic_center(row);
-    strcpy(row, "Uptime  : ");
-    strcat(row, upbuf);
-    strcat(row, " s");
-    panic_center(row);
+    panic_puts2("A problem has been detected and Kil0yOS has been shut down "
+                "to prevent\ndamage to your computer.\n\n");
+    panic_puts2(ubuf);
+    panic_puts2("\n\nIf this is the first time you've seen this Stop error "
+                "screen, restart\nyour computer. If this screen appears "
+                "again, follow these steps:\n\n");
+    panic_puts2("Collect all the information shown on this screen, then "
+                "submit a GitHub\nissue at github.com/Miwafi/Kil0yOS/issues "
+                "so this crash can be\ninvestigated and fixed.\n\n");
 
-    panic_color(COLOR_GREY);
-    panic_center("");
-    panic_center("The system has been halted.");
+    panic_puts2("Technical information:\n\n");
+    panic_puts2("*** STOP: ");
+    panic_puts2(codebuf);
+    panic_puts2("\n*** Location: ");
+    panic_puts2(file);
+    panic_puts2(":");
+    panic_puts2(buf);
+    panic_puts2("\n*** Uptime: ");
+    panic_puts2(upbuf);
+    panic_puts2(" s\n\n");
+
+    /* Physical memory dump: hex lines to the serial log, live percentage
+     * counter in place on the stop screen (skipped without a boot map). */
+    panic_dump_memory();
+
+    panic_puts2("For further assistance, include this screen in your issue "
+                "report.\nThank you for helping to improve Kil0yOS.");
 
     __asm__ volatile("cli");
     for (;;) { __asm__ volatile("hlt"); }

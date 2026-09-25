@@ -2,6 +2,24 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.5.0] - 2026-09-26
+The panic screen becomes a classic **Windows-style blue stop screen** — and the memory dump it promises is real: usable-RAM content is hex-dumped to the serial log while a live percentage counter runs on the blue field.
+
+### Changed
+- **BSOD panic screen redesign**: the old centered red/white/grey layout is replaced by the classic stop-screen look — solid blue field with white text on both backends (the VGA attribute is set *before* the clear so the whole text grid fills blue; the fb path gained `fb_set_bg_color()` since the background was hardwired black). Left-aligned warning prose ("A problem has been detected and Kil0yOS has been shut down..."), the panic message uppercased as the bugcheck name, the `*** STOP:` / `*** Location:` / `*** Uptime:` technical block, and the "Press any key to continue _" footer. All debug info (stop code, file:line, uptime) is preserved; the serial report format is unchanged. The layout fits exactly 25 VGA rows (a trailing newline on the last line would scroll line 1 off-screen).
+- **GitHub issue advice**: the stop screen now directs the user to collect the on-screen information and submit an issue at `github.com/Miwafi/Kil0yOS/issues`, replacing the generic hardware/software troubleshooting prose and the "contact your system administrator" footer.
+
+### Added
+- **Panic memory dump**: on panic, the usable-RAM snapshot recorded by `pmm_init` (multiboot2 type-1 / EFI type-7 ranges, clamped to the first 4 GB) is dumped to the serial log as greppable hex lines (`XXXXXXXX: 16 bytes per line`) between `*** MEMORY DUMP BEGIN ***` / `*** MEMORY DUMP END (N bytes) ***` markers. Only firmware-marked RAM is read — MMIO holes are never touched; reads are pure loads and serial output is polled, so the dump works with interrupts disabled. Budget-capped at `PANIC_DUMP_LIMIT` (default 2 MB, `-DPANIC_DUMP_LIMIT=0` skips) to keep real 115200-baud UARTs bounded.
+- **Live dump progress**: `Beginning dump of physical memory...` / `Dumping physical memory: NNN %` (in-place `\r` refresh every 64 KiB on both text backends) / `Physical memory dump complete.`; skipped cleanly with an on-screen notice when no usable-RAM snapshot exists.
+- **`tools/panic_screenshot.py`**: boots the ISO, triggers `painme`, waits for the dump to finish (TCG polled-UART throughput is ~0.25 MB/s), grabs a QEMU monitor screendump and converts PPM→PNG in pure Python — visual regression checks for the stop screen without extra host dependencies.
+
+### File Changes
+- `src/kernel/mm/memory.c`: BSOD layout, `pmm_usable[]` boot-map snapshot, `panic_dump_memory()` + progress display
+- `src/kernel/drivers/fb.c`, `include/drivers/fb.h`: `fb_set_bg_color()`
+- `tools/panic_screenshot.py`: new screenshot verification tool
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [3.4.0] - 2026-09-25
 Third wired NIC driver: **RTL8111F** (Realtek RTL8168/8111 PCIe Gigabit family, `10EC:8168`) for the physical machine's on-board Ethernet.
 

@@ -44,6 +44,10 @@ void fb_set_color(uint8_t ega_index) {
     fg_rgb = ega_rgb[ega_index & 0x0F];
 }
 
+void fb_set_bg_color(uint8_t ega_index) {
+    bg_rgb = ega_rgb[ega_index & 0x0F];
+}
+
 void fb_set_info(uint64_t base, uint32_t pitch, uint32_t w, uint32_t h,
                  int rgbx) {
     fb     = (uint32_t*)(uint64_t)base;
