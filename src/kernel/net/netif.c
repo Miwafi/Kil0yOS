@@ -1,6 +1,7 @@
 #include "net/netif.h"
 #include "net/ethernet.h"
 #include "net/rtl8139.h"
+#include "net/rtl8111.h"
 #include "net/e1000.h"
 #include "drivers/pci.h"
 #include "drivers/vga.h"
@@ -67,6 +68,9 @@ const char* netif_probe(void) {
          * silently rejects a NIC we fully support. */
         if (dev->vendor_id == 0x10EC && dev->device_id == 0x8139) {
             if (rtl8139_init() == 0) drv = "RTL8139";
+        } else if (dev->vendor_id == 0x10EC && dev->device_id == 0x8168) {
+            /* RTL8111F / RTL8168 / 8411 family */
+            if (rtl8111_init() == 0) drv = "RTL8111";
         } else if (dev->vendor_id == 0x8086 &&
                    (dev->device_id == 0x100E || dev->device_id == 0x100F ||
                     dev->device_id == 0x10D3 || dev->device_id == 0x10F6)) {

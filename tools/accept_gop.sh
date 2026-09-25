@@ -54,7 +54,7 @@ QPID=$!
 check "$TDIR/serial_gop_uefi.log" "gop_ok" "gop_ok mode=1024x768x32" 60 || true
 check "$TDIR/serial_gop_uefi.log" "ebs_ok" "ebs_ok" 30 || true
 check "$TDIR/serial_gop_uefi.log" "pmm_efi" "PMM: using EFI memory map fallback" 30 || true
-check "$TDIR/serial_gop_uefi.log" "version" "Kil0yOS version 3.3.0" 30 || true
+check "$TDIR/serial_gop_uefi.log" "version" "Kil0yOS version 3.4.0" 30 || true
 
 echo "--- 2) fb visual: screendump ---"
 sleep 4
@@ -104,7 +104,7 @@ qemu-system-x86_64 -cdrom build/kil0yos.iso -m 512M -display none \
 QPID2=$!
 
 check "$TDIR/serial_gop_bios.log" "no_efi_st" "no EFI ST" 60 || true
-check "$TDIR/serial_gop_bios.log" "bios_version" "Kil0yOS version 3.3.0" 30 || true
+check "$TDIR/serial_gop_bios.log" "bios_version" "Kil0yOS version 3.4.0" 30 || true
 
 sleep 3
 kill "$QPID2" 2>/dev/null

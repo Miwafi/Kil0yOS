@@ -91,6 +91,7 @@ NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
            $(SRCDIR)/kernel/net/dhcp.c \
            $(SRCDIR)/kernel/net/tftp.c \
            $(SRCDIR)/kernel/net/rtl8139.c \
+           $(SRCDIR)/kernel/net/rtl8111.c \
            $(SRCDIR)/kernel/net/e1000.c
 
 # --- USB (UHCI + core + HID) ---

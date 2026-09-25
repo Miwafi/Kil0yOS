@@ -2,6 +2,21 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.4.0] - 2026-09-25
+Third wired NIC driver: **RTL8111F** (Realtek RTL8168/8111 PCIe Gigabit family, `10EC:8168`) for the physical machine's on-board Ethernet.
+
+### Added
+- **RTL8111/RTL8168 driver (`net/rtl8111.c`)**: MMIO BAR0 (64-bit BAR parsed the e1000 way), ChipCmd soft reset, 16-byte TX/RX descriptor rings (16 entries each, 2 KB per-frame buffers, 256-byte aligned bases via `kcalloc` + `vmm_get_phys`). TX is a single-fragment `FS|LS` descriptor kicked with `NPQ`, completion polled on the Own bit (bounded, failure propagates through `netif_send`); RX drains up to 32 frames per poll with error/RUNT/CRC drops and FCS stripping. The init sequence mirrors Linux r8169's `rtl_hw_start_8168f` + `rtl_hw_start_8168f_1` for the 8111F generation: ERI register workarounds (FIFO sizing, packet-filter reset, ASPM entry latency), the `e_info_8168f_1` EPHY patch table through the EPHYAR channel, `EarlySize` TX threshold, `AUTO_FIFO` TxConfig, and `RX128_INT_EN|RX_MULTI_EN` RxConfig.
+- **ASPM/CLKREQ kept off everywhere**: chip-side Config2/Config5 bits cleared, plus a PCI capability-list walk clearing ASPM L0s/L1 and Clock Request in the PCIe Link Control register — r8169 documents ASPM as a typical cause of tx timeouts / dead devices on this family.
+- **`netif_probe` match**: `10EC:8168` (RTL8111F/8168/8411 family) → `rtl8111_init()`, driver name "RTL8111"; VID:DID matching per project rule.
+- Chip version (`(TxConfig>>20)&0xfcf`, 0x480/0x481 = RTL8111F) and link status (PHYstatus 1000M/100M/10M) logged to the serial klog as `[rtl8111]` lines.
+
+### File Changes
+- `include/net/rtl8111.h`, `src/kernel/net/rtl8111.c`: new driver module
+- `src/kernel/net/netif.c`: `10EC:8168` probe match
+- `Makefile`: new net source file
+- `CHANGELOG.md`, version strings (`core/main.c`, `shell/shell.c`, `core/syscall_lnx.c`, `tools/accept_gop.sh`)
+
 ## [3.3.0] - 2026-09-22
 The NMI watchdog closes the kwatchdog's blind spot: a kernel main task wedged inside a **cli'd loop** freezes IRQ0 (so no thread can run) but cannot stop an **NMI**.
 
