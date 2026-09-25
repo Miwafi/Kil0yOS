@@ -4,7 +4,7 @@
 #include "lib/types.h"
 
 /* Thin streaming wrapper around the vendored minimp3 decoder
- * (include/drivers/minimp3.h, MIT - see file header). The whole file is
+ * (include/drivers/audio/minimp3.h, MIT - see file header). The whole file is
  * expected to stay in memory; every mp3_decode() call yields one MPEG
  * audio frame (1152 samples per channel for Layer III, interleaved L/R).
  *

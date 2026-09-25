@@ -1,9 +1,9 @@
 #include "core/syscall.h"
 #include "core/syscall_lnx.h"
 #include "core/process.h"
-#include "drivers/vga.h"
-#include "drivers/fb.h"
-#include "drivers/keyboard.h"
+#include "drivers/video/vga.h"
+#include "drivers/video/fb.h"
+#include "drivers/input/keyboard.h"
 #include "lib/string.h"
 
 /* System call handler table */

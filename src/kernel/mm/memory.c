@@ -3,9 +3,9 @@
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "drivers/io.h"
-#include "drivers/vga.h"
-#include "drivers/fb.h"
-#include "drivers/efi_gop.h"
+#include "drivers/video/vga.h"
+#include "drivers/video/fb.h"
+#include "drivers/video/efi_gop.h"
 #include "core/interrupts.h"
 #include "timer/pit.h"
 

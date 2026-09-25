@@ -1,10 +1,10 @@
 #include "shell/shell.h"
 #include "shell/terminal.h"
-#include "drivers/vga.h"
-#include "drivers/fb.h"
-#include "drivers/efi_gop.h"
-#include "drivers/keyboard.h"
-#include "drivers/mouse.h"
+#include "drivers/video/vga.h"
+#include "drivers/video/fb.h"
+#include "drivers/video/efi_gop.h"
+#include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "fs/fs.h"
@@ -26,9 +26,9 @@
 #include "pkg/dpkg.h"
 #include "pkg/kilget.h"
 #include "usb/usb.h"
-#include "drivers/jpeg.h"
-#include "drivers/audio.h"
-#include "drivers/mp3.h"
+#include "drivers/video/jpeg.h"
+#include "drivers/audio/audio.h"
+#include "drivers/audio/mp3.h"
 
 /* Redirect VGA output calls inside command handlers to the active terminal */
 #define vga_puts      term_puts
@@ -454,7 +454,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.5.0\n");
+    vga_puts("Kil0yOS v3.5.1\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -2309,7 +2309,7 @@ static void desktop_draw_chrome(void) {
     /* top header bar */
     dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
     dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v3.5.0", 0x00);
+    dt_draw_string(4, title_y, "Kil0yOS v3.5.1", 0x00);
     dt_draw_string(dt_w - 148, title_y, "[Win]=Menu  F1-F4", 0x01);
 
     /* left function panel */

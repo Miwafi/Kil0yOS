@@ -5,7 +5,7 @@
 #include "timer/pit.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define DNS_SERVER_PORT 53
 #define DNS_QUERY       0x0100u   /* RD=1 */

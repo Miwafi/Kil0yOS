@@ -23,7 +23,7 @@
 #include "timer/pit.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define USB_CTRL_TIMEOUT_MS 250
 #define UHCI_TD_COUNT 24

@@ -1,4 +1,4 @@
-#include "net/rtl8139.h"
+#include "net/realtek/rtl8139.h"
 #include "net/netif.h"
 #include "drivers/pci.h"
 #include "drivers/io.h"

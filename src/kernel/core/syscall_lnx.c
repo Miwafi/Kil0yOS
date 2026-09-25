@@ -7,8 +7,8 @@
 #include "timer/pit.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
-#include "drivers/vga.h"
-#include "drivers/keyboard.h"
+#include "drivers/video/vga.h"
+#include "drivers/input/keyboard.h"
 #include "drivers/io.h"
 #include "core/tty.h"
 #include "core/lnxvfs.h"
@@ -1414,7 +1414,7 @@ static uint64_t sc_uname(uint64_t buf,
     memset(u, 0, sizeof(*u));
     strcpy(u->v[0], "Kil0yOS");
     strcpy(u->v[1], "kil0yos");
-    strcpy(u->v[2], "3.5.0");
+    strcpy(u->v[2], "3.5.1");
     strcpy(u->v[3], "#1 SMP Kil0yOS Phase 1");
     strcpy(u->v[4], "x86_64");
     strcpy(u->v[5], "");

@@ -26,7 +26,7 @@
 #include "timer/pit.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define USB_TICKS_PER_POLL 100      /* IRQ0 @100Hz -> poll ports ~1s */
 

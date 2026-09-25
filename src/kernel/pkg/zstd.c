@@ -19,7 +19,7 @@
 #include "pkg/zstd.h"
 #include "lib/string.h"
 #include "mm/memory.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #ifdef ZSTD_KTEST
 #include <stdio.h>

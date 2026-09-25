@@ -1,5 +1,5 @@
-#include "drivers/vga.h"
-#include "drivers/fb.h"
+#include "drivers/video/vga.h"
+#include "drivers/video/fb.h"
 #include "drivers/io.h"
 #include "gfx/88front.h"
 

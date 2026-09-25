@@ -15,7 +15,7 @@
  * (int64 accumulators), +-1 lsb quality vs float at a fraction of the
  * code complexity of jidctint-style butterflies. */
 
-#include "drivers/jpeg.h"
+#include "drivers/video/jpeg.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 

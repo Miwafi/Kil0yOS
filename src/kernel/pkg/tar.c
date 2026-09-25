@@ -3,7 +3,7 @@
 #include "pkg/tar.h"
 #include "lib/string.h"
 #include "fs/fs.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "mm/memory.h"
 #include "sched/scheduler.h"
 

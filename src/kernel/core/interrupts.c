@@ -1,7 +1,7 @@
 #include "core/interrupts.h"
 #include "drivers/io.h"
-#include "drivers/keyboard.h"
-#include "drivers/vga.h"
+#include "drivers/input/keyboard.h"
+#include "drivers/video/vga.h"
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA    0x21

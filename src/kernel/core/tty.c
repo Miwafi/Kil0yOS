@@ -1,6 +1,6 @@
 #include "core/tty.h"
-#include "drivers/keyboard.h"
-#include "drivers/vga.h"
+#include "drivers/input/keyboard.h"
+#include "drivers/video/vga.h"
 #include "drivers/io.h"
 
 /* Line being composed; committed lines queue here for readers */

@@ -11,8 +11,8 @@
  * SetMode=0x08, Mode=0x18; MODE: Info=0x08, FrameBufferBase=0x18,
  * FrameBufferSize=0x20).
  */
-#include "drivers/efi_gop.h"
-#include "drivers/fb.h"
+#include "drivers/video/efi_gop.h"
+#include "drivers/video/fb.h"
 #include "drivers/io.h"
 #include "lib/string.h"
 

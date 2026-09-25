@@ -1,7 +1,7 @@
 #include "core/uvm.h"
 #include "mm/memory.h"
 #include "lib/string.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 /* PTE attribute bits for a user protection set. Non-executable writable
  * pages get NX so stray jumps into data fault immediately. */

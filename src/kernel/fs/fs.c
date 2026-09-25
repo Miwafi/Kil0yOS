@@ -4,7 +4,7 @@
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "drivers/disk.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 static fat32_boot_sector_t boot_sector;
 static uint8_t* fat_buffer;

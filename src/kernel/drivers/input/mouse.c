@@ -1,7 +1,7 @@
-#include "drivers/mouse.h"
+#include "drivers/input/mouse.h"
 #include "drivers/io.h"
 #include "core/interrupts.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define MOUSE_DATA_PORT    0x60
 #define MOUSE_STATUS_PORT  0x64

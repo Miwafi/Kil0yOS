@@ -32,23 +32,23 @@ CORE_SRCS = $(SRCDIR)/kernel/core/main.c \
 # --- Memory Management ---
 MM_SRCS = $(SRCDIR)/kernel/mm/memory.c
 
-# --- Device Drivers ---
-DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/vga.c \
-               $(SRCDIR)/kernel/drivers/keyboard.c \
-               $(SRCDIR)/kernel/drivers/mouse.c \
+# --- Device Drivers (by function: video/ input/ audio/, rest on the root) ---
+DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/video/vga.c \
+               $(SRCDIR)/kernel/drivers/input/keyboard.c \
+               $(SRCDIR)/kernel/drivers/input/mouse.c \
                $(SRCDIR)/kernel/drivers/disk.c \
                $(SRCDIR)/kernel/drivers/device.c \
                $(SRCDIR)/kernel/drivers/power.c \
                $(SRCDIR)/kernel/drivers/pci.c \
                $(SRCDIR)/kernel/drivers/rtc.c \
                $(SRCDIR)/kernel/drivers/speaker.c \
-               $(SRCDIR)/kernel/drivers/efi_gop.c \
-               $(SRCDIR)/kernel/drivers/fb.c \
-               $(SRCDIR)/kernel/drivers/jpeg.c \
-               $(SRCDIR)/kernel/drivers/audio.c \
-               $(SRCDIR)/kernel/drivers/ac97.c \
-               $(SRCDIR)/kernel/drivers/hda.c \
-               $(SRCDIR)/kernel/drivers/mp3.c
+               $(SRCDIR)/kernel/drivers/video/efi_gop.c \
+               $(SRCDIR)/kernel/drivers/video/fb.c \
+               $(SRCDIR)/kernel/drivers/video/jpeg.c \
+               $(SRCDIR)/kernel/drivers/audio/audio.c \
+               $(SRCDIR)/kernel/drivers/audio/ac97.c \
+               $(SRCDIR)/kernel/drivers/audio/hda.c \
+               $(SRCDIR)/kernel/drivers/audio/mp3.c
 
 # --- Filesystem ---
 FS_SRCS = $(SRCDIR)/kernel/fs/fs.c \
@@ -90,9 +90,9 @@ NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
            $(SRCDIR)/kernel/net/http.c \
            $(SRCDIR)/kernel/net/dhcp.c \
            $(SRCDIR)/kernel/net/tftp.c \
-           $(SRCDIR)/kernel/net/rtl8139.c \
-           $(SRCDIR)/kernel/net/rtl8111.c \
-           $(SRCDIR)/kernel/net/e1000.c
+           $(SRCDIR)/kernel/net/realtek/rtl8139.c \
+           $(SRCDIR)/kernel/net/realtek/rtl8111.c \
+           $(SRCDIR)/kernel/net/intel/e1000.c
 
 # --- USB (UHCI + core + HID) ---
 USB_SRCS = $(SRCDIR)/kernel/usb/usb.c \
@@ -295,7 +295,7 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 # so this one translation unit must be built with SSE even though the rest
 # of the kernel is -mno-sse. mp3.c saves/restores the live FPU/SSE state and
 # masks interrupts around every decode, so no other context ever sees it.
-$(BUILDDIR)/kernel/drivers/mp3.o: $(SRCDIR)/kernel/drivers/mp3.c
+$(BUILDDIR)/kernel/drivers/audio/mp3.o: $(SRCDIR)/kernel/drivers/audio/mp3.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -msse -msse2 -mmmx -c $< -o $@
 

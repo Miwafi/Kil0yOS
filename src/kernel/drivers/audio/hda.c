@@ -28,7 +28,7 @@ static void pit_delay_ms(uint32_t ms) { (void)ms; }
 #else
 #include "drivers/io.h"
 #include "drivers/pci.h"
-#include "drivers/hda.h"
+#include "drivers/audio/hda.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"

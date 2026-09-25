@@ -15,7 +15,7 @@
 #include "fs/fs.h"
 #include "mm/memory.h"
 #include "shell/terminal.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define DPKG_DIR     "/var/lib/dpkg"
 #define DPKG_INFO    DPKG_DIR "/info"

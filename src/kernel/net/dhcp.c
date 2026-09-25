@@ -3,7 +3,7 @@
 #include "net/ipv4.h"
 #include "timer/pit.h"
 #include "lib/string.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "mm/memory.h"
 #define DHCP_BOOT_REQUEST  1
 #define DHCP_BOOT_REPLY    2

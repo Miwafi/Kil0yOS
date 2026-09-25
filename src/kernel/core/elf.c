@@ -2,7 +2,7 @@
 #include "core/uvm.h"
 #include "mm/memory.h"
 #include "lib/string.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 /* --- Minimal ELF64 structures (little-endian, x86-64) ---------------- */
 

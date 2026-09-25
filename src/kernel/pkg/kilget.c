@@ -11,7 +11,7 @@
 #include "fs/fs.h"
 #include "mm/memory.h"
 #include "shell/terminal.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define KILGET_INDEX   "/var/lib/kilget/Packages"
 #define KILGET_SOURCES "/etc/kilget/sources.list"

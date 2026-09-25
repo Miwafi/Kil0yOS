@@ -4,7 +4,7 @@
 /* Intel High Definition Audio (class 0x0403) controller + codec backend.
  * Covers the Realtek ALC family (vendor 0x10EC) and any other HDA codec with
  * a discoverable DAC -> pin path. The public entry points live in
- * drivers/audio.h; drivers/audio.c picks between this and AC'97. */
+ * drivers/audio/audio.h; drivers/audio.c picks between this and AC'97. */
 #include "lib/types.h"
 
 int  hda_init(void);                             /* probe PCI, reset, enumerate codec */

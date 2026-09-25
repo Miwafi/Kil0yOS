@@ -12,11 +12,11 @@
  * rtl8139.c (netif hookups, IRQ-in-handler EOI, polling fallback).
  */
 
-#include "net/rtl8111.h"
+#include "net/realtek/rtl8111.h"
 #include "net/netif.h"
 #include "drivers/pci.h"
 #include "drivers/io.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "mm/memory.h"
 #include "core/interrupts.h"
 #include "core/isr.h"

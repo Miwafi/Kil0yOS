@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include "drivers/io.h"
 #include "drivers/pci.h"
-#include "drivers/ac97.h"
+#include "drivers/audio/ac97.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 

@@ -1,4 +1,4 @@
-/* MP3 streaming facade over minimp3 (include/drivers/minimp3.h).
+/* MP3 streaming facade over minimp3 (include/drivers/audio/minimp3.h).
  * The decoder state (~10 KB of float scratch) is heap-allocated because
  * kernel stacks are small; the caller keeps the file buffer alive for the
  * lifetime of the handle (bit reservoir reads run backwards into previous
@@ -8,8 +8,8 @@
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_ONLY_MP3
 #define MINIMP3_KERNEL
-#include "drivers/minimp3.h"
-#include "drivers/mp3.h"
+#include "drivers/audio/minimp3.h"
+#include "drivers/audio/mp3.h"
 #include "mm/memory.h"
 
 /* The kernel is -mno-sse everywhere except this file, so the decoder is the

@@ -1,5 +1,5 @@
 #include "drivers/pci.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "drivers/io.h"
 #include "mm/memory.h"
 #include "lib/stdlib.h"

@@ -9,12 +9,12 @@
  * drains and discards); unbinding restores it.
  */
 #include "usb/usb.h"
-#include "drivers/keyboard.h"
-#include "drivers/mouse.h"
+#include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
 #include "timer/pit.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 /* HID usage ID -> set-1 make scancode.  Bit 7 marks extended keys
  * (delivered as keyboard_feed_scancode(sc, 1)). */

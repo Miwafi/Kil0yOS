@@ -10,7 +10,7 @@
 #include "fs/fs.h"
 #include "pkg/zstd.h"
 #include "timer/pit.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 /* Process table */
 static process_t processes[MAX_PROCESSES];

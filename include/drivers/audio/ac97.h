@@ -2,7 +2,7 @@
 #define AC97_H
 
 /* Intel ICH AC'97 bus-master backend. The public entry points live in
- * drivers/audio.h; drivers/audio.c picks between this and HDA. */
+ * drivers/audio/audio.h; drivers/audio.c picks between this and HDA. */
 #include "lib/types.h"
 
 int  ac97_init(void);                            /* probe PCI + cold reset; -1 = none */

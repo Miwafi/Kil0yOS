@@ -14,7 +14,7 @@
 #include "net/udp.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define TFTP_RRQ   1
 #define TFTP_DATA  3

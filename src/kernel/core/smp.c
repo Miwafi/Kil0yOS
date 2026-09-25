@@ -3,7 +3,7 @@
 #include "core/idt.h"
 #include "core/interrupts.h"
 #include "drivers/power.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "drivers/io.h"
 #include "mm/memory.h"
 #include "timer/pit.h"

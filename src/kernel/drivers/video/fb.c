@@ -4,8 +4,8 @@
  * boot page tables for the first 4 GiB).  All entry points are inert until
  * fb_set_info() runs from efi_gop_init, so BIOS boots never touch this
  * code and the legacy VGA terminal stays the only display. */
-#include "drivers/fb.h"
-#include "drivers/vga.h"
+#include "drivers/video/fb.h"
+#include "drivers/video/vga.h"
 #include "gfx/88front.h"
 #include "lib/string.h"
 

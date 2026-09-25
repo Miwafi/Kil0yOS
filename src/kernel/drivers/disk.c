@@ -2,7 +2,7 @@
 #include "drivers/io.h"
 #include "drivers/device.h"
 #include "drivers/pci.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 

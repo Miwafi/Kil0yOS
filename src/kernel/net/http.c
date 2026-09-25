@@ -8,7 +8,7 @@
 #include "fs/fs.h"
 #include "mm/memory.h"
 #include "timer/pit.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 #define HTTP_TIMEOUT_MS 20000
 #define HTTP_MAX_BODY   (8 * 1024 * 1024)

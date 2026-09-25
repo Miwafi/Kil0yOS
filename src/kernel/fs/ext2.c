@@ -1,7 +1,7 @@
 #include "fs/ext2.h"
 #include "fs/fs.h"
 #include "drivers/disk.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "mm/memory.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"

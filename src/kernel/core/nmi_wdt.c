@@ -4,7 +4,7 @@
 #include "sched/scheduler.h"
 #include "timer/pit.h"
 #include "mm/memory.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
 

@@ -1,10 +1,10 @@
 #include "net/netif.h"
 #include "net/ethernet.h"
-#include "net/rtl8139.h"
-#include "net/rtl8111.h"
-#include "net/e1000.h"
+#include "net/realtek/rtl8139.h"
+#include "net/realtek/rtl8111.h"
+#include "net/intel/e1000.h"
 #include "drivers/pci.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 
 netif_t g_netif;
 

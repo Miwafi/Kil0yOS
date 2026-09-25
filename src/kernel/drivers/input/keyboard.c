@@ -1,9 +1,9 @@
-#include "drivers/keyboard.h"
+#include "drivers/input/keyboard.h"
 #include "drivers/io.h"
 #include "core/isr.h"
 #include "core/interrupts.h"
 #include "drivers/device.h"
-#include "drivers/vga.h"
+#include "drivers/video/vga.h"
 #include "sched/scheduler.h"
 
 #define BUFFER_SIZE 256

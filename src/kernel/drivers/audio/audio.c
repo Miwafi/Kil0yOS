@@ -1,9 +1,9 @@
 /* Audio front-end: picks a playback backend once (HDA first, then AC'97)
- * and forwards the drivers/audio.h API to it, so callers never care which
+ * and forwards the drivers/audio/audio.h API to it, so callers never care which
  * controller the machine has. */
-#include "drivers/audio.h"
-#include "drivers/ac97.h"
-#include "drivers/hda.h"
+#include "drivers/audio/audio.h"
+#include "drivers/audio/ac97.h"
+#include "drivers/audio/hda.h"
 #include "lib/string.h"
 
 extern void klog(const char* s);

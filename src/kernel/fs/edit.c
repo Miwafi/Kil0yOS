@@ -1,6 +1,6 @@
 #include "fs/edit.h"
-#include "drivers/vga.h"
-#include "drivers/keyboard.h"
+#include "drivers/video/vga.h"
+#include "drivers/input/keyboard.h"
 #include "lib/string.h"
 #include "mm/memory.h"
 #include "fs/fs.h"

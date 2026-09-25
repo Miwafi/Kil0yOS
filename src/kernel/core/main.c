@@ -7,11 +7,11 @@
 #include "core/tss.h"
 #include "core/process.h"
 #include "mm/memory.h"
-#include "drivers/vga.h"
-#include "drivers/fb.h"
-#include "drivers/efi_gop.h"
-#include "drivers/keyboard.h"
-#include "drivers/mouse.h"
+#include "drivers/video/vga.h"
+#include "drivers/video/fb.h"
+#include "drivers/video/efi_gop.h"
+#include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
 #include "drivers/pci.h"
 #include "drivers/power.h"
 #include "drivers/speaker.h"
@@ -21,8 +21,8 @@
 #include "timer/pit.h"
 #include "sched/scheduler.h"
 #include "net/netif.h"
-#include "net/rtl8139.h"
-#include "net/e1000.h"
+#include "net/realtek/rtl8139.h"
+#include "net/intel/e1000.h"
 #include "net/arp.h"
 #include "net/udp.h"
 #include "net/tcp.h"
@@ -163,7 +163,7 @@ void kernel_main(uint64_t mb_info_phys) {
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 3.5.0\n");
+    klog("Kil0yOS version 3.5.1\n");
     klog("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 

@@ -2,6 +2,18 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.5.1] - 2026-09-26
+Internal reorganization — no functional changes. Source tree now groups files by vendor and function; the `include/` tree still mirrors `src/kernel/` 1:1.
+
+### Changed
+- **NIC drivers grouped by vendor (品牌分区)**: `net/rtl8139.c`, `net/rtl8111.c` → `net/realtek/`; `net/e1000.c` → `net/intel/`. The protocol stack (arp/ipv4/tcp/udp/icmp/dhcp/dns/http/tftp/ethernet/netif) stays on the `net/` root. Same split applied to `include/net/`.
+- **drivers split by function (功能分区)**: `drivers/audio/` (ac97, audio, hda, mp3 + header-only minimp3), `drivers/video/` (vga, fb, efi_gop, jpeg), `drivers/input/` (keyboard, mouse). Bus/storage/power drivers (device, disk, io, pci, power, rtc, speaker) stay on the `drivers/` root. Same split applied to `include/drivers/`.
+- All `#include` paths updated to the new subpaths (e.g. `#include "drivers/video/vga.h"`, `#include "net/realtek/rtl8139.h"`); the old flat paths no longer exist.
+- **Makefile synced**: `DRIVERS_SRCS` / `NET_SRCS` point at the new locations; the mp3 SSE special rule moved to `$(BUILDDIR)/kernel/drivers/audio/mp3.o` — the generic `%.o: $(SRCDIR)/%.c` pattern rule covers everything else.
+
+### File Changes
+- 27 files moved with `git mv` (history preserved); 80+ include paths rewritten; `Makefile`, `CHANGELOG.md`, version strings
+
 ## [3.5.0] - 2026-09-26
 The panic screen becomes a classic **Windows-style blue stop screen** — and the memory dump it promises is real: usable-RAM content is hex-dumped to the serial log while a live percentage counter runs on the blue field.
 
