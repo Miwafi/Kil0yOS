@@ -20,7 +20,7 @@ The `8139compat` demo is replaced by the **real upstream Linux 8139too driver**,
 - `src/kernel/compat/drivers/rtl8139_compat.c` (the 3.6.0 demo driver; superseded by the real 8139too port).
 
 ### File Changes
-- 36 files: 8139too.c ported + 13 new compat headers, io.h volatile fix, linker.ld initcall fix, compat.c/netif.c/stdlib.c adjustments, version strings
+- 33 files: 8139too.c ported + 13 new compat headers, io.h volatile fix, linker.ld initcall fix, compat.c/netif.c/stdlib.c adjustments, version strings
 
 ## [3.6.0] - 2026-09-28
 ### Added
