@@ -110,7 +110,18 @@ KERNEL_SRCS = $(CORE_SRCS) \
               $(SCHED_SRCS) \
               $(TIMER_SRCS) \
               $(NET_SRCS) \
+              $(COMPAT_NET_SRCS) \
               $(USB_SRCS)
+
+# --- Linux NIC driver compatibility layer (build with COMPAT_NET=1) ---
+# When enabled, netif_probe() dispatches to Linux-style drivers under
+# src/kernel/compat/ instead of the native drivers in src/kernel/net/.
+COMPAT_NET_SRCS =
+ifeq ($(COMPAT_NET),1)
+CFLAGS += -DCOMPAT_NET
+COMPAT_NET_SRCS = $(SRCDIR)/kernel/compat/linux/compat.c \
+                  $(SRCDIR)/kernel/compat/drivers/rtl8139_compat.c
+endif
 
 KERNEL_OBJS = $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(KERNEL_SRCS))
 KERNEL_ASM_OBJS = $(BUILDDIR)/kernel/core/isr_asm.o

@@ -2,6 +2,19 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.6.0] - 2026-09-28
+### Added
+- **Linux NIC driver compatibility layer** (`make COMPAT_NET=1`): Linux-kernel-style header tree (`include/linux/`: types, kernel, module, pci, io, slab/dma/delay, interrupt, netdevice/skbuff, etherdevice) plus a runtime shim (`src/kernel/compat/linux/compat.c`) so Linux NIC driver source can be compiled into the kernel nearly as-is. The shim provides `printk`, `kmalloc`/GFP bridges, `ioremap`/`readl`/`writel`, `pci_register_driver` (id-table matching over the enumerated PCI list, BAR size probing, `pci_ioremap_bar`), `request_irq` (trampoline auto-sends the PIC EOI), `sk_buff` + `netif_rx` (feeds the existing protocol stack), and `register_netdev` (binds `ndo_start_xmit` to the kernel netif).
+- **Driver initcalls**: `module_init()` drops an entry into a `.compat_initcall` linker section (`linker.ld` gained `KEEP` + `__compat_initcall_start/end`); `compat_initcalls()` runs drivers after PCI enumeration — the same contract as Linux built-in drivers, multiple drivers supported.
+- **Demo driver `8139compat`** (`src/kernel/compat/drivers/rtl8139_compat.c`): a functional transplant of 8139too's data path (MMIO BAR1, 64 KiB RX ring, 4 TX descriptors, IRQ + main-loop `poll_hook` RX drain). **End-to-end verified in QEMU: full DHCP handshake (DISCOVER → OFFER → REQUEST → ACK, `net: DHCP ok`) using the Linux-style driver.**
+- `netif_probe()` dispatches to the compat layer when `COMPAT_NET` is defined, so the Linux-style driver and the native drivers are mutually exclusive per build (default build unchanged, regression-verified).
+
+### Fixed
+- Seven hardware/API mismatches surfaced while bringing the demo driver up, all documented for future real-driver ports: missing `pic_enable_irq` after `register_irq_handler` (IRQ stays masked), DMA bus addresses must go through `vmm_get_phys` (heap VA ≠ bus address), `skb_put` must advance the tail (not `data`), `TSD_OWN` is bit31 (bit13 is TOK), RX ring advance = `wire_len + header` padded to 4, RCR ring-size bits must match `RX_BUF_LEN_IDX`, and `poll_hook` main-loop drain is the reliable receive path.
+
+### File Changes
+- 21 files: +948/-9 (13 new `include/linux/` headers, `compat.c`, `rtl8139_compat.c`, `linker.ld`, `netif.c`, `Makefile`, `CHANGELOG.md`, version strings)
+
 ## [3.5.1] - 2026-09-26
 Internal reorganization — no functional changes. Source tree now groups files by vendor and function; the `include/` tree still mirrors `src/kernel/` 1:1.
 

@@ -19,6 +19,14 @@ SECTIONS {
         *(.data)
     }
 
+    /* Linux driver initcalls (module_init compat) */
+    . = ALIGN(8);
+    __compat_initcall_start = .;
+    .compat_initcall : {
+        KEEP(*(.compat_initcall))
+    }
+    __compat_initcall_end = .;
+
     .bss : {
         *(.bss)
     }

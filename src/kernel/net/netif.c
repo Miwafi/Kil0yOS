@@ -60,6 +60,13 @@ uint32_t netif_get_ip(void) {
 }
 
 const char* netif_probe(void) {
+#ifdef COMPAT_NET
+    /* Linux-driver compat layer: module_init drivers probe via the
+     * compat PCI core and register into g_netid themselves. */
+    extern void compat_initcalls(void);
+    compat_initcalls();
+    return g_netif.send ? "8139compat(Linux)" : NULL;
+#endif
     pci_device_t* dev = pci_get_device_list();
     while (dev) {
         const char* drv = NULL;
