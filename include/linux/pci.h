@@ -47,9 +47,26 @@ struct pci_device_id {
     .vendor = (vend), .device = (dev), \
     .subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID
 
+/* subsystem match: vendor/device + subsystem ids */
+#define PCI_DEVICE_SUB(vend, dev, svend, sdev)  \
+    .vendor = (vend), .device = (dev),          \
+    .subvendor = (svend), .subdevice = (sdev)
+
+#define PCI_DEVICE_ID_REALTEK_8139 0x8139
+#define PCI_VENDOR_ID_ATHEROS      0x168C
+
+#define PCI_STATUS 0x06
+
+/* Minimal struct device so drivers can pass &pdev->dev to the DMA and
+ * printk helpers; the compat core reads back the owning pci_dev. */
+struct device {
+    void* drvdata;
+};
+
 struct pci_dev {
     struct pci_device* core;    /* underlying Kil0yOS device node */
     __u16 vendor, device;
+    __u16 subsystem_vendor, subsystem_device;
     __u8  irq;                  /* interrupt line */
     __u8  revision;
     __u32 class;
@@ -59,6 +76,8 @@ struct pci_dev {
     unsigned long resource_len[6];
     int   resource_flags[6];    /* IORESOURCE_IO / IORESOURCE_MEM */
     void* priv;                 /* driver may reuse for convenience */
+    struct device dev;          /* embedded device for DMA/printk glue */
+    void* drvdata;              /* pci_set_drvdata / pci_get_drvdata */
 };
 
 #define IORESOURCE_IO  0x00000100
@@ -68,15 +87,32 @@ struct pci_dev {
 #define PCI_IRQ_MSI    0x2
 #define PCI_IRQ_INTX   0x4
 
+struct dev_pm_ops {
+    int (*suspend)(struct device* dev);
+    int (*resume)(struct device* dev);
+};
+
 struct pci_driver {
     const char* name;
     const struct pci_device_id* id_table;
     int (*probe)(struct pci_dev* dev, const struct pci_device_id* id);
     void (*remove)(struct pci_dev* dev);
-    int  (*suspend)(struct pci_dev* dev);
-    int  (*resume)(struct pci_dev* dev);
+    struct {
+        const struct dev_pm_ops* pm;
+    } driver;
     struct list_head node;
 };
+
+/* Built-in PCI driver: register on module_init, unregister on exit. */
+#define module_pci_driver(pci_driver)                                   \
+    static int __init pci_driver##_init(void)                           \
+    { return pci_register_driver(&(pci_driver)); }                      \
+    module_init(pci_driver##_init)
+
+#define SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn)                  \
+    const struct dev_pm_ops name __maybe_unused = {                     \
+        .suspend = suspend_fn, .resume = resume_fn,                     \
+    }
 
 int  pci_register_driver(struct pci_driver* drv);
 void pci_unregister_driver(struct pci_driver* drv);
@@ -92,6 +128,35 @@ void pci_set_master(struct pci_dev* dev);
 
 void __iomem* pci_ioremap_bar(struct pci_dev* dev, int bar);
 int pci_request_regions(struct pci_dev* dev, const char* name);
+void pci_release_regions(struct pci_dev* dev);
 void pci_disable_device(struct pci_dev* dev);
+
+/* pci_iomap: MMIO bars map through ioremap, PIO bars return the raw
+ * port base (PIO accessors are not used by drivers on this platform). */
+static inline void __iomem* pci_iomap(struct pci_dev* dev, int bar, unsigned long max) {
+    (void)max;
+    if (dev->resource_flags[bar] & IORESOURCE_MEM)
+        return pci_ioremap_bar(dev, bar);
+    if (dev->resource_flags[bar] & IORESOURCE_IO)
+        return (void __iomem*)dev->resource_start[bar];
+    return 0;
+}
+static inline void pci_iounmap(struct pci_dev* dev, void __iomem* addr) {
+    (void)dev;
+    iounmap(addr);
+}
+
+int  pci_read_config_word(struct pci_dev* dev, int where, __u16* val);
+int  pci_write_config_word(struct pci_dev* dev, int where, __u16 val);
+
+static inline void pci_set_drvdata(struct pci_dev* pdev, void* data) { pdev->drvdata = data; }
+static inline void* pci_get_drvdata(struct pci_dev* pdev) { return pdev->drvdata; }
+static inline void dev_set_drvdata(struct device* dev, void* data) { dev->drvdata = data; }
+static inline void* dev_get_drvdata(struct device* dev) { return dev->drvdata; }
+
+static inline const char* pci_name(const struct pci_dev* pdev) {
+    (void)pdev;
+    return "pci";
+}
 
 #endif /* _COMPAT_LINUX_PCI_H */

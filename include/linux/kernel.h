@@ -21,6 +21,34 @@
 
 int printk(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* pr_fmt: drivers may #define it before including kernel.h (8139too
+ * uses KBUILD_MODNAME). pr_debug is compiled out like netdev_dbg. */
+#ifndef pr_fmt
+#define pr_fmt(fmt) fmt
+#endif
+#define pr_emerg(fmt, ...)  printk(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_alert(fmt, ...)  printk(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_crit(fmt, ...)   printk(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_err(fmt, ...)    printk(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_warn(fmt, ...)   printk(KERN_WARNING pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_warning(fmt, ...) printk(KERN_WARNING pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_notice(fmt, ...) printk(KERN_NOTICE pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_info(fmt, ...)   printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_cont(fmt, ...)   printk(KERN_CONT fmt, ##__VA_ARGS__)
+#define pr_debug(fmt, ...)  do { } while (0)
+#define pr_devel(fmt, ...)  do { } while (0)
+
+/* device printk helpers: the struct device argument is dropped, the
+ * message text carries the context already */
+#define dev_emerg(dev, fmt, ...)  printk(KERN_ERR fmt, ##__VA_ARGS__)
+#define dev_crit(dev, fmt, ...)   printk(KERN_ERR fmt, ##__VA_ARGS__)
+#define dev_alert(dev, fmt, ...)  printk(KERN_ERR fmt, ##__VA_ARGS__)
+#define dev_err(dev, fmt, ...)    printk(KERN_ERR fmt, ##__VA_ARGS__)
+#define dev_warn(dev, fmt, ...)   printk(KERN_WARNING fmt, ##__VA_ARGS__)
+#define dev_notice(dev, fmt, ...) printk(KERN_NOTICE fmt, ##__VA_ARGS__)
+#define dev_info(dev, fmt, ...)   printk(KERN_INFO fmt, ##__VA_ARGS__)
+#define dev_dbg(dev, fmt, ...)    do { (void)(dev); } while (0)
+
 void panic(const char* msg, const char* file, int line, uint64_t code);
 
 unsigned long compat_jiffies(void);
@@ -35,6 +63,13 @@ unsigned long compat_jiffies(void);
 
 #define container_of(ptr, type, member) \
     ((type*)((char*)(ptr) - __builtin_offsetof(type, member)))
+
+/* error-pointer plumbing (errno values stay negative in a pointer) */
+#define ERR_PTR(err)      ((void*)(long)(err))
+#define PTR_ERR(ptr)      ((long)(ptr))
+#define IS_ERR(ptr)       ((unsigned long)(ptr) > (unsigned long)-MAX_ERRNO)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
+#define MAX_ERRNO 4096L
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 

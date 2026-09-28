@@ -38,6 +38,29 @@ typedef uint16_t __bitwise;
 typedef unsigned int  uint;
 typedef unsigned char uchar;
 
+/* Un-underscored kernel integer types (drivers use both spellings) */
+typedef __u8  u8;
+typedef __u16 u16;
+typedef __u32 u32;
+typedef __u64 u64;
+typedef __s8  s8;
+typedef __s16 s16;
+typedef __s32 s32;
+typedef __s64 s64;
+
+/* u64 statistics sync: uniprocessor, so the seqcounter is vestigial */
+struct u64_stats_sync { unsigned int seq; };
+static inline void u64_stats_init(struct u64_stats_sync* s)            { s->seq = 0; }
+static inline void u64_stats_update_begin(struct u64_stats_sync* s)    { (void)s; }
+static inline void u64_stats_update_end(struct u64_stats_sync* s)      { (void)s; }
+static inline unsigned int u64_stats_fetch_begin(const struct u64_stats_sync* s) {
+    (void)s; return 0;
+}
+static inline unsigned int u64_stats_fetch_retry(const struct u64_stats_sync* s,
+                                                 unsigned int start) {
+    (void)s; (void)start; return 0;
+}
+
 /* Little-endian host (x86): byte order conversions are no-ops */
 static inline __le16  cpu_to_le16(__u16 v) { return v; }
 static inline __le32  cpu_to_le32(__u32 v) { return v; }
@@ -90,13 +113,13 @@ static inline void list_del(struct list_head *entry) {
 #define list_first_entry(ptr, type, member) \
     list_entry((ptr)->next, type, member)
 #define list_next_entry(pos, member) \
-    list_entry((pos)->member.next, typeof(*(pos)), member)
+    list_entry((pos)->member.next, __typeof__(*(pos)), member)
 #define list_for_each_entry(pos, head, member)                          \
-    for (pos = list_first_entry(head, typeof(*pos), member);            \
+    for (pos = list_first_entry(head, __typeof__(*pos), member);            \
          &pos->member != (head);                                        \
          pos = list_next_entry(pos, member))
 #define list_for_each_entry_safe(pos, n, head, member)                  \
-    for (pos = list_first_entry(head, typeof(*pos), member),            \
+    for (pos = list_first_entry(head, __typeof__(*pos), member),            \
          n = list_next_entry(pos, member);                              \
          &pos->member != (head);                                        \
          pos = n, n = list_next_entry(n, member))

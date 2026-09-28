@@ -72,6 +72,8 @@ static inline int dma_mapping_error(void* dev, dma_addr_t a) { (void)dev; return
 #define EOPNOTSUPP 95
 #define EPERM  1
 #define EFAULT 14
+#define EADDRNOTAVAIL 99
+#define EADDRINUSE 98
 
 /* ---- delay.h (busy-wait; IRQ contexts in a panic-safe kernel) ---- */
 static inline void udelay(unsigned long usec) {

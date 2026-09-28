@@ -49,4 +49,10 @@ struct module;
 
 #define MODULE_NAME "compat"
 
+/* pr_fmt() users reference KBUILD_MODNAME; the build passes the real
+ * name per translation unit, this is only a fallback. */
+#ifndef KBUILD_MODNAME
+#define KBUILD_MODNAME "kmod"
+#endif
+
 #endif /* _COMPAT_LINUX_MODULE_H */

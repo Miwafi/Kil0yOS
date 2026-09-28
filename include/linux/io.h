@@ -22,12 +22,16 @@ static inline void __iomem* ioremap(unsigned long phys, unsigned long size) {
 #define ioremap_wc ioremap
 static inline void iounmap(void __iomem* addr) { (void)addr; }
 
-static inline __u8  readb(const volatile void __iomem* addr) { return *(__u8*)addr; }
-static inline __u16 readw(const volatile void __iomem* addr) { return *(__u16*)addr; }
-static inline __u32 readl(const volatile void __iomem* addr) { return *(__u32*)addr; }
-static inline void  writeb(__u8 v, volatile void __iomem* addr) { *(__u8*)addr = v; }
-static inline void  writew(__u16 v, volatile void __iomem* addr) { *(__u16*)addr = v; }
-static inline void  writel(__u32 v, volatile void __iomem* addr) { *(__u32*)addr = v; }
+/* NOTE: the inner casts MUST re-apply volatile - casting away the
+ * const-volatile qualifier lets gcc -O2 CSE/reorder MMIO reads (observed:
+ * one IntrStatus read fanned out to two setne consumers), which breaks
+ * drivers that rely on per-read side effects (status/ACK registers). */
+static inline __u8  readb(const volatile void __iomem* addr) { return *(const volatile __u8*)addr; }
+static inline __u16 readw(const volatile void __iomem* addr) { return *(const volatile __u16*)addr; }
+static inline __u32 readl(const volatile void __iomem* addr) { return *(const volatile __u32*)addr; }
+static inline void  writeb(__u8 v, volatile void __iomem* addr) { *(volatile __u8*)addr = v; }
+static inline void  writew(__u16 v, volatile void __iomem* addr) { *(volatile __u16*)addr = v; }
+static inline void  writel(__u32 v, volatile void __iomem* addr) { *(volatile __u32*)addr = v; }
 
 static inline void ioread8(const volatile void __iomem* a)  { (void)readb(a); }
 static inline __u8  ioread8v(const volatile void __iomem* a)  { return readb(a); }
@@ -48,6 +52,17 @@ static inline void ioread32_rep(const volatile void __iomem* addr, void* buf, in
 static inline void iowrite32_rep(volatile void __iomem* addr, const void* buf, int len) {
     const __u32* s = (const __u32*)buf;
     while (len--) writel(*s++, addr);
+}
+
+static inline void memcpy_fromio(void* dst, const volatile void __iomem* src, unsigned long len) {
+    const volatile __u8* s = (const volatile __u8*)src;
+    __u8* d = (__u8*)dst;
+    while (len--) *d++ = *s++;
+}
+static inline void memcpy_toio(volatile void __iomem* dst, const void* src, unsigned long len) {
+    volatile __u8* d = (volatile __u8*)dst;
+    const __u8* s = (const __u8*)src;
+    while (len--) *d++ = *s++;
 }
 
 #endif /* _COMPAT_LINUX_IO_H */

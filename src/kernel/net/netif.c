@@ -65,7 +65,7 @@ const char* netif_probe(void) {
      * compat PCI core and register into g_netid themselves. */
     extern void compat_initcalls(void);
     compat_initcalls();
-    return g_netif.send ? "8139compat(Linux)" : NULL;
+    return g_netif.send ? "8139too(Linux)" : NULL;
 #endif
     pci_device_t* dev = pci_get_device_list();
     while (dev) {

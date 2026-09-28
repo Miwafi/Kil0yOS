@@ -114,8 +114,18 @@ void compat_pci_dev_fill(struct pci_dev* pdev, pci_device_t* core) {
     pdev->core    = core;
     pdev->vendor  = core->vendor_id;
     pdev->device  = core->device_id;
+    pdev->subsystem_vendor = pci_read_word(core->bus, core->device, core->function, 0x2C);
+    pdev->subsystem_device = pci_read_word(core->bus, core->device, core->function, 0x2E);
     pdev->irq     = core->irq;
     pdev->revision = pci_read_byte(core->bus, core->device, core->function, PCI_REVISION_OFFSET);
+    /* QEMU's rtl8139 reports the "8139C+" revision 0x20, and Linux
+     * 8139too refuses rev >= 0x20 (it expects the 8139cp driver to
+     * handle those). We ship no 8139cp; the chip's classic register
+     * interface (verified end-to-end on this device) is identical, so
+     * report a pre-C+ revision to keep the real 8139too probe alive. */
+    if (pdev->vendor == PCI_VENDOR_ID_REALTEK &&
+        pdev->device == PCI_DEVICE_ID_REALTEK_8139 && pdev->revision >= 0x20)
+        pdev->revision = 0x11;
     pdev->class   = (pci_read_byte(core->bus, core->device, core->function, 0x0B) << 8) |
                      pci_read_byte(core->bus, core->device, core->function, 0x0A);
     pdev->devfn   = (core->device << 3) | core->function;
@@ -170,6 +180,20 @@ void __iomem* pci_ioremap_bar(struct pci_dev* dev, int bar) {
 
 int pci_request_regions(struct pci_dev* dev, const char* name) {
     (void)dev; (void)name;
+    return 0;
+}
+
+void pci_release_regions(struct pci_dev* dev) { (void)dev; }
+
+int pci_read_config_word(struct pci_dev* dev, int where, __u16* val) {
+    pci_device_t* d = dev->core;
+    *val = pci_read_word(d->bus, d->device, d->function, (uint16_t)where);
+    return 0;
+}
+
+int pci_write_config_word(struct pci_dev* dev, int where, __u16 val) {
+    pci_device_t* d = dev->core;
+    pci_write_word(d->bus, d->device, d->function, (uint16_t)where, val);
     return 0;
 }
 
@@ -269,7 +293,89 @@ struct net_device* compat_g_netdev(void) {
     return (struct net_device*)compat_netdev_priv;
 }
 
+/* ------------------------------------------------------------------ */
+/* delayed work: queued here, executed by the netif main-loop poll hook */
+/* ------------------------------------------------------------------ */
+
+static LIST_HEAD(compat_works);
+
+int schedule_delayed_work(struct delayed_work* dwork, unsigned long delay) {
+    if (!dwork || !dwork->work.func) return -1;
+    if (dwork->pending) return 0;               /* already queued: no-op */
+    dwork->deadline = compat_jiffies() + delay;
+    dwork->pending = 1;
+    list_add_tail(&dwork->node, &compat_works);
+    return 0;
+}
+
+int cancel_delayed_work_sync(struct delayed_work* dwork) {
+    int was_pending = dwork->pending;
+    if (dwork->pending) {
+        list_del(&dwork->node);
+        dwork->pending = 0;
+    }
+    return was_pending;
+}
+
+void compat_run_due_works(void) {
+    unsigned long now = compat_jiffies();
+    struct delayed_work* w;
+    struct delayed_work* n;
+    /* safe iteration: a work may re-schedule itself (8139too thread) */
+    list_for_each_entry_safe(w, n, &compat_works, node) {
+        if (!time_after_eq(now, w->deadline)) continue;
+        list_del(&w->node);
+        w->pending = 0;
+        w->work.func(&w->work);
+    }
+}
+
 void* compat_netdev_priv;   /* registered net_device */
+
+/* ------------------------------------------------------------------ */
+/* NAPI: synchronous mode. __napi_schedule() runs the poll callback
+ * immediately (interrupt context); the main-loop poll hook drains as a
+ * safety net and also executes due delayed work. */
+/* ------------------------------------------------------------------ */
+
+static struct napi_struct* compat_napi;      /* the one NAPI instance */
+static struct net_device*  compat_napi_dev;
+
+void netif_napi_add(struct net_device* dev, struct napi_struct* napi,
+                    int (*poll)(struct napi_struct*, int)) {
+    napi->dev = dev;
+    napi->poll = poll;
+    napi->state = 0;
+    compat_napi = napi;
+    compat_napi_dev = dev;
+}
+
+int napi_schedule_prep(struct napi_struct* napi) {
+    (void)napi;
+    return 1;
+}
+
+void __napi_schedule(struct napi_struct* napi) {
+    if (napi->poll) napi->poll(napi, 64);
+}
+
+int napi_complete_done(struct napi_struct* napi, int work_done) {
+    (void)napi; (void)work_done;
+    return 1;                                /* re-arm the IRQ mask */
+}
+
+struct sk_buff* napi_alloc_skb(struct napi_struct* napi, unsigned int length) {
+    (void)napi;
+    return compat_alloc_skb(length);
+}
+
+/* Main-loop drain: run due delayed work first (8139too media thread),
+ * then poll RX in case the interrupt was lost (IMR clearing quirk). */
+static void compat_napi_poll_hook(struct net_device* dev) {
+    compat_run_due_works();
+    if (compat_napi && compat_napi_dev == dev && compat_napi->poll)
+        compat_napi->poll(compat_napi, 64);
+}
 
 int register_netdev(struct net_device* dev) {
     if (!dev || !dev->netdev_ops || !dev->netdev_ops->ndo_start_xmit)
@@ -280,6 +386,14 @@ int register_netdev(struct net_device* dev) {
     g_netif.poll = compat_poll;
     g_netif.flags = 1;
     dev->flags |= IFF_UP | IFF_RUNNING;
+    /* NAPI drivers get the main-loop drain hook (rx + delayed work);
+     * drivers managing their own hook keep theirs. */
+    if (compat_napi_dev == dev)
+        dev->poll_hook = compat_napi_poll_hook;
+    /* No ifconfig: bring the device up at registration, exactly like
+     * the demo driver did before register_netdev(). */
+    if (dev->netdev_ops->ndo_open)
+        dev->netdev_ops->ndo_open(dev);
     printk(KERN_INFO "compat: %s registered, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
            dev->name, dev->dev_addr[0], dev->dev_addr[1], dev->dev_addr[2],
            dev->dev_addr[3], dev->dev_addr[4], dev->dev_addr[5]);

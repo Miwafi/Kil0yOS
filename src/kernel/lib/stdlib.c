@@ -29,29 +29,77 @@ void kvsnprintf(char* buf, size_t size, const char* fmt, va_list ap_copy) {
             while (*s) KSP_EMIT(*s++);
             continue;
         }
-        /* optional zero-pad flag + decimal width, e.g. %02x %08x %5d */
+        /* optional zero-pad flag + decimal width, e.g. %02x %08x %5d,
+         * plus '#' (0x prefix for %x) and 'l'/'ll' (64-bit args) */
         const char* wstart = p;
         int zeropad = (*p == '0');
         if (zeropad) p++;
+        int alt = (*p == '#');
+        if (alt) p++;
         int width = 0;
         while (*p >= '0' && *p <= '9') {
             width = width * 10 + (*p - '0');
             p++;
         }
+        int longs = 0;
+        while (*p == 'l') { longs++; p++; }
         char spec = *p;
-        if (spec == 'd' || spec == 'u' || spec == 'x') {
-            char num[24];
-            if (spec == 'd') itoa(va_arg(ap, int), num, 10, sizeof(num));
-            else utoa(va_arg(ap, uint32_t), num, spec == 'x' ? 16 : 10, sizeof(num));
-            char* q = num;
-            if (*q == '-') {                    /* sign first, then pad */
-                KSP_EMIT('-');
-                q++;
+
+        /* %p[M]: kernel pointer; %pM formats a MAC address */
+        if (spec == 'p') {
+            void* ptr = va_arg(ap, void*);
+            if (p[1] == 'M') {
+                p++;
+                static const char hx[] = "0123456789abcdef";
+                const unsigned char* mac = (const unsigned char*)ptr;
+                for (int i = 0; i < 6; i++) {
+                    if (i) KSP_EMIT(':');
+                    KSP_EMIT(hx[(mac[i] >> 4) & 0xF]);
+                    KSP_EMIT(hx[mac[i] & 0xF]);
+                }
+                continue;
             }
-            int len = 0;
-            for (char* r = q; *r; r++) len++;
-            for (int i = len; i < width; i++) KSP_EMIT(zeropad ? '0' : ' ');
-            while (*q) KSP_EMIT(*q++);
+            KSP_EMIT('0');
+            KSP_EMIT('x');
+            unsigned long long v = (unsigned long long)(uintptr_t)ptr;
+            char digits[20];
+            int li = 0;
+            if (!v) digits[li++] = '0';
+            while (v) {
+                digits[li++] = "0123456789abcdef"[v & 0xF];
+                v >>= 4;
+            }
+            while (li) KSP_EMIT(digits[--li]);
+            continue;
+        }
+
+        if (spec == 'd' || spec == 'u' || spec == 'x') {
+            unsigned long long uv;
+            int neg = 0;
+            if (spec == 'd') {
+                long long sv = longs ? va_arg(ap, long long)
+                                     : (long long)va_arg(ap, int);
+                if (sv < 0) { neg = 1; uv = (unsigned long long)(-sv); }
+                else uv = (unsigned long long)sv;
+            } else {
+                uv = longs ? va_arg(ap, unsigned long long)
+                           : (unsigned long long)va_arg(ap, unsigned int);
+            }
+            int base = (spec == 'x') ? 16 : 10;
+            char num[24];
+            int li = 0;
+            if (!uv) num[li++] = '0';
+            while (uv) {
+                int dgt = (int)(uv % (unsigned int)base);
+                num[li++] = (char)((dgt < 10) ? ('0' + dgt) : ('a' + dgt - 10));
+                uv /= (unsigned int)base;
+            }
+            int prefix = (alt && spec == 'x') ? 2 : 0;
+            if (neg) KSP_EMIT('-');
+            if (prefix) { KSP_EMIT('0'); KSP_EMIT('x'); }
+            for (int i = neg + prefix + li; i < width; i++)
+                KSP_EMIT(zeropad ? '0' : ' ');
+            while (li) KSP_EMIT(num[--li]);
             continue;
         }
         if (spec == 'c') {

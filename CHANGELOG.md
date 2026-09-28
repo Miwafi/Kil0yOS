@@ -2,6 +2,26 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.7.0] - 2026-09-28
+The `8139compat` demo is replaced by the **real upstream Linux 8139too driver**, compiled into the kernel nearly as-is on top of the compat layer — full DHCP verified stable in QEMU.
+
+### Added
+- **Real 8139too driver** (`src/kernel/compat/drivers/8139too.c`): the upstream Linux source (`drivers/net/ethernet/realtek/8139too.c`) ported to the compat layer, replacing the demo transplant. Brings the driver's real structure intact: NAPI-style poll loop, ring buffer RX with wrap handling, MII/ethtool scaffolding, TX descriptor ring, EEPROM MAC read. QEMU end-to-end verified **3/3 runs** (`net: DHCP ok`, `8139too(Linux) claimed 10ec:8139`).
+- **New compat headers**: `mii.h`, `ethtool.h`, `crc32.h`, `spinlock.h`, `completion.h`, `gfp.h`, `if_vlan.h`, `init.h`, `rtnetlink.h`, `uaccess.h`, `compiler.h`, plus `include/asm/irq.h` — whatever 8139too's real include web needed beyond the 3.6.0 tree.
+
+### Fixed
+- **io.h MMIO accessors discarded `volatile`**: the inner casts (`*(__u16*)addr`) stripped the qualifier, letting gcc -O2 CSE one `IntrStatus` read into two `setne` consumers (confirmed in disassembly). All read/write accessors now re-apply volatile. This was the root cause of a timing-sensitive DHCP regression (poll gate read `ISR=0x0005`, gate said "frame pending", yet `rtl8139_rx` never observed it) — with the fix, DHCP passes with debug probes removed.
+- **linker.ld initcall symbol hole**: `__compat_initcall_start/end` assigned *outside* the `.compat_initcall` output section used the location counter before ld applied the input sections' 16-byte alignment, leaving an 8-byte hole that corrupted the first initcall table entry (boot-time #PF whenever `.data` ended at an unfavorable offset). Symbols now live inside the section.
+- **8139too low-power write vs auto-open**: compat `register_netdev` auto-opens the device (ndo_open starts the clock with `HltClk='R'`), then upstream `init_one` wrote `HltClk='H'` to enter low-power mode — QEMU's `rtl8139_do_receive` then rejects **every** inbound frame (clock_enabled path; TX still works, which masked it). Upstream is unaffected because real `register_netdev` does not auto-open. The low-power write is skipped with a comment.
+- **MAC read fallback**: QEMU does not answer the 9346 EEPROM bitbang reliably in this environment; when the EEPROM read yields an invalid address, fall back to the MAC0 register mirror (`is_valid_ether_addr` check).
+- **QEMU revision clamp**: QEMU's rtl8139 reports revision 0x20 (8139C+), which 8139too's probe rejects (it expects the 8139cp driver for C+). The compat PCI fill reports a pre-C+ revision — the classic register interface is identical and verified end-to-end.
+
+### Removed
+- `src/kernel/compat/drivers/rtl8139_compat.c` (the 3.6.0 demo driver; superseded by the real 8139too port).
+
+### File Changes
+- 36 files: 8139too.c ported + 13 new compat headers, io.h volatile fix, linker.ld initcall fix, compat.c/netif.c/stdlib.c adjustments, version strings
+
 ## [3.6.0] - 2026-09-28
 ### Added
 - **Linux NIC driver compatibility layer** (`make COMPAT_NET=1`): Linux-kernel-style header tree (`include/linux/`: types, kernel, module, pci, io, slab/dma/delay, interrupt, netdevice/skbuff, etherdevice) plus a runtime shim (`src/kernel/compat/linux/compat.c`) so Linux NIC driver source can be compiled into the kernel nearly as-is. The shim provides `printk`, `kmalloc`/GFP bridges, `ioremap`/`readl`/`writel`, `pci_register_driver` (id-table matching over the enumerated PCI list, BAR size probing, `pci_ioremap_bar`), `request_irq` (trampoline auto-sends the PIC EOI), `sk_buff` + `netif_rx` (feeds the existing protocol stack), and `register_netdev` (binds `ndo_start_xmit` to the kernel netif).

@@ -120,7 +120,7 @@ COMPAT_NET_SRCS =
 ifeq ($(COMPAT_NET),1)
 CFLAGS += -DCOMPAT_NET
 COMPAT_NET_SRCS = $(SRCDIR)/kernel/compat/linux/compat.c \
-                  $(SRCDIR)/kernel/compat/drivers/rtl8139_compat.c
+                  $(SRCDIR)/kernel/compat/drivers/8139too.c
 endif
 
 KERNEL_OBJS = $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(KERNEL_SRCS))
@@ -309,6 +309,11 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 $(BUILDDIR)/kernel/drivers/audio/mp3.o: $(SRCDIR)/kernel/drivers/audio/mp3.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -msse -msse2 -mmmx -c $< -o $@
+
+# 8139too needs a real KBUILD_MODNAME (pr_fmt wraps it)
+$(BUILDDIR)/kernel/compat/drivers/8139too.o: $(SRCDIR)/kernel/compat/drivers/8139too.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DKBUILD_MODNAME='"8139too"' -c $< -o $@
 
 $(BOOT_OBJ): $(SRCDIR)/boot/boot.asm
 	@mkdir -p $(dir $@)
