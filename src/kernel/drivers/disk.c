@@ -276,6 +276,10 @@ int disk_read_sector(uint32_t sector, uint8_t* buffer) {
     /* Try DMA first, fall back to PIO */
     if (dma_enabled) {
         if (ata_do_dma(sector, buffer, 0) == 0) return 0;
+        /* DMA failed mid-command: drain any busy state before the PIO
+         * fallback reprograms the taskfile (real hw keeps BSY/DRQ set). */
+        disk_wait_ready();
+        inb(ATA_PRIMARY_IO_BASE + ATA_REG_STATUS);
     }
 
     outb(ATA_PRIMARY_IO_BASE + ATA_REG_DEVICE, 0xE0 | ((sector >> 24) & 0x0F));
@@ -310,6 +314,9 @@ int disk_write_sector(uint32_t sector, const uint8_t* buffer) {
     /* Try DMA first, fall back to PIO */
     if (dma_enabled) {
         if (ata_do_dma(sector, (uint8_t*)buffer, 1) == 0) return 0;
+        /* Same as the read path: let the drive settle before PIO. */
+        disk_wait_ready();
+        inb(ATA_PRIMARY_IO_BASE + ATA_REG_STATUS);
     }
 
     outb(ATA_PRIMARY_IO_BASE + ATA_REG_DEVICE, 0xE0 | ((sector >> 24) & 0x0F));
@@ -340,10 +347,19 @@ static int disk_device_close(device_t* dev) {
     return 0;
 }
 
+/* The device read/write API has no position: disk_device_read/write always
+ * stream from a fixed starting sector (previously hardwired to 0). Callers
+ * needing a different window set it once via DISK_IOC_SET_LBA; it stays in
+ * effect until changed. The fs layer does NOT use the device API (it drives
+ * disk_read_sector/disk_write_sector directly with explicit LBAs). */
+#define DISK_IOC_SET_LBA 0x5A01
+static uint32_t device_start_sector = 0;
+
 static int disk_device_read(device_t* dev, void* buffer, size_t size) {
+    (void)dev;
     if (size == 0 || buffer == NULL) return -1;
     uint8_t* buf = (uint8_t*)buffer;
-    uint32_t sector = 0;
+    uint32_t sector = device_start_sector;
     int offset = 0;
 
     while (offset < (int)size && sector < DISK_MAX_SECTORS) {
@@ -366,9 +382,10 @@ static int disk_device_read(device_t* dev, void* buffer, size_t size) {
 }
 
 static int disk_device_write(device_t* dev, const void* buffer, size_t size) {
+    (void)dev;
     if (size == 0 || buffer == NULL) return -1;
     const uint8_t* buf = (const uint8_t*)buffer;
-    uint32_t sector = 0;
+    uint32_t sector = device_start_sector;
     int offset = 0;
 
     while (offset < (int)size && sector < DISK_MAX_SECTORS) {
@@ -393,5 +410,10 @@ static int disk_device_write(device_t* dev, const void* buffer, size_t size) {
 }
 
 static int disk_device_ioctl(device_t* dev, int cmd, void* arg) {
+    (void)dev;
+    if (cmd == DISK_IOC_SET_LBA && arg != NULL) {
+        device_start_sector = *(uint32_t*)arg;
+        return 0;
+    }
     return -1;
 }

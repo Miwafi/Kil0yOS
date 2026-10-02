@@ -113,6 +113,11 @@ struct fs_entry {
     fs_backend_t backend;
     uint32_t inode_no;      /* ext2 inode number (FS_BACKEND_EXT2) */
     uint8_t* mem_data;      /* content buffer (FS_BACKEND_MEM files) */
+    /* The 11-byte on-disk FAT short name as actually stored (may be a
+     * mangled NAME~1.EXT form; case-folded). Directory-entry updates and
+     * deletes must match against THIS, not against `name` - the plain
+     * name differs in case/truncation from what format_short_name wrote. */
+    uint8_t disk_name[11];
     struct fs_entry* parent;
     struct fs_entry* children[MAX_DIR_ENTRIES];
 };

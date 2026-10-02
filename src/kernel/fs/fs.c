@@ -289,8 +289,11 @@ done_counting:
         if (current_cluster == FAT32_IO_ERROR) break;
     }
     
+    /* Report the number ACTUALLY filled in pass 2, not the pass-1 count:
+     * an IO-error break leaves the tail of all_entries as uninitialized
+     * heap memory, which fs_load_directory would parse as entries. */
     *entries = all_entries;
-    *count = total_entries;
+    *count = idx;
     return 0;
 }
 
@@ -307,6 +310,7 @@ static fs_entry_t* fs_create_entry_from_dir(fat32_dir_entry_t* dir_entry, fs_ent
     entry->backend = FS_BACKEND_FAT;   /* entries read back from FAT disk */
     entry->inode_no = 0;
     entry->mem_data = NULL;
+    memcpy(entry->disk_name, dir_entry->name, sizeof(entry->disk_name));
     
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         entry->children[i] = NULL;
@@ -335,7 +339,11 @@ static void fs_load_directory(fs_entry_t* dir) {
             }
         }
     }
-    
+
+    if (count > MAX_DIR_ENTRIES) {
+        klog("[fs] warning: FAT directory truncated at MAX_DIR_ENTRIES\n");
+    }
+
     kfree(entries);
 }
 
@@ -460,6 +468,92 @@ static void format_short_name(const char* name, uint8_t* output) {
     }
 }
 
+/* Does this directory already contain an entry with this exact 11-byte
+ * short name? (0xE5-deleted slots are skipped: their names are dead.) */
+static int fat_short_name_exists(uint32_t cluster, const uint8_t sn[11]) {
+    if (cluster == 0) cluster = boot_sector.root_cluster;
+    uint32_t cur = cluster;
+    while (cur != 0 && cur != FAT32_EOC_MARK && cur != FAT32_IO_ERROR) {
+        uint32_t sector = cluster_to_sector(cur);
+        for (int s = 0; s < (int)boot_sector.bpb.sectors_per_cluster; s++) {
+            uint8_t buffer[DISK_SECTOR_SIZE];
+            if (disk_read_sector(sector + s, buffer) != 0) return 0;
+            fat32_dir_entry_t* de = (fat32_dir_entry_t*)buffer;
+            for (int i = 0; i < 16; i++) {
+                if (de[i].name[0] == 0x00) return 0;   /* end of directory */
+                if (de[i].name[0] == 0xE5) continue;
+                if (memcmp(de[i].name, sn, 11) == 0) return 1;
+            }
+        }
+        cur = fat_read_entry(cur);
+    }
+    return 0;
+}
+
+/* format_short_name + on-disk collision mangling. FAT stores only the
+ * 8.3 upper-case short name, so distinct long names ("libc6_2.39-0u.deb"
+ * vs "libc6_2.39-1u.deb") truncate to the SAME short name and their
+ * directory entries would silently collide. When the plain name is
+ * already taken on disk, fall back to the classic NAME~1.EXT mangling
+ * (mtools/dos semantics). */
+static void format_short_name_unique(const char* name, uint8_t* output,
+                                     uint32_t dir_cluster) {
+    format_short_name(name, output);
+    if (dir_cluster == 0) dir_cluster = boot_sector.root_cluster;
+    if (!fat_short_name_exists(dir_cluster, output)) return;
+
+    const char* illegal_chars = "*?:\"<>|/\\";
+    const char* dot = strchr(name, '.');
+    int name_len = dot ? (int)(dot - name) : (int)strlen(name);
+
+    char stem[6];
+    int stem_n = 0;
+    for (int i = 0; i < name_len && stem_n < 6; i++) {
+        char c = name[i];
+        int illegal = 0;
+        for (const char* p = illegal_chars; *p; p++) {
+            if (c == *p) { illegal = 1; break; }
+        }
+        if (illegal) continue;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        stem[stem_n++] = c;
+    }
+
+    uint8_t ext[3];
+    int ext_n = 0;
+    if (dot && dot[1]) {
+        for (int i = 1; dot[i] && ext_n < 3; i++) {
+            char c = dot[i];
+            int illegal = 0;
+            for (const char* p = illegal_chars; *p; p++) {
+                if (c == *p) { illegal = 1; break; }
+            }
+            if (illegal) continue;
+            if (c >= 'a' && c <= 'z') c -= 32;
+            ext[ext_n++] = (uint8_t)c;
+        }
+    }
+
+    for (unsigned long n = 1; n <= 999999UL; n++) {
+        char num[16];
+        itoa((int)n, num, 10, sizeof(num));
+        int num_len = (int)strlen(num);
+        int stem_use = 6 - num_len;
+        if (stem_use > stem_n) stem_use = stem_n;
+        if (stem_use < 0) stem_use = 0;
+
+        memset(output, ' ', 11);
+        int idx = 0;
+        for (int i = 0; i < stem_use; i++) output[idx++] = (uint8_t)stem[i];
+        output[idx++] = '~';
+        for (int i = 0; i < num_len; i++) output[idx++] = (uint8_t)num[i];
+        for (int i = 0; i < ext_n; i++) output[8 + i] = ext[i];
+        if ((uint8_t)output[0] == 0xE5) output[0] = 0x05;
+        if (!fat_short_name_exists(dir_cluster, output)) return;
+    }
+    /* every ~N taken: leave the colliding plain name - nothing better exists */
+}
+
 static void fs_format() {
     memset(&boot_sector, 0, sizeof(fat32_boot_sector_t));
     
@@ -559,6 +653,16 @@ int fs_load() {
         return -1;
     }
 
+    /* Implausible BPB: a corrupt/garbage boot sector that kept the magic
+     * would otherwise drive every geometry computation off the rails. */
+    if (boot_sector.bpb.bytes_per_sector != DISK_SECTOR_SIZE ||
+        boot_sector.bpb.sectors_per_cluster == 0 ||
+        boot_sector.bpb.sectors_per_cluster > 128 ||
+        boot_sector.bpb.fat_count == 0) {
+        klog("[fs] implausible BPB, refusing to mount\n");
+        return -1;
+    }
+
     if (fat_cache_ready == 0 && fat_cache_load() != 0) {
         klog("[fs] fat cache load failed (falling back to disk I/O)\n");
     }
@@ -579,6 +683,7 @@ int fs_load() {
     root->backend = FS_BACKEND_FAT;
     root->inode_no = 0;
     root->mem_data = NULL;
+    memset(root->disk_name, 0, sizeof(root->disk_name));
     
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         root->children[i] = NULL;
@@ -860,6 +965,7 @@ fs_entry_t* fs_create_file(const char* name) {
         entry->backend = FS_BACKEND_MEM;
         entry->inode_no = 0;
         entry->mem_data = NULL;
+        memset(entry->disk_name, 0, sizeof(entry->disk_name));
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
             if (parent_dir->children[i] == NULL) {
                 parent_dir->children[i] = entry;
@@ -875,7 +981,8 @@ fs_entry_t* fs_create_file(const char* name) {
 
     fat32_dir_entry_t dir_entry;
     memset(&dir_entry, 0, sizeof(fat32_dir_entry_t));
-    format_short_name(base_name, dir_entry.name);
+    format_short_name_unique(base_name, dir_entry.name, parent_dir->first_cluster);
+    memcpy(entry->disk_name, dir_entry.name, sizeof(entry->disk_name));
     dir_entry.attributes = ATTR_ARCHIVE;
     dir_entry.first_cluster_low = 0;
     dir_entry.first_cluster_high = 0;
@@ -942,6 +1049,7 @@ fs_entry_t* fs_create_dir(const char* name) {
         entry->backend = FS_BACKEND_MEM;
         entry->inode_no = 0;
         entry->mem_data = NULL;
+        memset(entry->disk_name, 0, sizeof(entry->disk_name));
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
             entry->children[i] = NULL;
         }
@@ -995,7 +1103,7 @@ fs_entry_t* fs_create_dir(const char* name) {
 
     fat32_dir_entry_t dir_entry;
     memset(&dir_entry, 0, sizeof(fat32_dir_entry_t));
-    format_short_name(base_name, dir_entry.name);
+    format_short_name_unique(base_name, dir_entry.name, parent_dir->first_cluster);
     dir_entry.attributes = ATTR_DIRECTORY;
     dir_entry.first_cluster_low = new_cluster & 0xFFFF;
     dir_entry.first_cluster_high = (new_cluster >> 16) & 0xFFFF;
@@ -1022,6 +1130,7 @@ fs_entry_t* fs_create_dir(const char* name) {
     entry->backend = FS_BACKEND_FAT;
     entry->inode_no = 0;
     entry->mem_data = NULL;
+    memcpy(entry->disk_name, dir_entry.name, sizeof(entry->disk_name));
 
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         entry->children[i] = NULL;
@@ -1071,6 +1180,7 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
     }
 
     if (size > MAX_FILE_SIZE) {
+        klog("[fs] write: clamping oversized write to MAX_FILE_SIZE\n");
         size = MAX_FILE_SIZE;
     }
 
@@ -1090,7 +1200,6 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
 
     /* FAT backend: legacy cluster chain write. */
     uint32_t old_first_cluster = file->first_cluster;
-    uint32_t old_size = file->size;
 
     uint32_t first_cluster = fat_alloc_cluster();
     if (first_cluster == 0) {
@@ -1156,9 +1265,10 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
                 if (disk_read_sector(sector + s, buffer) != 0) break;
                 fat32_dir_entry_t* dir_entries = (fat32_dir_entry_t*)buffer;
                 for (int j = 0; j < 16; j++) {
-                    char entry_name[256];
-                    parse_short_name(dir_entries[j].name, entry_name);
-                    if (strcmp(entry_name, file->name) == 0 &&
+                    /* Match the 11-byte short name as stored on disk (the
+                     * entry may be a mangled NAME~1.EXT form and the case
+                     * never matches `file->name`). */
+                    if (memcmp(dir_entries[j].name, file->disk_name, 11) == 0 &&
                         dir_entries[j].name[0] != 0xE5) {
                         dir_entries[j].first_cluster_low = first_cluster & 0xFFFF;
                         dir_entries[j].first_cluster_high = (first_cluster >> 16) & 0xFFFF;
@@ -1173,6 +1283,10 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
                 }
             }
             scan_cluster = fat_read_entry(scan_cluster);
+        }
+
+        if (!entry_updated) {
+            klog("[fs] warning: on-disk dir entry not found (size/cluster not persisted)\n");
         }
     }
 
@@ -1296,9 +1410,10 @@ int fs_delete_entry(const char* name) {
                     if (disk_read_sector(sector + s, buffer) != 0) break;
                     fat32_dir_entry_t* dir_entries = (fat32_dir_entry_t*)buffer;
                     for (int j = 0; j < 16; j++) {
-                        char entry_name[256];
-                        parse_short_name(dir_entries[j].name, entry_name);
-                        if (strcmp(entry_name, base_name) == 0) {
+                        /* Match the stored short name (case/mangling-safe),
+                         * see fs_entry_t.disk_name. */
+                        if (memcmp(dir_entries[j].name,
+                                   parent_dir->children[i]->disk_name, 11) == 0) {
                             dir_entries[j].name[0] = 0xE5;
                             disk_write_sector(sector + s, buffer);
                             goto delete_done;
@@ -1321,9 +1436,6 @@ int fs_get_last_error() {
     return fs_last_error;
 }
 
-static void fs_save_file(fs_entry_t* file);
-static void fs_save_directory(fs_entry_t* dir);
-
 void fs_save() {
     /* ext2 mode: the disk is read-only ext2, in-memory overlay state is
      * volatile by design - do not write FAT structures onto the disk. */
@@ -1341,135 +1453,6 @@ void fs_save() {
     memset(buffer, 0, DISK_SECTOR_SIZE);
     memcpy(buffer, &boot_sector, sizeof(fat32_boot_sector_t));
     disk_write_sector(0, buffer);
-}
-
-/*
- * Save file content clusters to disk.
- * Reads from in-memory fs_entry_t and writes to disk clusters.
- */
-static void fs_save_file(fs_entry_t* file) {
-    if (file == NULL || file->type != FS_TYPE_FILE) return;
-    if (file->first_cluster == 0) return;
-
-    /* File content is already written by fs_write_file() during edit/save,
-       so we just need to ensure the directory entry is updated */
-    /* The directory entry update is handled by fs_save_directory() */
-}
-
-/*
- * Write all in-memory directory entries of 'dir' back to disk.
- * Recursively saves all child directories and files.
- * Supports multi-cluster directories.
- */
-static void fs_save_directory(fs_entry_t* dir) {
-    if (dir == NULL || dir->type != FS_TYPE_DIRECTORY) return;
-    if (dir->first_cluster == 0) return;
-
-    /* First, recursively save all child directories and files */
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (dir->children[i] != NULL) {
-            if (dir->children[i]->type == FS_TYPE_DIRECTORY) {
-                fs_save_directory(dir->children[i]);
-            } else if (dir->children[i]->type == FS_TYPE_FILE) {
-                fs_save_file(dir->children[i]);
-            }
-        }
-    }
-
-    /* Count directory entries */
-    int entry_count = 0;
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (dir->children[i] != NULL) entry_count++;
-    }
-
-    int entries_per_cluster = (DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster) / sizeof(fat32_dir_entry_t);
-    int base_entries = (dir->parent != NULL) ? 2 : 0; /* . and .. */
-    int clusters_needed = (entry_count + base_entries + entries_per_cluster - 1) / entries_per_cluster;
-    if (clusters_needed == 0 && dir->parent == NULL) {
-        clusters_needed = 1; /* Root directory always needs at least one cluster cleared */
-    }
-
-    uint8_t* dir_data = (uint8_t*)kmalloc(DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster);
-    if (dir_data == NULL) return;
-
-    uint32_t prev_cluster = 0;
-    uint32_t current_cluster = dir->first_cluster;
-    int cluster_index = 0;
-    int child_idx = 0;
-
-    while (cluster_index < clusters_needed) {
-        if (current_cluster == 0 || current_cluster == FAT32_EOC_MARK || current_cluster == FAT32_IO_ERROR) {
-            uint32_t new_cluster = fat_alloc_cluster();
-            if (new_cluster == 0) break;
-            if (prev_cluster != 0 && prev_cluster != FAT32_IO_ERROR) {
-                fat_write_entry(prev_cluster, new_cluster);
-            }
-            current_cluster = new_cluster;
-        }
-
-        memset(dir_data, 0, DISK_SECTOR_SIZE * boot_sector.bpb.sectors_per_cluster);
-
-        int entries_in_this_cluster = 0;
-
-        /* Write . and .. for non-root directories in the first cluster */
-        if (base_entries > 0 && cluster_index == 0) {
-            fat32_dir_entry_t dot, dotdot;
-            memset(&dot, 0, sizeof(dot));
-            dot.name[0] = '.';
-            dot.attributes = ATTR_DIRECTORY;
-            dot.first_cluster_low = dir->first_cluster & 0xFFFF;
-            dot.first_cluster_high = (dir->first_cluster >> 16) & 0xFFFF;
-
-            memset(&dotdot, 0, sizeof(dotdot));
-            dotdot.name[0] = '.';
-            dotdot.name[1] = '.';
-            dotdot.attributes = ATTR_DIRECTORY;
-            uint32_t parent_cluster = dir->parent ? dir->parent->first_cluster : boot_sector.root_cluster;
-            if (parent_cluster == 0) parent_cluster = boot_sector.root_cluster;
-            dotdot.first_cluster_low = parent_cluster & 0xFFFF;
-            dotdot.first_cluster_high = (parent_cluster >> 16) & 0xFFFF;
-
-            memcpy(dir_data, &dot, sizeof(dot));
-            memcpy(dir_data + sizeof(dot), &dotdot, sizeof(dotdot));
-            entries_in_this_cluster = 2;
-        }
-
-        /* Write children entries */
-        while (entries_in_this_cluster < entries_per_cluster && child_idx < MAX_DIR_ENTRIES) {
-            fs_entry_t* child = dir->children[child_idx++];
-            if (child == NULL) continue;
-
-            fat32_dir_entry_t de;
-            memset(&de, 0, sizeof(fat32_dir_entry_t));
-            format_short_name(child->name, de.name);
-            de.attributes = child->attributes;
-            de.first_cluster_low = child->first_cluster & 0xFFFF;
-            de.first_cluster_high = (child->first_cluster >> 16) & 0xFFFF;
-            de.file_size = child->size;
-
-            memcpy(dir_data + entries_in_this_cluster * sizeof(fat32_dir_entry_t), &de, sizeof(fat32_dir_entry_t));
-            entries_in_this_cluster++;
-        }
-
-        uint32_t sector = cluster_to_sector(current_cluster);
-        for (int s = 0; s < boot_sector.bpb.sectors_per_cluster; s++) {
-            disk_write_sector(sector + s, dir_data + s * DISK_SECTOR_SIZE);
-        }
-
-        prev_cluster = current_cluster;
-        current_cluster = fat_read_entry(current_cluster);
-        cluster_index++;
-    }
-
-    /* Truncate excess clusters */
-    if (current_cluster != 0 && current_cluster != FAT32_EOC_MARK) {
-        if (prev_cluster != 0) {
-            fat_write_entry(prev_cluster, FAT32_EOC_MARK);
-        }
-        fat_free_cluster_chain(current_cluster);
-    }
-
-    kfree(dir_data);
 }
 
 int fs_ext2_active() {

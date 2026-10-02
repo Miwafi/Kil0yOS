@@ -213,6 +213,7 @@ static fs_entry_t* ext2_new_node(const char* name, fs_entry_type_t type,
     e->backend = FS_BACKEND_EXT2;
     e->inode_no = ino;
     e->mem_data = NULL;
+    memset(e->disk_name, 0, sizeof(e->disk_name));
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) e->children[i] = NULL;
     return e;
 }
@@ -286,6 +287,10 @@ static void ext2_load_dir_recursive(fs_entry_t* dir) {
         }
     }
 
+    if (child_idx >= MAX_DIR_ENTRIES) {
+        klog("[ext2] warning: directory truncated at MAX_DIR_ENTRIES\n");
+    }
+
     kfree(bbuf);
     kfree(ibuf);
 }
@@ -320,12 +325,17 @@ int ext2_read_file(uint32_t ino, uint8_t* buffer, size_t size) {
     size_t offset = 0;
     uint32_t nblocks = ((uint32_t)size + sb.block_size - 1) / sb.block_size;
     for (uint32_t b = 0; b < nblocks && offset < size; b++) {
-        uint32_t phys = ext2_bmap(inode.block, b, ibuf);
-        if (phys == 0) break;
-        if (ext2_read_block(phys, bbuf) != 0) break;
-
         size_t copy = sb.block_size;
         if (offset + copy > size) copy = size - offset;
+
+        uint32_t phys = ext2_bmap(inode.block, b, ibuf);
+        if (phys == 0) {
+            /* sparse hole: ext2 semantics are a zero block, not EOF */
+            memset(buffer + offset, 0, copy);
+            offset += copy;
+            continue;
+        }
+        if (ext2_read_block(phys, bbuf) != 0) break;
         memcpy(buffer + offset, bbuf, copy);
         offset += copy;
     }

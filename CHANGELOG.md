@@ -2,6 +2,19 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.7.1] - 2026-10-03
+Storage-subsystem audit: fixed the data-loss/corruption paths found in the disk/FAT/ext2 stack. ext2 (main path) and FAT fallback verified in QEMU after the changes (ext2 probe + mount + memfs self-test; FAT format → reload → fs_init complete).
+
+### Fixed
+- **ext2 sparse-file holes truncated reads**: a block mapped to 0 (hole) ended the read instead of zero-filling — files with holes silently cut short mid-way ([ext2.c](src/kernel/fs/ext2.c)).
+- **FAT directory-entry matching broke on case/truncation**: updates and deletes matched the on-disk 8.3 upper-case short name against the original in-memory name (`strcmp("LIBC.SO", "libc.so")` fails silently), so after writing a file its on-disk size/cluster stayed 0 (data "lost" on remount) and deletes never wrote the 0xE5 tombstone. Each `fs_entry_t` now caches the actual 11-byte on-disk short name (`disk_name`) and matching is a byte-exact `memcmp`.
+- **FAT short-name collisions**: distinct long names truncating to the same 8.3 short name silently shared one disk entry; creation now falls back to classic `NAME~1.EXT` mangling (mtools/dos semantics) via an on-disk collision scan.
+- **`read_directory_entries` over-reported the entry count** after an IO-error break mid-directory: the tail of the entry array was uninitialized heap memory, parsed as file entries. It now reports the number actually filled.
+- **ATA DMA → PIO fallback left the drive mid-command**: the fallback now drains BSY before reprogramming the taskfile (real hardware keeps BSY/DRQ set after a timed-out DMA).
+- **disk device API had no position semantics**: `device_read/write` streamed from sector 0 unconditionally; the start LBA is now settable via `DISK_IOC_SET_LBA` ioctl (documented; the fs layer does not use the device API).
+- Imposed-plausibility check on the FAT BPB at mount (bytes/sector, sectors/cluster, fat count) instead of trusting a magic-matching garbage boot sector; oversized writes now log the clamp instead of truncating silently; directory loading past `MAX_DIR_ENTRIES` logs a truncation warning instead of dropping entries silently.
+- Removed dead code (`fs_save_file`/`fs_save_directory`), a dead `old_size` variable and unused-parameter warnings in disk.c; corrected a wrong comment in `make_ext2_disk.sh`.
+
 ## [3.7.0] - 2026-09-28
 The `8139compat` demo is replaced by the **real upstream Linux 8139too driver**, compiled into the kernel nearly as-is on top of the compat layer — full DHCP verified stable in QEMU.
 

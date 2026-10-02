@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 
 IMG=build/ext2.img
 ROOT=build/ext2_rootfs
-SIZE_BLOCKS=8192   # 8192 x 1 KiB = 8 MiB = 16384 sectors (== DISK_MAX_SECTORS)
+SIZE_BLOCKS=8192   # 8192 x 1 KiB = 8 MiB = 16384 sectors (DISK_MAX_SECTORS = 65536)
 
 BB="$HOME/busybox-1.36.1/busybox"
 if [ ! -f "$BB" ]; then
