@@ -294,6 +294,20 @@ void term_gui_render(void) {
     }
 }
 
+/* Move the terminal to a new glyph origin / repaint region (window drag).
+ * Cell content and cursor position are preserved; only placement changes. */
+void term_gui_move(int base_x, int base_y,
+                   int clr_x, int clr_y, int clr_w, int clr_h) {
+    if (g_current_term != &g_gui_term) return;
+    gui_term_priv_t* p = &g_gui_priv;
+    p->base_x = base_x;
+    p->base_y = base_y;
+    p->clr_x  = clr_x;
+    p->clr_y  = clr_y;
+    p->clr_w  = clr_w;
+    p->clr_h  = clr_h;
+}
+
 int term_gui_get_cursor_y(void) {
     if (g_current_term != &g_gui_term) return 0;
     gui_term_priv_t* p = &g_gui_priv;

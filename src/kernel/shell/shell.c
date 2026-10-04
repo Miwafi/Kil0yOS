@@ -454,7 +454,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.7.1\n");
+    vga_puts("Kil0yOS v3.8.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -525,16 +525,22 @@ static int dt_use_fb = 0;
 static int dt_w = GFX_WIDTH;
 static int dt_h = GFX_HEIGHT;
 
-/* Desktop layout geometry (mode13h and GOP desktops share the layout):
- * left function panel | right-top shell terminal | right-bottom kernel log. */
+/* Desktop layout geometry: panel code renders in app-window-local coords
+ * synced from the window manager (lay_*); lay_h is the content height. */
 static int lay_header_h, lay_footer_h;
-static int lay_left_w;      /* function panel width */
-static int lay_split_y;     /* y of the separator between shell and klog panes */
+static int lay_left_w;      /* function panel width (app-window interior) */
+static int lay_h;           /* app-window content height (local coords)   */
 
-/* Left-panel functions, selectable through the Win-key popup menu */
+/* WM syncs the panel geometry to the app window before any panel render */
+static void app_sync_layout(void);
+static void app_begin_draw(void);
+
+/* Left-panel functions, selectable through the start menu / F-keys */
 enum { FUNC_EDITOR = 0, FUNC_FILES, FUNC_SYSTEM, FUNC_CATS, DT_MENU_COUNT };
-static const char* dt_menu_items[DT_MENU_COUNT] = {
-    "Editor", "Files", "System", "CATs"
+#define MENU_EXIT      DT_MENU_COUNT            /* last start-menu entry  */
+#define MENU_COUNT_ALL (DT_MENU_COUNT + 1)
+static const char* dt_menu_items[MENU_COUNT_ALL] = {
+    "Editor", "Files", "System", "CATs", "Exit Desktop"
 };
 static int active_func = FUNC_EDITOR;
 
@@ -546,17 +552,27 @@ static int panel_content_top(void) {
     return lay_header_h + 1 + SEL_ROWS * SEL_ROW_H + 6;
 }
 
+/* Global draw offset: the panel code (file manager, editor, system panel)
+ * works in window-local coordinates; the window manager sets the offset to
+ * the app window's content origin before rendering panel content, and back
+ * to (0,0) for screen-space drawing (modals, taskbar, wallpaper). */
+static int dt_ox = 0, dt_oy = 0;
+static void dt_offset(int x, int y) { dt_ox = x; dt_oy = y; }
+
 static void dt_fill_rect(int x, int y, int w, int h, uint8_t c) {
+    x += dt_ox; y += dt_oy;
     if (dt_use_fb) fb_gfx_fill_rect(x, y, w, h, c);
     else           vga_fill_rect(x, y, w, h, c);
 }
 
 static void dt_draw_rect(int x, int y, int w, int h, uint8_t c) {
+    x += dt_ox; y += dt_oy;
     if (dt_use_fb) fb_gfx_draw_rect(x, y, w, h, c);
     else           vga_draw_rect(x, y, w, h, c);
 }
 
 static void dt_draw_string(int x, int y, const char* s, uint8_t c) {
+    x += dt_ox; y += dt_oy;
     if (dt_use_fb) fb_gfx_draw_string(x, y, s, c);
     else           vga_draw_string(x, y, s, c);
 }
@@ -617,30 +633,132 @@ static uint8_t dt_nearest_ega(uint32_t rgb, int x, int y) {
 }
 
 static void dt_pixel_rgb(int x, int y, uint32_t rgb) {
+    x += dt_ox; y += dt_oy;
     if (dt_use_fb) fb_gfx_pixel_rgb(x, y, rgb);
     else           vga_plot_pixel(x, y, dt_nearest_ega(rgb, x, y));
 }
 
-/* ===== Win-key function menu popup ===== */
+/* ===== Window manager =====
+ * Three floating windows on a wallpaper above a taskbar: the app panel
+ * (Editor/Files/System/CATs render into it unchanged through the dt_offset
+ * translation), the shell terminal and the kernel-log view. Windows drag
+ * by their title bar, focus/raise on click, and hide through the title-bar
+ * close button (taskbar buttons bring them back). */
+static void wm_repaint(void);               /* fwd: full desktop repaint     */
+static void desktop_switch_func(int f, mouse_state_t* prev);   /* fwd      */
+
+enum { WIN_APPS = 0, WIN_SHELL, WIN_KLOG, WIN_COUNT };
+typedef struct {
+    int x, y, w, h;
+    int visible;
+} dtwin_t;
+static dtwin_t dt_win[WIN_COUNT];
+static int win_z[WIN_COUNT];            /* win_z[0]=bottom .. [top]=focused */
+static int win_focused = WIN_SHELL;
+static int g_title_h   = 14;            /* per-backend chrome metrics       */
+static int g_taskbar_h = 20;
+static int g_shadow    = 3;
+static int wm_menu_open = 0;            /* start menu (drawn by taskbar)    */
+static int wm_menu_sel  = 0;
+
+static const char* win_titles[WIN_COUNT] = { "Apps", "Shell", "Kernel Log" };
+static const char* win_tasks[WIN_COUNT]  = { "Apps", "Shell", "Log" };
+
+static void win_raise(int idx) {
+    int z, cur = -1;
+    for (z = 0; z < WIN_COUNT; z++) {
+        if (win_z[z] == idx) { cur = z; break; }
+    }
+    if (cur < 0) return;
+    for (z = cur; z < WIN_COUNT - 1; z++) win_z[z] = win_z[z + 1];
+    win_z[WIN_COUNT - 1] = idx;
+    win_focused = idx;
+}
+
+/* content rect (inside the 1px border, below the title bar) */
+static void win_content(int idx, int* cx, int* cy, int* cw, int* ch) {
+    *cx = dt_win[idx].x + 1;
+    *cy = dt_win[idx].y + 1 + g_title_h;
+    *cw = dt_win[idx].w - 2;
+    *ch = dt_win[idx].h - 2 - g_title_h;
+}
+
+/* Panel code works in window-local coordinates against lay_*: the app
+ * window content is its "virtual screen" (tiny header/footer padding). */
+static void app_sync_layout(void) {
+    int ax, ay, aw, ah;
+    win_content(WIN_APPS, &ax, &ay, &aw, &ah);
+    (void)ax; (void)ay;
+    lay_left_w   = aw;
+    lay_header_h = 2;
+    lay_footer_h = 2;
+    lay_h        = ah;
+}
+
+/* enter app-window local drawing space (panel render funnels call this) */
+static void app_begin_draw(void) {
+    int ax, ay, aw, ah;
+    win_content(WIN_APPS, &ax, &ay, &aw, &ah);
+    (void)aw; (void)ah;
+    app_sync_layout();
+    dt_offset(ax, ay);
+}
+
+/* topmost visible window containing the point, or -1 */
+static int win_at(int px, int py) {
+    for (int z = WIN_COUNT - 1; z >= 0; z--) {
+        int i = win_z[z];
+        if (!dt_win[i].visible) continue;
+        if (px >= dt_win[i].x && px < dt_win[i].x + dt_win[i].w &&
+            py >= dt_win[i].y && py < dt_win[i].y + dt_win[i].h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int win_hit_title(int idx, int px, int py) {
+    return px >= dt_win[idx].x && px < dt_win[idx].x + dt_win[idx].w &&
+           py >= dt_win[idx].y && py < dt_win[idx].y + 1 + g_title_h;
+}
+
+static int win_hit_close(int idx, int px, int py) {
+    int bx = dt_win[idx].x + dt_win[idx].w - 14;
+    return px >= bx && px < bx + 12 &&
+           py >= dt_win[idx].y + 2 && py < dt_win[idx].y + g_title_h;
+}
+
+/* ===== Start menu (Win key / taskbar start button) ===== */
+static void menu_rect_get(int* mx, int* my, int* mw, int* mh) {
+    int spacing = dt_use_fb ? 16 : 12;
+    int w = 18 * 8;
+    int h = MENU_COUNT_ALL * spacing + 22;
+    *mx = 4;
+    *my = dt_h - g_taskbar_h - h - 2;
+    *mw = w;
+    *mh = h;
+}
+
 static void menu_popup_draw(int sel) {
     int spacing = dt_use_fb ? 16 : 12;
-    int w = 18 * 8;                          /* widest item + padding */
-    int h = DT_MENU_COUNT * spacing + 20;
-    int x = (dt_w - w) / 2;
-    int y = (dt_h - h) / 2;
+    int x, y, w, h;
+    menu_rect_get(&x, &y, &w, &h);
 
+    dt_offset(0, 0);   /* screen-space: callers may leave the app offset set */
+    dt_fill_rect(x + 3, y + 3, w, h, 0x00);            /* drop shadow */
     dt_fill_rect(x, y, w, h, 0x0F);
-    dt_draw_rect(x, y, w, h, 0x09);
-    dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
-    dt_draw_string(x + 4, y + 3, "Menu", 0x09);
+    dt_draw_rect(x, y, w, h, 0x00);
+    dt_fill_rect(x + 1, y + 1, w - 2, 13, 0x09);       /* title strip */
+    dt_draw_string(x + 4, y + 4, "Kil0yOS", 0x0F);
 
-    for (int i = 0; i < DT_MENU_COUNT; i++) {
-        int iy = y + 14 + i * spacing;
+    for (int i = 0; i < MENU_COUNT_ALL; i++) {
+        int iy = y + 16 + i * spacing;
         if (i == sel) {
-            dt_fill_rect(x + 3, iy - 1, w - 6, spacing - 1, 0x01);
+            dt_fill_rect(x + 3, iy - 1, w - 6, spacing - 1, 0x09);
             dt_draw_string(x + 8, iy, dt_menu_items[i], 0x0F);
         } else {
-            dt_draw_string(x + 8, iy, dt_menu_items[i], 0x00);
+            dt_draw_string(x + 8, iy, dt_menu_items[i],
+                           (i == MENU_EXIT) ? 0x08 : 0x00);
         }
     }
 }
@@ -671,6 +789,13 @@ static void klog_view_init(int bx, int by, int cols, int rows,
     /* show the tail of the logs emitted before the desktop started */
     if (kl_seq > 1024) kl_seq -= 1024;
     for (int r = 0; r < KL_MAX_ROWS; r++) kl_lines[r][0] = '\0';
+}
+
+/* Reposition the log view inside its window (window drag); the line ring
+ * content is preserved. */
+static void klog_view_move(int bx, int by, int cx, int cy, int cw, int ch) {
+    kl_bx = bx; kl_by = by;
+    kl_cx = cx; kl_cy = cy; kl_cw = cw; kl_ch = ch;
 }
 
 static void kl_push_line(const char* s) {
@@ -976,9 +1101,12 @@ static void fm_size_str(uint32_t sz, char* out) {
 
 static void fm_render(void) {
     int cx = 4;
-    int ctop = panel_content_top();
-    int y = ctop + 2;
-    int bottom = dt_h - lay_footer_h - 1;
+    int ctop, y, bottom;
+
+    app_begin_draw();                      /* app-window local space */
+    ctop = panel_content_top();
+    y = ctop + 2;
+    bottom = lay_h - lay_footer_h - 1;
 
     dt_fill_rect(1, ctop, lay_left_w - 2, bottom - ctop, 0x0F);
 
@@ -1442,6 +1570,7 @@ static void fm_input_box_draw(void) {
     int x = (dt_w - w) / 2;
     int y = (dt_h - h) / 2;
 
+    dt_offset(0, 0);                       /* modal: screen space */
     dt_fill_rect(x, y, w, h, 0x0F);
     dt_draw_rect(x, y, w, h, 0x09);
     dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
@@ -1461,6 +1590,7 @@ static void fm_confirm_draw(void) {
     int x = (dt_w - w) / 2;
     int y = (dt_h - h) / 2;
 
+    dt_offset(0, 0);                       /* modal: screen space */
     dt_fill_rect(x, y, w, h, 0x0F);
     dt_draw_rect(x, y, w, h, 0x09);
     dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
@@ -1481,6 +1611,7 @@ static void fm_preview_draw(void) {
     int x = (dt_w - w) / 2;
     int y = (dt_h - h) / 2;
 
+    dt_offset(0, 0);                       /* modal: screen space */
     dt_fill_rect(x, y, w, h, 0x0F);
     dt_draw_rect(x, y, w, h, 0x09);
     dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
@@ -1501,6 +1632,7 @@ static void fm_preview_draw(void) {
  * YCbCr planes and pushed through dt_pixel_rgb (native RGB on GOP, dithered
  * EGA-16 on the mode12h desktop). */
 static void fm_image_draw(void) {
+    dt_offset(0, 0);                       /* modal: screen space */
     if (fm_img_fail) {
         int w = 240, h = 64;
         int x = (dt_w - w) / 2;
@@ -1574,6 +1706,7 @@ static void fm_image_draw(void) {
 
 /* FM_AUDIO: centered player window with progress bar */
 static void fm_audio_draw(void) {
+    dt_offset(0, 0);                       /* modal: screen space */
     if (fm_img_fail) {
         int w = 328, h = 64;      /* wide enough for the probe-failure reason */
         int x = (dt_w - w) / 2;
@@ -1832,9 +1965,11 @@ static void ed_enter_edit(void) {
 
 /* visible text rows in the editor panel (title/path/status reserved) */
 static int ed_view_rows(void) {
-    int top_y = panel_content_top() + 28;
-    int bottom = dt_h - lay_footer_h - 24;
-    int rows = (bottom - top_y) / 10;
+    int top_y, bottom, rows;
+    app_begin_draw();                      /* sync lay_* to the app window */
+    top_y = panel_content_top() + 28;
+    bottom = lay_h - lay_footer_h - 24;
+    rows = (bottom - top_y) / 10;
     return (rows < 1) ? 1 : rows;
 }
 
@@ -1879,8 +2014,11 @@ static void ed_refresh(void) {
 
 static void ed_pick_draw(void) {
     int cx = 4;
-    int ctop = panel_content_top();
-    int bottom = dt_h - lay_footer_h - 1;
+    int ctop, bottom;
+
+    app_begin_draw();                      /* app-window local space */
+    ctop = panel_content_top();
+    bottom = lay_h - lay_footer_h - 1;
 
     dt_fill_rect(1, ctop, lay_left_w - 2, bottom - ctop, 0x0F);
 
@@ -1920,8 +2058,11 @@ static void ed_pick_draw(void) {
 
 static void ed_edit_draw(void) {
     int cx = 4;
-    int ctop = panel_content_top();
-    int bottom = dt_h - lay_footer_h - 1;
+    int ctop, bottom;
+
+    app_begin_draw();                      /* app-window local space */
+    ctop = panel_content_top();
+    bottom = lay_h - lay_footer_h - 1;
 
     dt_fill_rect(1, ctop, lay_left_w - 2, bottom - ctop, 0x0F);
 
@@ -1960,6 +2101,7 @@ static void ed_input_draw(void) {
     int x = (dt_w - w) / 2;
     int y = (dt_h - h) / 2;
 
+    dt_offset(0, 0);                       /* modal: screen space */
     dt_fill_rect(x, y, w, h, 0x0F);
     dt_draw_rect(x, y, w, h, 0x09);
     dt_draw_rect(x + 1, y + 1, w - 2, h - 2, 0x09);
@@ -2113,8 +2255,11 @@ static void draw_func_selector(void) {
 /* Left function panel: target of the Win-key menu. Default = text editor. */
 static void draw_func_panel(int func) {
     int cx = 4;
-    int cy = panel_content_top() + 3;
-    int content_h = dt_h - lay_header_h - lay_footer_h;
+    int cy, content_h;
+
+    app_begin_draw();                      /* app-window local space */
+    cy = panel_content_top() + 3;
+    content_h = lay_h - lay_header_h - lay_footer_h;
 
     /* clear interior (inside border) */
     dt_fill_rect(1, lay_header_h + 1, lay_left_w - 2, content_h - 2, 0x0F);
@@ -2225,7 +2370,7 @@ static void draw_func_panel(int func) {
             itoa(ntasks, buf + 7, 10, 8);
             dt_draw_string(cx, y, buf, 0x00);
 
-            int bottom = dt_h - lay_footer_h - 2;
+            int bottom = lay_h - lay_footer_h - 2;
             for (int i = 0; i < MAX_TASKS; i++) {
                 int st = task_get_status(i);
                 if (st == TASK_DEAD) continue;
@@ -2248,27 +2393,51 @@ static void draw_func_panel(int func) {
     }
 }
 
-static void gui_draw_datetime(int footer_h) {
-    rtc_time_t t;
-    if (rtc_read(&t) != 0) return;
+/* ===== window frame + taskbar + desktop repaint ===== */
 
+static void win_draw_frame(int idx) {
+    dtwin_t* w = &dt_win[idx];
+    int focused = (win_focused == idx);
+    int ty = w->y + (g_title_h - 8) / 2 + 1;
+    int cbx = w->x + w->w - 14;
+    const char* title = (idx == WIN_APPS) ? dt_menu_items[active_func]
+                                          : win_titles[idx];
+
+    dt_fill_rect(w->x + g_shadow, w->y + g_shadow, w->w, w->h, 0x00);
+    dt_fill_rect(w->x, w->y, w->w, w->h, 0x0F);
+    dt_draw_rect(w->x, w->y, w->w, w->h, 0x00);
+    dt_fill_rect(w->x + 1, w->y + 1, w->w - 2, g_title_h - 1,
+                 focused ? 0x09 : 0x07);
+    dt_draw_string(w->x + 4, ty, title, focused ? 0x0F : 0x00);
+    dt_fill_rect(cbx, w->y + 2, 12, g_title_h - 3, 0x04);
+    dt_draw_string(cbx + 2, ty, "x", 0x0F);
+}
+
+/* clock in the taskbar corner: full date on wide screens, time-only below */
+static void taskbar_clock_draw(void) {
+    rtc_time_t t;
     char buf[32];
     char* p = buf;
+    int len, x, ty, ey;
 
-    /* year */
-    itoa((int)t.year, p, 10, 16);
-    while (*p) p++;
-    *p++ = '-';
-    /* month */
-    if (t.month < 10) *p++ = '0';
-    itoa((int)t.month, p, 10, 4);
-    while (*p) p++;
-    *p++ = '-';
-    /* day */
-    if (t.day < 10) *p++ = '0';
-    itoa((int)t.day, p, 10, 4);
-    while (*p) p++;
-    *p++ = ' ';
+    if (rtc_read(&t) != 0) return;
+
+    if (dt_w >= 640) {
+        /* year */
+        itoa((int)t.year, p, 10, 16);
+        while (*p) p++;
+        *p++ = '-';
+        /* month */
+        if (t.month < 10) *p++ = '0';
+        itoa((int)t.month, p, 10, 4);
+        while (*p) p++;
+        *p++ = '-';
+        /* day */
+        if (t.day < 10) *p++ = '0';
+        itoa((int)t.day, p, 10, 4);
+        while (*p) p++;
+        *p++ = ' ';
+    }
     /* hour */
     if (t.hour < 10) *p++ = '0';
     itoa((int)t.hour, p, 10, 4);
@@ -2285,102 +2454,158 @@ static void gui_draw_datetime(int footer_h) {
     while (*p) p++;
     *p = '\0';
 
-    int len = strlen(buf);
-    int x = dt_w - len * 8 - 4;
-    if (x < 0) x = 0;
-
-    dt_fill_rect(x, dt_h - footer_h + 1, len * 8 + 2, 8, 0x01);
-    dt_draw_string(x, dt_h - footer_h + 2, buf, 0x0F);
+    len = strlen(buf) * 8;
+    x = dt_w - len - 6;
+    ty = dt_h - g_taskbar_h;
+    ey = ty + (g_taskbar_h - 8) / 2;
+    dt_fill_rect(x - 1, ey - 1, len + 2, 10, 0x08);
+    dt_draw_string(x, ey, buf, 0x0F);
 }
 
-/* Desktop chrome: backdrop, header bar, left function panel, right-top
- * shell pane, right-bottom kernel-log pane, footer + clock. Shared by the
- * mode13h and GOP desktops; geometry lives in the lay_* statics. */
-static void desktop_draw_chrome(void) {
-    int content_h = dt_h - lay_header_h - lay_footer_h;
-    int right_w = dt_w - lay_left_w;
-    int title_y = (lay_header_h - 8) / 2;
-    if (title_y < 2) title_y = 2;
+static void taskbar_draw(void) {
+    int ty = dt_h - g_taskbar_h;
+    int spacing = dt_use_fb ? 4 : 8;
+    int bw = 6 * 8 + 10;
+    int bx;
 
-    /* clear screen (aligned to vertical retrace to avoid tearing) */
-    dt_wait_vsync();
-    dt_fill_rect(0, 0, dt_w, dt_h, 0x0F);
+    dt_offset(0, 0);
+    dt_fill_rect(0, ty, dt_w, g_taskbar_h, 0x08);
+    dt_fill_rect(0, ty, dt_w, 1, 0x00);            /* top edge */
 
-    /* top header bar */
-    dt_fill_rect(0, 0, dt_w, lay_header_h, 0x0F);
-    dt_draw_rect(0, 0, dt_w, lay_header_h, 0x03);
-    dt_draw_string(4, title_y, "Kil0yOS v3.7.1", 0x00);
-    dt_draw_string(dt_w - 148, title_y, "[Win]=Menu  F1-F4", 0x01);
+    /* start button */
+    dt_fill_rect(2, ty + 2, bw, g_taskbar_h - 4, wm_menu_open ? 0x09 : 0x01);
+    dt_draw_string(7, ty + (g_taskbar_h - 8) / 2, "Start", 0x0F);
 
-    /* left function panel */
-    dt_fill_rect(0, lay_header_h, lay_left_w, content_h, 0x0F);
-    dt_draw_rect(0, lay_header_h, lay_left_w, content_h, 0x03);
-
-    /* right-top shell pane */
-    dt_fill_rect(lay_left_w, lay_header_h, right_w,
-                 lay_split_y - lay_header_h, 0x0F);
-    dt_draw_rect(lay_left_w, lay_header_h, right_w,
-                 lay_split_y - lay_header_h, 0x03);
-    dt_draw_string(lay_left_w + 4, lay_header_h + 2, "Shell", 0x09);
-
-    /* right-bottom kernel-log pane */
-    int klog_h = dt_h - lay_footer_h - lay_split_y;
-    dt_fill_rect(lay_left_w, lay_split_y, right_w, klog_h, 0x0F);
-    dt_draw_rect(lay_left_w, lay_split_y, right_w, klog_h, 0x03);
-    dt_draw_string(lay_left_w + 4, lay_split_y + 2, "Kernel Log", 0x09);
-
-    /* bottom footer bar */
-    dt_fill_rect(0, dt_h - lay_footer_h, dt_w, lay_footer_h, 0x0F);
-    dt_draw_rect(0, dt_h - lay_footer_h, dt_w, lay_footer_h, 0x03);
-    {
-        char pl[40];
-        strcpy(pl, "Panel: ");
-        strcat(pl, dt_menu_items[active_func]);
-        dt_draw_string(4, dt_h - lay_footer_h + 6, pl, 0x08);
+    /* task buttons */
+    bx = 2 + bw + spacing;
+    for (int i = 0; i < WIN_COUNT; i++) {
+        const char* label = win_tasks[i];
+        int active = dt_win[i].visible && (win_focused == i);
+        bw = strlen(label) * 8 + 8;
+        dt_fill_rect(bx, ty + 2, bw, g_taskbar_h - 4, active ? 0x09 : 0x00);
+        dt_draw_string(bx + 4, ty + (g_taskbar_h - 8) / 2, label,
+                       dt_win[i].visible ? (active ? 0x0F : 0x0B) : 0x08);
+        bx += bw + spacing;
     }
-    gui_draw_datetime(lay_footer_h);
 
-    draw_func_panel(active_func);
+    taskbar_clock_draw();
 }
 
-/* Full repaint after the menu popup closes (chrome + panes + prompt + log).
- * An open Files modal popup (input/confirm/preview) is drawn last so it
- * survives the repaint that closes the Win-key menu over it; same for the
- * editor's centered new-file input. */
-static void desktop_repaint(void) {
-    desktop_draw_chrome();
-    term_gui_render();   /* paints the prompt too: it lives in the cells */
-    klog_view_render();
-    if (active_func == FUNC_FILES) {
+/* clicks inside the taskbar strip: start button + task buttons */
+static void taskbar_click(int mx, int my, mouse_state_t* st) {
+    int spacing = dt_use_fb ? 4 : 8;
+    int bw = 6 * 8 + 10;
+    int bx;
+    (void)my;
+
+    if (mx >= 2 && mx < 2 + bw) {
+        wm_menu_open = !wm_menu_open;
+        wm_menu_sel = 0;
+    } else {
+        bx = 2 + bw + spacing;
+        for (int i = 0; i < WIN_COUNT; i++) {
+            const char* label = win_tasks[i];
+            bw = strlen(label) * 8 + 8;
+            if (mx >= bx && mx < bx + bw) {
+                dt_win[i].visible = 1;
+                win_raise(i);
+                break;
+            }
+            bx += bw + spacing;
+        }
+    }
+    dt_cursor_erase(st->x, st->y);
+    wm_repaint();
+    dt_cursor_draw(st->x, st->y);
+}
+
+/* activate a start-menu entry; returns 1 when "Exit Desktop" was chosen */
+static int menu_activate(int sel, mouse_state_t* st) {
+    wm_menu_open = 0;
+    if (sel == MENU_EXIT) return 1;
+    desktop_switch_func(sel, st);
+    return 0;
+}
+
+/* Full desktop repaint: wallpaper, windows in z-order (each content
+ * rendered through its own backend), open modals, start menu, taskbar.
+ * The mouse cursor is NOT drawn here - callers erase it before and redraw
+ * it after (the cursor save/restore snapshots must not go stale). */
+static void wm_repaint(void) {
+    dt_offset(0, 0);
+    dt_wait_vsync();
+    dt_fill_rect(0, 0, dt_w, dt_h, 0x03);          /* wallpaper */
+
+    for (int z = 0; z < WIN_COUNT; z++) {
+        int i = win_z[z];
+        int cx, cy, cw, ch;
+        if (!dt_win[i].visible) continue;
+
+        /* frame is always screen-space: the previous z-iteration may have
+         * left the app-window content offset set (APPS panel draw) */
+        dt_offset(0, 0);
+        win_draw_frame(i);
+        if (i == WIN_APPS) {
+            app_begin_draw();
+            draw_func_panel(active_func);
+        } else if (i == WIN_SHELL) {
+            win_content(i, &cx, &cy, &cw, &ch);
+            dt_offset(0, 0);
+            term_gui_move(cx + 2, cy + 2, cx + 1, cy + 1, cw - 2, ch - 2);
+            term_gui_render();
+        } else {                                   /* WIN_KLOG */
+            win_content(i, &cx, &cy, &cw, &ch);
+            dt_offset(0, 0);
+            klog_view_move(cx + 2, cy + 2, cx + 1, cy + 1, cw - 2, ch - 2);
+            klog_view_render();
+        }
+    }
+
+    dt_offset(0, 0);
+    /* open modals float above every window */
+    if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
         fm_modal_draw();
     } else if (active_func == FUNC_EDITOR && ed_mode == ED_INPUT) {
         ed_input_draw();
     }
+    if (wm_menu_open) menu_popup_draw(wm_menu_sel);
+
+    taskbar_draw();
 }
 
-/* Switch the active left-panel function (F-keys, arrows, selector clicks,
- * Win menu) with a full repaint; the Editor panel re-opens its file picker
- * on every entry. */
+/* legacy entry point: panel/modal handlers repaint the whole desktop */
+static void desktop_repaint(void) {
+    wm_repaint();
+}
+
+/* Switch the active app-panel function (F-keys, arrows, selector clicks,
+ * start menu), showing/raising the app window; full repaint. */
 static void desktop_switch_func(int f, mouse_state_t* prev) {
-    if (f == active_func) return;
+    int changed = (f != active_func);
     active_func = f;
-    if (f == FUNC_EDITOR) ed_enter_picker();
+    dt_win[WIN_APPS].visible = 1;
+    win_raise(WIN_APPS);
+    if (changed && f == FUNC_EDITOR) ed_enter_picker();
     dt_cursor_erase(prev->x, prev->y);
-    desktop_repaint();
+    wm_repaint();
     dt_cursor_draw(prev->x, prev->y);
-    klog("[desktop] func -> ");
-    klog(dt_menu_items[active_func]);
-    klog("\n");
+    if (changed) {
+        klog("[desktop] func -> ");
+        klog(dt_menu_items[active_func]);
+        klog("\n");
+    }
 }
 
-/* Shared desktop main loop: Win-key menu popup, shell input, kernel-log
- * pump, clock, pointer. Runs until ESC; both desktops differ only in
- * geometry/backend. Keyboard focus stays on the right-top shell pane. */
+/* Shared desktop main loop: start menu, window drag/focus, shell input,
+ * kernel-log pump, clock, pointer. Runs until ESC or Start > Exit; the
+ * mode13h and GOP desktops differ only in geometry/backend. Keyboard
+ * typing always feeds the shell window; panel functions stay mouse- and
+ * F-key-driven. */
 static void desktop_run_loop(void) {
     extern void klog(const char* s);
-    int menu_open = 0;
-    int menu_sel = 0;
     static int trace_moved = 0;
+    int drag_win = -1;
+    int drag_dx = 0, drag_dy = 0;
 
     mouse_state_t prev = { .x = -1, .y = -1, .buttons = 0 };
     uint8_t last_second = 0xFF;
@@ -2392,38 +2617,38 @@ static void desktop_run_loop(void) {
 
     while (1) {
         kernel_heartbeat_touch();   /* kwatchdog: desktop loop is alive */
-        /* update clock every second */
+        /* update the taskbar clock once a second */
         rtc_time_t t;
         if (rtc_read(&t) == 0 && t.second != last_second) {
             last_second = t.second;
-            klog(".");   /* TEMP heartbeat: proves the loop is alive */
 
             /* hide pointer first so repaints are not clobbered by stale restore pixels */
             dt_cursor_erase(prev.x, prev.y);
 
-            dt_wait_vsync();
-            gui_draw_datetime(lay_footer_h);
+            taskbar_draw();
 
             /* auto-refresh System Monitor CPU stats */
-            if (active_func == FUNC_SYSTEM) {
+            if (dt_win[WIN_APPS].visible && active_func == FUNC_SYSTEM) {
                 smp_update_cpu_usage();
+                app_begin_draw();
                 draw_func_panel(FUNC_SYSTEM);
             }
 
             /* MP3 player: tick the elapsed-time readout and progress bar */
             if (active_func == FUNC_FILES && fm_mode == FM_AUDIO) {
-                fm_modal_draw();
+                fm_modal_draw();       /* modal: screen space internally */
             }
 
             /* pointer back with a fresh background snapshot */
             dt_cursor_draw(prev.x, prev.y);
         }
 
-        /* pump new kernel-log lines into the right-bottom pane */
-        if (klog_view_pump()) {
+        /* pump new kernel-log lines into the log window */
+        if (klog_view_pump() && dt_win[WIN_KLOG].visible) {
             dt_cursor_erase(prev.x, prev.y);
+            dt_offset(0, 0);
             klog_view_render();
-            /* the log pane overlaps the centered Files modal (e.g. the
+            /* the log window may sit under a centered Files modal (e.g. the
              * image viewer) - repaint it above the fresh log lines; same
              * for the editor's centered new-file input */
             if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
@@ -2438,15 +2663,15 @@ static void desktop_run_loop(void) {
             unsigned char c = (unsigned char)keyboard_getc();
 
             if (c == KEY_ESC) {
-                if (menu_open) {
-                    menu_open = 0;
+                if (wm_menu_open) {
+                    wm_menu_open = 0;
                     dt_cursor_erase(prev.x, prev.y);
-                    desktop_repaint();
+                    wm_repaint();
                     dt_cursor_draw(prev.x, prev.y);
                 } else if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
                     fm_close_modal();  /* modal dialog: close, keep desktop */
                     dt_cursor_erase(prev.x, prev.y);
-                    desktop_repaint();
+                    wm_repaint();
                     dt_cursor_draw(prev.x, prev.y);
                 } else if (active_func == FUNC_EDITOR && ed_mode != ED_IDLE) {
                     ed_handle_key(KEY_ESC, prev.x, prev.y);
@@ -2458,35 +2683,30 @@ static void desktop_run_loop(void) {
                     (active_func == FUNC_EDITOR && ed_mode != ED_IDLE)) {
                     /* modal dialog owns the keyboard: swallow */
                 } else {
-                    menu_open = !menu_open;
+                    wm_menu_open = !wm_menu_open;
+                    wm_menu_sel = active_func;
                     dt_cursor_erase(prev.x, prev.y);
-                    if (menu_open) {
-                        menu_sel = active_func;
-                        menu_popup_draw(menu_sel);
-                    } else {
-                        desktop_repaint();
-                    }
+                    wm_repaint();
                     dt_cursor_draw(prev.x, prev.y);
                 }
-            } else if (menu_open) {
+            } else if (wm_menu_open) {
                 if (c == KEY_UP || c == KEY_DOWN) {
-                    int old_sel = menu_sel;
-                    if (c == KEY_UP && menu_sel > 0) {
-                        menu_sel--;
-                    } else if (c == KEY_DOWN && menu_sel < DT_MENU_COUNT - 1) {
-                        menu_sel++;
+                    int old_sel = wm_menu_sel;
+                    if (c == KEY_UP && wm_menu_sel > 0) {
+                        wm_menu_sel--;
+                    } else if (c == KEY_DOWN && wm_menu_sel < MENU_COUNT_ALL - 1) {
+                        wm_menu_sel++;
                     }
-                    if (old_sel != menu_sel) {
+                    if (old_sel != wm_menu_sel) {
                         dt_cursor_erase(prev.x, prev.y);
-                        menu_popup_draw(menu_sel);
+                        menu_popup_draw(wm_menu_sel);
                         dt_cursor_draw(prev.x, prev.y);
                     }
                 } else if (c == '\n') {
-                    menu_open = 0;
-                    desktop_switch_func(menu_sel, &prev);
+                    if (menu_activate(wm_menu_sel, &prev)) break;
                 }
             } else if (c >= KEY_F1 && c <= KEY_F4) {
-                /* panel shortcuts, unless a modal editor/viewer owns the
+                /* app-panel shortcuts, unless a modal editor/viewer owns the
                  * keyboard; F1 on the idle editor reopens the file list */
                 int f = c - KEY_F1;
                 int files_modal = (active_func == FUNC_FILES &&
@@ -2496,7 +2716,7 @@ static void desktop_run_loop(void) {
                 if (f == active_func && f == FUNC_EDITOR && ed_mode == ED_IDLE) {
                     ed_enter_picker();
                     dt_cursor_erase(prev.x, prev.y);
-                    draw_func_panel(FUNC_EDITOR);
+                    wm_repaint();
                     dt_cursor_draw(prev.x, prev.y);
                 } else if (!files_modal && !ed_modal) {
                     desktop_switch_func(f, &prev);
@@ -2516,7 +2736,7 @@ static void desktop_run_loop(void) {
             } else if (active_func == FUNC_EDITOR && ed_mode != ED_IDLE) {
                 ed_handle_key(c, prev.x, prev.y);
             } else {
-                /* keyboard focus: right-top shell pane */
+                /* keyboard focus: shell window */
                 if (c == '\n') {
                     gui_shell_execute();
                 } else if (c >= 32 && c <= 126 && gui_shell_len < GUI_SHELL_BUF_SIZE - 1) {
@@ -2541,30 +2761,99 @@ static void desktop_run_loop(void) {
                 trace_moved = 1;
                 klog("[desktop] first pointer sample\n");
             }
-            /* draw_cursor restores the previous position itself when visible */
-            dt_cursor_draw(state.x, state.y);
+            if (drag_win >= 0 && left_now) {
+                int nx = state.x - drag_dx;
+                int ny = state.y - drag_dy;
+                if (nx < 0) nx = 0;
+                if (ny < 0) ny = 0;
+                if (nx > dt_w - dt_win[drag_win].w)
+                    nx = dt_w - dt_win[drag_win].w;
+                if (ny > dt_h - g_taskbar_h - dt_win[drag_win].h)
+                    ny = dt_h - g_taskbar_h - dt_win[drag_win].h;
+                if (nx != dt_win[drag_win].x || ny != dt_win[drag_win].y) {
+                    dt_win[drag_win].x = nx;
+                    dt_win[drag_win].y = ny;
+                    dt_cursor_erase(prev.x, prev.y);
+                    wm_repaint();
+                    dt_cursor_draw(state.x, state.y);
+                }
+            } else {
+                /* draw_cursor restores the previous position itself when visible */
+                dt_cursor_draw(state.x, state.y);
+            }
             prev = state;
         }
+        if (drag_win >= 0 && !left_now) drag_win = -1;   /* drop */
 
         if (left_now && !left_was) {
-            if (active_func == FUNC_FILES) {
-                fm_handle_click(state.x, state.y, state.x, state.y);
-            } else if (active_func == FUNC_EDITOR) {
-                ed_handle_click(state.x, state.y, state.x, state.y);
-            }
-            /* selector band at the top of the left panel: click to switch */
+            int mx = state.x, my = state.y;
             int files_modal = (active_func == FUNC_FILES &&
                                fm_mode != FM_BROWSE);
             int ed_modal = (active_func == FUNC_EDITOR &&
                             (ed_mode == ED_EDIT || ed_mode == ED_INPUT));
-            if (!files_modal && !ed_modal &&
-                state.x < lay_left_w &&
-                state.y >= lay_header_h + 2 &&
-                state.y < panel_content_top() - 4) {
-                int f = (state.y - (lay_header_h + 3)) / SEL_ROW_H;
-                if (f >= 0 && f < DT_MENU_COUNT) {
-                    desktop_switch_func(f, &state);
+
+            if (wm_menu_open) {
+                int mnx, mny, mw, mh;
+                menu_rect_get(&mnx, &mny, &mw, &mh);
+                if (mx >= mnx && mx < mnx + mw && my >= mny && my < mny + mh) {
+                    int sel = (my - (mny + 16)) / (dt_use_fb ? 16 : 12);
+                    if (sel >= 0 && sel < MENU_COUNT_ALL) {
+                        if (menu_activate(sel, &state)) break;
+                    }
+                } else {
+                    wm_menu_open = 0;
+                    dt_cursor_erase(prev.x, prev.y);
+                    wm_repaint();
+                    dt_cursor_draw(state.x, state.y);
                 }
+            } else if (my >= dt_h - g_taskbar_h) {
+                taskbar_click(mx, my, &state);
+            } else if (!files_modal && !ed_modal) {
+                int hit = win_at(mx, my);
+                if (hit >= 0) {
+                    win_raise(hit);
+                    if (win_hit_close(hit, mx, my)) {
+                        dt_win[hit].visible = 0;
+                        dt_cursor_erase(prev.x, prev.y);
+                        wm_repaint();
+                        dt_cursor_draw(state.x, state.y);
+                    } else if (win_hit_title(hit, mx, my)) {
+                        drag_win = hit;
+                        drag_dx = mx - dt_win[hit].x;
+                        drag_dy = my - dt_win[hit].y;
+                        dt_cursor_erase(prev.x, prev.y);
+                        wm_repaint();
+                        dt_cursor_draw(state.x, state.y);
+                    } else if (hit == WIN_APPS) {
+                        int ax, ay, aw, ah;
+                        win_content(WIN_APPS, &ax, &ay, &aw, &ah);
+                        (void)aw; (void)ah;
+                        int lx = mx - ax, ly = my - ay;
+                        if (active_func == FUNC_FILES) {
+                            fm_handle_click(lx, ly, mx, my);
+                        } else if (active_func == FUNC_EDITOR) {
+                            ed_handle_click(lx, ly, mx, my);
+                        }
+                        /* selector band at the top of the app panel */
+                        if (lx < lay_left_w && ly >= lay_header_h + 2 &&
+                            ly < panel_content_top() - 4) {
+                            int f = (ly - (lay_header_h + 3)) / SEL_ROW_H;
+                            if (f >= 0 && f < DT_MENU_COUNT) {
+                                desktop_switch_func(f, &state);
+                            }
+                        }
+                    }
+                }
+            } else if (active_func == FUNC_FILES) {
+                int ax, ay, aw, ah;
+                win_content(WIN_APPS, &ax, &ay, &aw, &ah);
+                (void)aw; (void)ah;
+                fm_handle_click(mx - ax, my - ay, mx, my);
+            } else if (active_func == FUNC_EDITOR) {
+                int ax, ay, aw, ah;
+                win_content(WIN_APPS, &ax, &ay, &aw, &ah);
+                (void)aw; (void)ah;
+                ed_handle_click(mx - ax, my - ay, mx, my);
             }
         }
         if (state.buttons != prev.buttons) prev.buttons = state.buttons;
@@ -2577,6 +2866,76 @@ static void desktop_run_loop(void) {
 
     dt_cursor_erase(prev.x, prev.y);
     klog("[desktop] loop exit\n");
+}
+
+/* default window arrangement: app panel left, shell top-right, kernel log
+ * bottom-right, all floating on the wallpaper above the taskbar */
+static void desktop_layout_init(void) {
+    int tb_top = dt_h - g_taskbar_h;
+    int avail  = tb_top - 4;
+    int aw = (dt_w >= 640) ? (dt_w / 5 + 2) : (dt_w * 5 / 8);
+    int rx, rw, sh_h;
+
+    if (dt_w >= 640) {
+        if (aw > dt_w - 130) aw = dt_w - 130;
+    } else {
+        if (aw < 122) aw = 122;
+    }
+
+    dt_win[WIN_APPS].x = 2;
+    dt_win[WIN_APPS].y = 2;
+    dt_win[WIN_APPS].w = aw;
+    dt_win[WIN_APPS].h = avail;
+
+    rx = 2 + aw + 4;
+    rw = dt_w - rx - 2;
+    sh_h = avail * 55 / 100;
+
+    dt_win[WIN_SHELL].x = rx;
+    dt_win[WIN_SHELL].y = 2;
+    dt_win[WIN_SHELL].w = rw;
+    dt_win[WIN_SHELL].h = sh_h;
+
+    dt_win[WIN_KLOG].x = rx;
+    dt_win[WIN_KLOG].y = 2 + sh_h + 4;
+    dt_win[WIN_KLOG].w = rw;
+    dt_win[WIN_KLOG].h = avail - sh_h - 4;
+
+    for (int i = 0; i < WIN_COUNT; i++) dt_win[i].visible = 1;
+    win_z[0] = WIN_APPS;
+    win_z[1] = WIN_KLOG;
+    win_z[2] = WIN_SHELL;
+    win_focused = WIN_SHELL;
+    wm_menu_open = 0;
+    wm_menu_sel = 0;
+}
+
+/* place the shell terminal + kernel-log view inside their windows and
+ * paint the first frame */
+static void desktop_views_init(int use_fb) {
+    int sx, sy, sw, sh, kx, ky, kw, kh;
+    int sh_cols, sh_rows;
+
+    win_content(WIN_SHELL, &sx, &sy, &sw, &sh);
+    sh_cols = (sw - 6) / 8;
+    sh_rows = (sh - 6) / 8;
+    if (sh_cols < 8) sh_cols = 8;
+    if (sh_rows < 4) sh_rows = 4;
+
+    if (use_fb) {
+        term_init_gop_gui(sx + 3, sy + 3, sh_cols, sh_rows,
+                          sx + 1, sy + 1, sw - 2, sh - 2);
+    } else {
+        term_init_gui_at(sx + 3, sy + 3, sh_cols, sh_rows,
+                         sx + 1, sy + 1, sw - 2, sh - 2);
+    }
+    gui_shell_init(sx + 3, sy + 3);
+
+    win_content(WIN_KLOG, &kx, &ky, &kw, &kh);
+    klog_view_init(kx + 3, ky + 3, (kw - 6) / 8, (kh - 6) / 8,
+                   kx + 1, ky + 1, kw - 2, kh - 2);
+
+    wm_repaint();
 }
 
 static int cmd_gui(int argc, char** argv) {
@@ -2601,30 +2960,12 @@ static int cmd_gui(int argc, char** argv) {
 
     vga_set_gfx_mode();
 
-    /* layout (640x480): proportional band split like the GOP desktop */
-    lay_header_h = 16;
-    lay_footer_h = 16;
-    lay_left_w = 200;
-    lay_split_y = lay_header_h +
-                  (dt_h - lay_header_h - lay_footer_h) * 55 / 100;
-
-    /* right-top shell terminal grid */
-    int sh_bx = lay_left_w + 4;
-    int sh_by = lay_header_h + 14;
-    int sh_cols = (dt_w - lay_left_w - 8) / 8;
-    int sh_rows = (lay_split_y - 12 - sh_by) / 8;
-
-    desktop_draw_chrome();
-    term_init_gui_at(sh_bx, sh_by, sh_cols, sh_rows,
-                     lay_left_w + 1, lay_header_h + 12, dt_w - lay_left_w - 2,
-                     lay_split_y - (lay_header_h + 13));
-    gui_shell_init(sh_bx, sh_by);
-
-    /* right-bottom kernel-log pane */
-    klog_view_init(lay_left_w + 4, lay_split_y + 14, sh_cols,
-                   (dt_h - lay_footer_h - lay_split_y - 16) / 8,
-                   lay_left_w + 1, lay_split_y + 12, dt_w - lay_left_w - 2,
-                   dt_h - lay_footer_h - (lay_split_y + 13));
+    /* windowed chrome metrics for the mode13h surface */
+    g_title_h   = 12;
+    g_taskbar_h = 14;
+    g_shadow    = 2;
+    desktop_layout_init();
+    desktop_views_init(0);
 
     desktop_run_loop();
 
@@ -2656,39 +2997,18 @@ static int cmd_desktop(int argc, char** argv) {
     dt_h = fb_height();
     mouse_set_bounds(dt_w, dt_h);
 
-    lay_header_h = 20;
-    lay_footer_h = 20;
-    lay_left_w = dt_w / 5;   /* 1/5 of the screen, clamped to a usable band */
-    if (lay_left_w < 120) lay_left_w = 120;
-    if (lay_left_w > 240) lay_left_w = 240;
-    lay_split_y = lay_header_h +
-                  (dt_h - lay_header_h - lay_footer_h) * 55 / 100;
-
-    /* right-top shell terminal grid */
-    int sh_bx = lay_left_w + 8;
-    int sh_by = lay_header_h + 26;
-    int sh_cols = (dt_w - lay_left_w - 16) / 8;
-    int sh_rows = (lay_split_y - sh_by - 4) / 8;
-    int sh_clr_y = lay_header_h + 14;
-
-    desktop_draw_chrome();
-    term_init_gop_gui(sh_bx, sh_by, sh_cols, sh_rows,
-                      lay_left_w + 2, sh_clr_y, dt_w - lay_left_w - 4,
-                      lay_split_y - sh_clr_y - 1);
-    gui_shell_init(sh_bx, sh_by);
-
-    /* right-bottom kernel-log pane */
-    int kl_by = lay_split_y + 16;
-    int kl_clr_y = lay_split_y + 12;
-    klog_view_init(lay_left_w + 8, kl_by, sh_cols,
-                   (dt_h - lay_footer_h - kl_by - 2) / 8,
-                   lay_left_w + 2, kl_clr_y, dt_w - lay_left_w - 4,
-                   dt_h - lay_footer_h - kl_clr_y - 1);
+    /* windowed chrome metrics for the GOP framebuffer */
+    g_title_h   = 14;
+    g_taskbar_h = 20;
+    g_shadow    = 3;
+    desktop_layout_init();
 
     /* The desktop owns the whole framebuffer now: mute the plain fb text
      * console so klog diagnostics go to serial only and never paint over
      * the UI (unmute + full repaint on exit below). */
     fb_console_mute(1);
+
+    desktop_views_init(1);
 
     desktop_run_loop();
     fb_console_mute(0);

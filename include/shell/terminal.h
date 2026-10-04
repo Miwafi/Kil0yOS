@@ -30,6 +30,10 @@ void term_set_color(uint8_t color);
 void term_clear(void);
 
 void term_gui_render(void);
+/* Move the terminal to a new glyph origin / repaint region (window drag).
+ * The cell grid content is preserved; only the on-screen placement moves. */
+void term_gui_move(int base_x, int base_y,
+                   int clr_x, int clr_y, int clr_w, int clr_h);
 int term_gui_get_cursor_y(void);
 void term_gui_type_char(char c);
 void term_gui_backspace(void);

@@ -2,6 +2,20 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.8.0] - 2026-10-04
+Desktop overhaul: the fixed TUI-style panel layout becomes a **windowed desktop** — floating windows with title bars, drop shadows, a taskbar and a start menu, on both the mode13h (BIOS) and GOP (UEFI) desktops.
+
+### Added
+- **Window manager** ([shell.c](src/kernel/shell/shell.c)): three floating windows — Apps (Editor/Files/System/CATs), Shell terminal, Kernel Log. Windows drag by their title bar (clamped to the screen above the taskbar), focus/raise on click, red X close button on every title bar; closed windows return via their taskbar button. The focused window's title bar is bright blue, unfocused ones grey.
+- **Taskbar + start menu**: dark bottom bar with a Start button (Win key or click), task buttons per window (visible/focused highlighted), and a live clock (full date on wide screens, time-only on the 320x200 mode13h desktop). The start menu lists Editor/Files/System/CATs plus "Exit Desktop", selectable by keyboard or mouse.
+- **Flat light theme**: teal wallpaper, white window bodies with 1px black borders and black drop shadows; the old full-width header/footer bars are gone.
+- **Draw-offset translation**: panel code (file manager, editor, system monitor) keeps its original window-local coordinates — the WM syncs `lay_*` geometry to the Apps window and routes every `dt_*` primitive through a global offset, so the existing panels render unmodified inside a movable window. Modals (input/confirm/preview/image/MP3) explicitly reset to screen space and float above all windows.
+- `term_gui_move()` re-anchors the shell terminal cells grid (content preserved) and the klog view re-positions for window drags.
+
+### Changed
+- Desktop input model: clicks hit-test taskbar → windows (top-down z-order); clicks inside the Apps window are translated to panel-local coordinates before the fm/ed handlers. F1-F4 still switch panel functions (showing/raising the Apps window), Win toggles the start menu, ESC closes menu → modal → desktop, keyboard typing always feeds the Shell window.
+- The per-second desktop tick now redraws the taskbar clock (and the System monitor / MP3 readouts only when visible); the temporary `klog(".")` heartbeat is removed.
+
 ## [3.7.1] - 2026-10-03
 Storage-subsystem audit: fixed the data-loss/corruption paths found in the disk/FAT/ext2 stack. ext2 (main path) and FAT fallback verified in QEMU after the changes (ext2 probe + mount + memfs self-test; FAT format → reload → fs_init complete).
 
