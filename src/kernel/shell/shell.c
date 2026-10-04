@@ -454,7 +454,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.8.0\n");
+    vga_puts("Kil0yOS v3.8.1\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -646,6 +646,7 @@ static void dt_pixel_rgb(int x, int y, uint32_t rgb) {
  * close button (taskbar buttons bring them back). */
 static void wm_repaint(void);               /* fwd: full desktop repaint     */
 static void desktop_switch_func(int f, mouse_state_t* prev);   /* fwd      */
+static void wm_flush(void);                                    /* fwd      */
 
 enum { WIN_APPS = 0, WIN_SHELL, WIN_KLOG, WIN_COUNT };
 typedef struct {
@@ -681,6 +682,52 @@ static void win_content(int idx, int* cx, int* cy, int* cw, int* ch) {
     *cy = dt_win[idx].y + 1 + g_title_h;
     *cw = dt_win[idx].w - 2;
     *ch = dt_win[idx].h - 2 - g_title_h;
+}
+
+/* ===== dirty-window repaint =====
+ * Changes mark either a window dirty (its frame + shadow + content are
+ * repainted in z-order) or a damage rect (exposed wallpaper area: window
+ * moved/closed/menu popup). wm_flush() repaints only what is needed:
+ * damaged wallpaper area + dirty windows + every window above a repainted
+ * one that overlaps its extent (frame/shadow reach into neighbors). */
+static uint8_t win_dirty[WIN_COUNT];
+static int dmg_on, dmg_x, dmg_y, dmg_w, dmg_h;
+static int wm_modal_was;    /* modal open at the last completed repaint */
+
+static void wm_damage(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (!dmg_on) {
+        dmg_on = 1;
+        dmg_x = x; dmg_y = y; dmg_w = w; dmg_h = h;
+        return;
+    }
+    if (x < dmg_x) { dmg_w += dmg_x - x; dmg_x = x; }
+    if (y < dmg_y) { dmg_h += dmg_y - y; dmg_y = y; }
+    if (x + w > dmg_x + dmg_w) dmg_w = x + w - dmg_x;
+    if (y + h > dmg_y + dmg_h) dmg_h = y + h - dmg_y;
+}
+
+static int wm_pending(void) {
+    int i;
+    if (dmg_on) return 1;
+    for (i = 0; i < WIN_COUNT; i++) {
+        if (win_dirty[i]) return 1;
+    }
+    return 0;
+}
+
+/* rect intersection test (a, b exclusive-ended) */
+static int wm_rect_hit(int ax, int ay, int aw, int ah,
+                       int bx, int by, int bw, int bh) {
+    return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+}
+
+/* visual extent of a window including its drop shadow */
+static void win_extent(int idx, int* x, int* y, int* w, int* h) {
+    *x = dt_win[idx].x;
+    *y = dt_win[idx].y;
+    *w = dt_win[idx].w + g_shadow;
+    *h = dt_win[idx].h + g_shadow;
 }
 
 /* Panel code works in window-local coordinates against lay_*: the app
@@ -2499,32 +2546,83 @@ static void taskbar_click(int mx, int my, mouse_state_t* st) {
     (void)my;
 
     if (mx >= 2 && mx < 2 + bw) {
+        int mx0, my0, mw0, mh0;
         wm_menu_open = !wm_menu_open;
         wm_menu_sel = 0;
+        menu_rect_get(&mx0, &my0, &mw0, &mh0);
+        wm_damage(mx0, my0, mw0 + 3, mh0 + 3);   /* popup area + drop shadow */
     } else {
         bx = 2 + bw + spacing;
         for (int i = 0; i < WIN_COUNT; i++) {
             const char* label = win_tasks[i];
             bw = strlen(label) * 8 + 8;
             if (mx >= bx && mx < bx + bw) {
+                int prev_focus = win_focused;
                 dt_win[i].visible = 1;
                 win_raise(i);
+                win_dirty[prev_focus] = 1;   /* focus color moved */
+                win_dirty[i] = 1;
                 break;
             }
             bx += bw + spacing;
         }
     }
     dt_cursor_erase(st->x, st->y);
-    wm_repaint();
+    wm_flush();
     dt_cursor_draw(st->x, st->y);
 }
 
 /* activate a start-menu entry; returns 1 when "Exit Desktop" was chosen */
 static int menu_activate(int sel, mouse_state_t* st) {
+    int mx, my, mw, mh;
+    menu_rect_get(&mx, &my, &mw, &mh);
+    wm_damage(mx, my, mw + 3, mh + 3);   /* popup + shadow leaves the screen */
     wm_menu_open = 0;
     if (sel == MENU_EXIT) return 1;
     desktop_switch_func(sel, st);
     return 0;
+}
+
+/* Paint one window: frame + shadow, then its content (app panel, shell
+ * terminal or kernel log) through the matching backend. */
+static void wm_paint_window(int i) {
+    int cx, cy, cw, ch;
+
+    /* frame is always screen-space: the previous z-iteration may have
+     * left the app-window content offset set (APPS panel draw) */
+    dt_offset(0, 0);
+    win_draw_frame(i);
+    if (i == WIN_APPS) {
+        app_begin_draw();
+        draw_func_panel(active_func);
+    } else if (i == WIN_SHELL) {
+        win_content(i, &cx, &cy, &cw, &ch);
+        dt_offset(0, 0);
+        term_gui_move(cx + 2, cy + 2, cx + 1, cy + 1, cw - 2, ch - 2);
+        term_gui_render();
+    } else {                                       /* WIN_KLOG */
+        win_content(i, &cx, &cy, &cw, &ch);
+        dt_offset(0, 0);
+        klog_view_move(cx + 2, cy + 2, cx + 1, cy + 1, cw - 2, ch - 2);
+        klog_view_render();
+    }
+}
+
+/* floating layers drawn above every window */
+static void wm_draw_overlays(void) {
+    dt_offset(0, 0);
+    if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
+        fm_modal_draw();
+    } else if (active_func == FUNC_EDITOR && ed_mode == ED_INPUT) {
+        ed_input_draw();
+    }
+    if (wm_menu_open) menu_popup_draw(wm_menu_sel);
+    taskbar_draw();
+}
+
+static int wm_modal_active(void) {
+    return (active_func == FUNC_FILES && fm_mode != FM_BROWSE) ||
+           (active_func == FUNC_EDITOR && ed_mode == ED_INPUT);
 }
 
 /* Full desktop repaint: wallpaper, windows in z-order (each content
@@ -2538,56 +2636,103 @@ static void wm_repaint(void) {
 
     for (int z = 0; z < WIN_COUNT; z++) {
         int i = win_z[z];
-        int cx, cy, cw, ch;
         if (!dt_win[i].visible) continue;
+        wm_paint_window(i);
+    }
 
-        /* frame is always screen-space: the previous z-iteration may have
-         * left the app-window content offset set (APPS panel draw) */
-        dt_offset(0, 0);
-        win_draw_frame(i);
-        if (i == WIN_APPS) {
-            app_begin_draw();
-            draw_func_panel(active_func);
-        } else if (i == WIN_SHELL) {
-            win_content(i, &cx, &cy, &cw, &ch);
-            dt_offset(0, 0);
-            term_gui_move(cx + 2, cy + 2, cx + 1, cy + 1, cw - 2, ch - 2);
-            term_gui_render();
-        } else {                                   /* WIN_KLOG */
-            win_content(i, &cx, &cy, &cw, &ch);
-            dt_offset(0, 0);
-            klog_view_move(cx + 2, cy + 2, cx + 1, cy + 1, cw - 2, ch - 2);
-            klog_view_render();
+    wm_draw_overlays();
+    for (int i = 0; i < WIN_COUNT; i++) win_dirty[i] = 0;
+    dmg_on = 0;
+    wm_modal_was = wm_modal_active();
+}
+
+/* Dirty-window flush: repaint the damaged wallpaper strip plus every dirty
+ * window (frame + shadow + content) and the windows above them that overlap
+ * their extent, then the floating layers. Much cheaper than wm_repaint for
+ * focus changes, drags, panel clicks and menu toggles. */
+static void wm_flush(void) {
+    int rep[WIN_COUNT];
+    int i, j, z, changed;
+
+    for (i = 0; i < WIN_COUNT; i++) {
+        rep[i] = win_dirty[i] && dt_win[i].visible;
+    }
+    if (dmg_on) {
+        for (i = 0; i < WIN_COUNT; i++) {
+            int x, y, w, h;
+            if (!dt_win[i].visible) continue;
+            win_extent(i, &x, &y, &w, &h);
+            if (wm_rect_hit(dmg_x, dmg_y, dmg_w, dmg_h, x, y, w, h)) {
+                rep[i] = 1;
+            }
         }
     }
 
-    dt_offset(0, 0);
-    /* open modals float above every window */
-    if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
-        fm_modal_draw();
-    } else if (active_func == FUNC_EDITOR && ed_mode == ED_INPUT) {
-        ed_input_draw();
-    }
-    if (wm_menu_open) menu_popup_draw(wm_menu_sel);
+    /* repainting a window clobbers everything above it that overlaps its
+     * visual extent - cascade until the set is stable */
+    do {
+        changed = 0;
+        for (z = 0; z < WIN_COUNT; z++) {
+            int ax, ay, aw, ah;
+            i = win_z[z];
+            if (!rep[i] || !dt_win[i].visible) continue;
+            win_extent(i, &ax, &ay, &aw, &ah);
+            for (j = z + 1; j < WIN_COUNT; j++) {
+                int bx, by, bw, bh;
+                int k = win_z[j];
+                if (!dt_win[k].visible || rep[k]) continue;
+                win_extent(k, &bx, &by, &bw, &bh);
+                if (wm_rect_hit(ax, ay, aw, ah, bx, by, bw, bh)) {
+                    rep[k] = 1;
+                    changed = 1;
+                }
+            }
+        }
+    } while (changed);
 
-    taskbar_draw();
+    dt_offset(0, 0);
+    dt_wait_vsync();
+    if (dmg_on) dt_fill_rect(dmg_x, dmg_y, dmg_w, dmg_h, 0x03);  /* wallpaper */
+
+    for (z = 0; z < WIN_COUNT; z++) {
+        i = win_z[z];
+        if (rep[i] && dt_win[i].visible) wm_paint_window(i);
+    }
+
+    wm_draw_overlays();
+    for (i = 0; i < WIN_COUNT; i++) win_dirty[i] = 0;
+    dmg_on = 0;
+    wm_modal_was = wm_modal_active();
 }
 
-/* legacy entry point: panel/modal handlers repaint the whole desktop */
+/* legacy entry point: panel/modal handlers repaint their changes. They only
+ * mutate the app window; a modal that just closed needs the area under it
+ * restored, which takes the full repaint. */
 static void desktop_repaint(void) {
-    wm_repaint();
+    int modal_now = wm_modal_active();
+
+    win_dirty[WIN_APPS] = 1;
+    if (wm_modal_was && !modal_now) {
+        wm_repaint();
+        return;
+    }
+    wm_flush();
 }
 
 /* Switch the active app-panel function (F-keys, arrows, selector clicks,
- * start menu), showing/raising the app window; full repaint. */
+ * start menu), showing/raising the app window; repaints the app window,
+ * the window that lost focus and whatever the start menu exposed. */
 static void desktop_switch_func(int f, mouse_state_t* prev) {
     int changed = (f != active_func);
+    int prev_focus = win_focused;
     active_func = f;
     dt_win[WIN_APPS].visible = 1;
     win_raise(WIN_APPS);
     if (changed && f == FUNC_EDITOR) ed_enter_picker();
     dt_cursor_erase(prev->x, prev->y);
-    wm_repaint();
+    win_dirty[WIN_APPS] = 1;      /* new panel content + title text */
+    win_dirty[prev_focus] = 1;    /* loses the focused title color */
+    wm_flush();
     dt_cursor_draw(prev->x, prev->y);
     if (changed) {
         klog("[desktop] func -> ");
@@ -2664,9 +2809,12 @@ static void desktop_run_loop(void) {
 
             if (c == KEY_ESC) {
                 if (wm_menu_open) {
+                    int mx0, my0, mw0, mh0;
+                    menu_rect_get(&mx0, &my0, &mw0, &mh0);
                     wm_menu_open = 0;
+                    wm_damage(mx0, my0, mw0 + 3, mh0 + 3);
                     dt_cursor_erase(prev.x, prev.y);
-                    wm_repaint();
+                    wm_flush();
                     dt_cursor_draw(prev.x, prev.y);
                 } else if (active_func == FUNC_FILES && fm_mode != FM_BROWSE) {
                     fm_close_modal();  /* modal dialog: close, keep desktop */
@@ -2683,10 +2831,13 @@ static void desktop_run_loop(void) {
                     (active_func == FUNC_EDITOR && ed_mode != ED_IDLE)) {
                     /* modal dialog owns the keyboard: swallow */
                 } else {
+                    int mx0, my0, mw0, mh0;
                     wm_menu_open = !wm_menu_open;
                     wm_menu_sel = active_func;
+                    menu_rect_get(&mx0, &my0, &mw0, &mh0);
+                    wm_damage(mx0, my0, mw0 + 3, mh0 + 3);
                     dt_cursor_erase(prev.x, prev.y);
-                    wm_repaint();
+                    wm_flush();
                     dt_cursor_draw(prev.x, prev.y);
                 }
             } else if (wm_menu_open) {
@@ -2716,7 +2867,8 @@ static void desktop_run_loop(void) {
                 if (f == active_func && f == FUNC_EDITOR && ed_mode == ED_IDLE) {
                     ed_enter_picker();
                     dt_cursor_erase(prev.x, prev.y);
-                    wm_repaint();
+                    win_dirty[WIN_APPS] = 1;
+                    wm_flush();
                     dt_cursor_draw(prev.x, prev.y);
                 } else if (!files_modal && !ed_modal) {
                     desktop_switch_func(f, &prev);
@@ -2771,10 +2923,16 @@ static void desktop_run_loop(void) {
                 if (ny > dt_h - g_taskbar_h - dt_win[drag_win].h)
                     ny = dt_h - g_taskbar_h - dt_win[drag_win].h;
                 if (nx != dt_win[drag_win].x || ny != dt_win[drag_win].y) {
+                    int ex, ey, ew, eh;
+                    win_extent(drag_win, &ex, &ey, &ew, &eh);
+                    wm_damage(ex, ey, ew, eh);       /* source area exposed */
                     dt_win[drag_win].x = nx;
                     dt_win[drag_win].y = ny;
+                    win_extent(drag_win, &ex, &ey, &ew, &eh);
+                    wm_damage(ex, ey, ew, eh);       /* destination area */
+                    win_dirty[drag_win] = 1;
                     dt_cursor_erase(prev.x, prev.y);
-                    wm_repaint();
+                    wm_flush();
                     dt_cursor_draw(state.x, state.y);
                 }
             } else {
@@ -2801,9 +2959,12 @@ static void desktop_run_loop(void) {
                         if (menu_activate(sel, &state)) break;
                     }
                 } else {
+                    int mx0, my0, mw0, mh0;
+                    menu_rect_get(&mx0, &my0, &mw0, &mh0);
                     wm_menu_open = 0;
+                    wm_damage(mx0, my0, mw0 + 3, mh0 + 3);
                     dt_cursor_erase(prev.x, prev.y);
-                    wm_repaint();
+                    wm_flush();
                     dt_cursor_draw(state.x, state.y);
                 }
             } else if (my >= dt_h - g_taskbar_h) {
@@ -2811,24 +2972,31 @@ static void desktop_run_loop(void) {
             } else if (!files_modal && !ed_modal) {
                 int hit = win_at(mx, my);
                 if (hit >= 0) {
+                    int prev_focus = win_focused;
                     win_raise(hit);
                     if (win_hit_close(hit, mx, my)) {
+                        int ex, ey, ew, eh;
+                        win_extent(hit, &ex, &ey, &ew, &eh);
                         dt_win[hit].visible = 0;
+                        wm_damage(ex, ey, ew, eh);   /* window leaves the screen */
                         dt_cursor_erase(prev.x, prev.y);
-                        wm_repaint();
+                        wm_flush();
                         dt_cursor_draw(state.x, state.y);
                     } else if (win_hit_title(hit, mx, my)) {
                         drag_win = hit;
                         drag_dx = mx - dt_win[hit].x;
                         drag_dy = my - dt_win[hit].y;
+                        win_dirty[prev_focus] = 1;   /* focus color moved */
+                        win_dirty[hit] = 1;
                         dt_cursor_erase(prev.x, prev.y);
-                        wm_repaint();
+                        wm_flush();
                         dt_cursor_draw(state.x, state.y);
                     } else if (hit == WIN_APPS) {
                         int ax, ay, aw, ah;
                         win_content(WIN_APPS, &ax, &ay, &aw, &ah);
                         (void)aw; (void)ah;
                         int lx = mx - ax, ly = my - ay;
+                        win_dirty[prev_focus] = 1;   /* focus color moved to Apps */
                         if (active_func == FUNC_FILES) {
                             fm_handle_click(lx, ly, mx, my);
                         } else if (active_func == FUNC_EDITOR) {
@@ -2842,6 +3010,19 @@ static void desktop_run_loop(void) {
                                 desktop_switch_func(f, &state);
                             }
                         }
+                        /* flush only if the panel handlers did not already */
+                        if (wm_pending()) {
+                            dt_cursor_erase(prev.x, prev.y);
+                            wm_flush();
+                            dt_cursor_draw(state.x, state.y);
+                        }
+                    } else {
+                        /* body click on Shell/Klog: only the focus colors moved */
+                        win_dirty[prev_focus] = 1;
+                        win_dirty[hit] = 1;
+                        dt_cursor_erase(prev.x, prev.y);
+                        wm_flush();
+                        dt_cursor_draw(state.x, state.y);
                     }
                 }
             } else if (active_func == FUNC_FILES) {

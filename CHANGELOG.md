@@ -2,6 +2,17 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.8.1] - 2026-10-04
+Dirty-window repaint: the desktop no longer repaints the whole screen on every interaction — only the changed windows and the wallpaper they expose get redrawn.
+
+### Changed
+- **Dirty-window flush** ([shell.c](src/kernel/shell/shell.c)): interactions now mark windows dirty (focus change, panel switch, taskbar buttons) and/or a damage rectangle (window move/close, start-menu toggling). `wm_flush()` repaints the damaged wallpaper strip, the dirty windows (frame + shadow + content) and — via a z-order cascade fixpoint — every window above a repainted one that overlaps its visual extent. Full `wm_repaint()` remains only for the first frame, modal close and legacy fallbacks.
+- Focus clicks on the Shell / Kernel Log window bodies now repaint immediately (previously the title colors stayed stale until the next full repaint).
+- `desktop_repaint()` (panel/modal handlers) marks the Apps window dirty and flushes; a modal that just closed still takes the full repaint to restore the area under it.
+
+### Added
+- `tools/smoke_wm_mouse.sh`: headless interaction test — drives the desktop with monitor mouse events (focus move, X close, taskbar restore, title-bar drag) and asserts screen pixels after each step.
+
 ## [3.8.0] - 2026-10-04
 Desktop overhaul: the fixed TUI-style panel layout becomes a **windowed desktop** — floating windows with title bars, drop shadows, a taskbar and a start menu, on both the mode13h (BIOS) and GOP (UEFI) desktops.
 
