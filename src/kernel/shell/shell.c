@@ -69,6 +69,7 @@ static int cmd_dpkg(int argc, char** argv);
 static int cmd_kilget(int argc, char** argv);
 static int cmd_memstat(int argc, char** argv);
 static int cmd_nmi(int argc, char** argv);
+static int cmd_power(int argc, char** argv);
 static int cmd_painme(int argc, char** argv);
 
 static shell_command_t commands[] = {
@@ -98,6 +99,7 @@ static shell_command_t commands[] = {
     {"apt-get", "Alias of kilget (update|install)", cmd_kilget},
     {"memstat", "Show memory usage (PMM/kernel/heap/fb/index)", cmd_memstat},
     {"nmi", "NMI watchdog status (armed, delivery ticks)", cmd_nmi},
+    {"power", "Show ACPI power status and CPU busy/idle", cmd_power},
     {"painme", "Trigger a kernel panic (test)", cmd_painme},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
@@ -454,7 +456,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.8.1\n");
+    vga_puts("Kil0yOS v3.9.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -3573,6 +3575,66 @@ static int cmd_nmi(int argc, char** argv) {
     klog(" ticks=");
     klog(b);
     klog("\n");
+    return 0;
+}
+
+/* ACPI power status + CPU busy/idle percentages. The busy/idle tick
+ * counters live in the scheduler and are zeroed by the System Monitor
+ * refresh (smp.c), so the percentages cover the window since the last
+ * reset - the same semantics the System Monitor shows. */
+static int cmd_power(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    char b[24];
+
+    power_info_t pi;
+    power_get_info(&pi);
+
+    vga_puts("=== power ===\n");
+    vga_puts("acpi   : ");
+    vga_puts(pi.acpi_available ? "available" : "NOT FOUND");
+    vga_puts(" (FADT rev ");
+    utoa((uint32_t)pi.fadt_revision, b, 10, sizeof(b));
+    vga_puts(b);
+    vga_puts(")\n");
+    vga_puts("pm1a   : ");
+    utoa(pi.pm1a_cnt_blk, b, 16, sizeof(b));
+    vga_puts(b);
+    vga_puts("x  pm1b: ");
+    utoa(pi.pm1b_cnt_blk, b, 16, sizeof(b));
+    vga_puts(b);
+    vga_puts("x\n");
+    vga_puts("s5     : ");
+    if (pi.s5_valid && pi.s5_source == 1) {
+        vga_puts("DSDT \\_S5, SLP_TYP=");
+        utoa(pi.s5_typa, b, 10, sizeof(b));
+        vga_puts(b);
+        vga_puts("/");
+        utoa(pi.s5_typb, b, 10, sizeof(b));
+        vga_puts(b);
+        vga_puts("\n");
+    } else {
+        vga_puts("not parsed (shutdown brute-forces SLP_TYP 0..7)\n");
+    }
+
+    extern volatile uint64_t cpu_busy_ticks;
+    extern volatile uint64_t cpu_idle_ticks;
+    uint64_t busy = cpu_busy_ticks;
+    uint64_t idle = cpu_idle_ticks;
+    uint64_t total = busy + idle;
+    vga_puts("cpu    : ");
+    if (total == 0) {
+        vga_puts("no ticks yet\n");
+    } else {
+        uint32_t busy_pct = (uint32_t)((busy * 100) / total);
+        uint32_t idle_pct = 100 - busy_pct;
+        utoa(busy_pct, b, 10, sizeof(b));
+        vga_puts(b);
+        vga_puts("% busy / ");
+        utoa(idle_pct, b, 10, sizeof(b));
+        vga_puts(b);
+        vga_puts("% idle (since last monitor refresh)\n");
+    }
     return 0;
 }
 

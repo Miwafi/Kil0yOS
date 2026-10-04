@@ -2,6 +2,19 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.9.0] - 2026-10-04
+Memory management & power scheduling optimization: O(1) PMM statistics, per-page TLB invalidation on the exec hot path, cheaper kfree, and a real ACPI \_S5 shutdown instead of brute-forcing SLP_TYP values.
+
+### Changed
+- **PMM** ([memory.c](src/kernel/mm/memory.c)): `pmm_get_stats()` answers from an incremental set-bit counter (maintained inside `bitmap_set`/`bitmap_clear` with test-before-set) instead of walking up to 1M bitmap bits per call. `pmm_alloc_pages(count>1)` now starts its scan at the `pmm_last_page` hint and wraps (two independent segments), matching `pmm_alloc_page()`.
+- **VMM TLB strategy** ([memory.c](src/kernel/mm/memory.c)): `vmm_map_page()`/`vmm_unmap_page()` no longer force a full CR3 reload on every call. When the edited root is the *active* CR3 space, a plain PTE update uses `invlpg` (single page); newly created intermediate levels still flush fully (not-present negative caching). When editing a *non-active* space (fork / pre-schedule exec map the child while CR3 runs the parent), no flush at all — that space's next CR3 load clears the TLB. A large exec maps thousands of pages, so this removes thousands of full TLB flushes per exec.
+- **kfree** ([memory.c](src/kernel/mm/memory.c)): the per-free full-list `heap_verify()` walk becomes an O(1) local check (block magic, successor adjacency, successor magic); corrupt blocks are still refused and leaked with a klog line. The merge sweep stops once the walk passes the released block (the list is physically ordered) and now folds three+ consecutive free blocks in one pass. Stage-checkpoint `heap_verify()` calls (fs_init, acpi, network...) are unchanged.
+- **ACPI shutdown** ([power.c](src/kernel/drivers/power.c)): `power_init()` locates the DSDT (32-bit `dsdt` pointer, or X_DSDT at FADT offset 140), copies it to the heap and scans for the `\_S5` package — `"_S5_"` must be followed by PackageOp (0x12), the package length is decoded per the AML PkgLength rules, the NumElements byte is skipped, and the first two integer elements (ZeroOp/OneOp/Byte/Word/DWord prefixes) become SLP_TYPa/b. `power_shutdown()` writes the parsed values directly; the old 0..7 brute-force scan remains as fallback. QEMU piix4/q35 expose `\_S5 = Package{0,0}`, which the old scan hit last (SLP_TYP 7 first).
+
+### Added
+- `power` shell command: ACPI availability, FADT revision, PM1a/PM1b ports, parsed \_S5 SLP_TYP values and their source, plus CPU busy/idle percentages (same counters as the System Monitor, i.e. since the last monitor refresh).
+- `tools/smoke_mem.sh` (boot `[pmm]` line + double busybox exec + heap-corruption grep) and `tools/smoke_power.sh` (DSDT \_S5 parse line + `shutdown` must terminate QEMU within 15 s).
+
 ## [3.8.1] - 2026-10-04
 Dirty-window repaint: the desktop no longer repaints the whole screen on every interaction — only the changed windows and the wallpaper they expose get redrawn.
 

@@ -315,36 +315,54 @@ void kfree(void* ptr) {
     heap_block_t* block = (heap_block_t*)ptr - 1;
     if ((uint8_t*)block < heap_start || (uint8_t*)block >= heap_end) return;
 
-    /* Heap integrity check: the free list must stay within [heap_start,
-     * heap_end), strictly increasing and magic-stamped. On corruption we
-     * REFUSE to touch the list (walking it would #GP on garbage links)
-     * and leak the block instead. */
-    if (heap_verify("kfree") != 0) {
-        /* Dump the first healthy-looking blocks to bracket the stomp. */
-        heap_block_t* it = heap_list;
-        int n = 0;
-        while (it != NULL && n < 16) {
-            char b1[12], b2[12];
-            klog("  blk ");
-            itoa((int)((uint64_t)it >> 4), b1, 16, sizeof(b1));
-            klog(b1);
-            klog("x size=");
-            itoa((int)it->size, b2, 10, sizeof(b2));
-            klog(b2);
-            klog("\n");
-            if (it->next <= it) break;
-            it = it->next;
-            n++;
+    /* O(1) local integrity check replacing the old full-list heap_verify()
+     * walk: this block's header, the physical adjacency of its successor
+     * and the successor's header. Full walks stay available via the public
+     * heap_verify() at stage checkpoints (fs_init, network init, ...) -
+     * they are the nets that catch region-wide stomps; paying O(n) on
+     * EVERY kfree was the hot-path cost. On corruption we still REFUSE to
+     * touch the list (walking it would #GP on garbage links) and leak the
+     * block instead. */
+    heap_block_t* next = block->next;
+    const char* bad = NULL;
+    if (block->magic != HEAP_MAGIC) {
+        bad = "magic";
+    } else if (next != NULL) {
+        if ((uint8_t*)next != (uint8_t*)block + sizeof(heap_block_t) + block->size) {
+            bad = "non-adjacent";
+        } else if ((uint8_t*)next < heap_start || (uint8_t*)next >= heap_end ||
+                   next->magic != HEAP_MAGIC) {
+            bad = "successor";
         }
+    }
+    if (bad != NULL) {
+        char b1[20], b2[12];
+        klog("[heap] kfree CORRUPT (");
+        klog(bad);
+        klog(") blk ");
+        itoa((int)((uint64_t)block >> 4), b1, 16, sizeof(b1));
+        klog(b1);
+        klog("x size=");
+        itoa((int)block->size, b2, 10, sizeof(b2));
+        klog(b2);
+        klog(" - block LEAKED\n");
         return;
     }
 
     block->free = 1;
+
+    /* Merge pass. The list is physically ordered, so merging that can
+     * involve the released block only happens while current <= block;
+     * stop as soon as the walk passes it (the old loop always swept the
+     * whole list). Re-checking the SAME current after a merge also folds
+     * three+ consecutive free blocks in one pass, which the old
+     * advance-after-merge loop left for a later kfree. */
     heap_block_t* current = heap_list;
-    while (current != NULL && current->next != NULL) {
+    while (current != NULL && current->next != NULL && current <= block) {
         if (current->free && current->next->free) {
             current->size += sizeof(heap_block_t) + current->next->size;
             current->next  = current->next->next;
+            continue;
         }
         current = current->next;
     }
@@ -377,6 +395,14 @@ void* krealloc(void* ptr, size_t size) {
 
 static uint8_t pmm_bitmap[PMM_MAX_PAGES / 8];
 static uint64_t pmm_last_page = 0;
+
+/* Incremental count of set bits in pmm_bitmap. Initialized to the all-set
+ * state produced by pmm_init's memset(0xFF) so the counter is consistent
+ * from the very first bitmap_set/clear. Maintained exclusively inside
+ * bitmap_set/bitmap_clear (test-before-set) - every mark/alloc/free path
+ * funnels through them, so no site can drift. Lets pmm_get_stats answer
+ * in O(1) instead of walking up to 1M bitmap bits per call. */
+static uint64_t pmm_used_pages = PMM_MAX_PAGES;
 
 /* Snapshot of the usable-RAM ranges from the boot memory map (multiboot2
  * type-1 / EFI type-7), taken while pmm_init parses them.  The panic memory
@@ -412,13 +438,21 @@ static void pmm_note_usable(uint64_t base, uint64_t len) {
 static uint64_t pmm_ram_top = 0;
 
 static inline void bitmap_set(uint64_t page) {
-    if (page < PMM_MAX_PAGES)
-        pmm_bitmap[page / 8] |= (1 << (page % 8));
+    if (page < PMM_MAX_PAGES) {
+        if (!((pmm_bitmap[page / 8] >> (page % 8)) & 1)) {
+            pmm_bitmap[page / 8] |= (1 << (page % 8));
+            pmm_used_pages++;
+        }
+    }
 }
 
 static inline void bitmap_clear(uint64_t page) {
-    if (page < PMM_MAX_PAGES)
-        pmm_bitmap[page / 8] &= ~(1 << (page % 8));
+    if (page < PMM_MAX_PAGES) {
+        if ((pmm_bitmap[page / 8] >> (page % 8)) & 1) {
+            pmm_bitmap[page / 8] &= ~(1 << (page % 8));
+            pmm_used_pages--;
+        }
+    }
 }
 
 static inline int bitmap_test(uint64_t page) {
@@ -571,21 +605,32 @@ uint64_t pmm_alloc_pages(size_t count) {
     if (count == 0) return 0;
     if (count == 1) return pmm_alloc_page();
 
-    uint64_t consecutive = 0;
-    uint64_t start = 0;
-
-    for (uint64_t p = 0; p < PMM_MAX_PAGES; p++) {
-        if (!bitmap_test(p)) {
-            if (consecutive == 0) start = p;
-            consecutive++;
-            if (consecutive >= count) {
-                for (uint64_t i = start; i < start + count; i++)
-                    bitmap_set(i);
-                return start * PAGE_SIZE;
+    /* Same hint-based strategy as pmm_alloc_page: scan from pmm_last_page
+     * upward, then wrap to [0, hint). The two segments are scanned
+     * independently - runs never straddle the wrap point (page 0 sits in
+     * the permanently-reserved low 2 MiB, so the pages are not adjacent
+     * candidates anyway). Boot-time callers (8 MiB ramdisk) start with a
+     * hint near 0, matching the old from-zero behaviour. */
+    for (uint64_t base = pmm_last_page; ; base = 0) {
+        if (base < PMM_MAX_PAGES) {
+            uint64_t consecutive = 0;
+            uint64_t start = 0;
+            for (uint64_t p = base; p < PMM_MAX_PAGES; p++) {
+                if (!bitmap_test(p)) {
+                    if (consecutive == 0) start = p;
+                    consecutive++;
+                    if (consecutive >= count) {
+                        for (uint64_t i = start; i < start + count; i++)
+                            bitmap_set(i);
+                        pmm_last_page = start + count;
+                        return start * PAGE_SIZE;
+                    }
+                } else {
+                    consecutive = 0;
+                }
             }
-        } else {
-            consecutive = 0;
         }
+        if (base == 0) break;   /* wrapped segment done: out of memory */
     }
     return 0;
 }
@@ -602,13 +647,16 @@ void pmm_free_pages(uint64_t phys, size_t count) {
 }
 
 void pmm_get_stats(uint64_t* total_pages, uint64_t* used_pages, uint64_t* free_pages) {
-    uint64_t used = 0;
+    /* O(1) from the incremental bit counter: pages above pmm_ram_top are
+     * never cleared (pmm_mark_region clamps at the bitmap span), so the
+     * set bits there are a known constant and the rest of the counter is
+     * exactly the used pages below ram_top. Identical to the old full
+     * bitmap walk, without the 1M-bit scan per call. */
     uint64_t total = pmm_ram_top / PAGE_SIZE;
     if (total == 0) total = PMM_MAX_PAGES;   /* pre-init fallback */
-    for (uint64_t i = 0; i < total; i++) {
-        if (bitmap_test(i))
-            used++;
-    }
+    uint64_t above = PMM_MAX_PAGES - total;
+    uint64_t used = pmm_used_pages - above;
+    if (used > total) used = total;          /* paranoia clamp */
     if (total_pages) *total_pages = total;
     if (used_pages)  *used_pages  = used;
     if (free_pages)  *free_pages  = total - used;
@@ -678,9 +726,28 @@ static inline uint64_t vmm_make_entry(uint64_t phys, uint64_t flags) {
     return (phys & ~0xFFF) | (flags & 0xFFF) | (flags & VMM_NX) | VMM_PRESENT;
 }
 
+/* TLB flush policy helpers. invlpg is only meaningful when the page tables
+ * being edited belong to the CURRENTLY ACTIVE address space: uvm_enter/
+ * leave re-point vmm_pml4 via vmm_set_root_ptr WITHOUT loading CR3 (fork
+ * and pre-schedule exec map the child while CR3 still runs the parent), so
+ * the edit root and the active root differ most of the time. Editing a
+ * NON-active space needs no flush at all - its next CR3 load clears all
+ * non-global TLB entries (this kernel uses no PCID and no global user
+ * pages). */
+static int vmm_editing_active_root(void) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    return mm_root_to_pml4(cr3 & ~0xFFFULL) == vmm_pml4;
+}
+
+static inline void vmm_invlpg(uint64_t virt) {
+    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+}
+
 void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     if (!vmm_pml4) vmm_init();
 
+    int new_levels = 0;
     uint64_t pml4i = (virt >> 39) & 0x1FF;
     uint64_t pdpti = (virt >> 30) & 0x1FF;
     uint64_t pdi   = (virt >> 21) & 0x1FF;
@@ -691,6 +758,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         if (!new_pdpt) PANIC("vmm_map_page: out of physical memory (pdpt)");
         vmm_pml4[pml4i] = vmm_make_entry(new_pdpt, VMM_WRITABLE);
         memset((void*)new_pdpt, 0, PAGE_SIZE);
+        new_levels = 1;
     }
     uint64_t* pdpt = (uint64_t*)(vmm_pml4[pml4i] & ~0xFFF);
 
@@ -708,6 +776,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         if (!new_pd) PANIC("vmm_map_page: out of physical memory (pd)");
         pdpt[pdpti] = vmm_make_entry(new_pd, VMM_WRITABLE);
         memset((void*)new_pd, 0, PAGE_SIZE);
+        new_levels = 1;
     }
     uint64_t* pd = (uint64_t*)(pdpt[pdpti] & ~0xFFF);
 
@@ -738,6 +807,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
 
                 /* Replace the huge page with the page table */
                 pd[pdi] = vmm_make_entry(new_pt, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+                new_levels = 1;   /* retired a live 2 MiB translation */
 
                 /* Now fall through to update the specific 4KB entry */
             } else {
@@ -750,12 +820,23 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         if (!new_pt) PANIC("vmm_map_page: out of physical memory (pt)");
         pd[pdi] = vmm_make_entry(new_pt, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
         memset((void*)new_pt, 0, PAGE_SIZE);
+        new_levels = 1;
     }
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
 
     pt[pti] = vmm_make_entry(phys, flags);
 
-    vmm_reload_cr3();
+    /* TLB strategy (see vmm_editing_active_root): a stale cached
+     * translation only matters for the space running right now. Newly
+     * created intermediate levels can also hit not-present negative
+     * caching, so they force a full reload; a plain PTE update on the
+     * active space only needs this one page invalidated. */
+    if (vmm_editing_active_root()) {
+        if (new_levels)
+            vmm_reload_cr3();
+        else
+            vmm_invlpg(virt);
+    }
 }
 
 void vmm_unmap_page(uint64_t virt) {
@@ -774,14 +855,16 @@ void vmm_unmap_page(uint64_t virt) {
 
     if (pd[pdi] & VMM_HUGE) {
         pd[pdi] = 0;
-        vmm_reload_cr3();
+        if (vmm_editing_active_root())
+            vmm_reload_cr3();   /* retire a live 2 MiB translation */
         return;
     }
 
     uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFF);
     uint64_t pti = (virt >> 12) & 0x1FF;
     pt[pti] = 0;
-    vmm_reload_cr3();
+    if (vmm_editing_active_root())
+        vmm_invlpg(virt);
 }
 
 /* Raw PTE of a 4KB mapping (0 if any walk level is absent). Used by the
