@@ -2,6 +2,24 @@
  All notable changes to this project will be documented in this file.
  This format follows Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [3.10.0] - 2026-10-05
+Block devices, AHCI SATA and a real installer: the OS can now install itself from the live medium onto a SATA disk (ext2 + GRUB in the MBR) and re-install over itself as an update.
+
+### Added
+- **blkdev layer** ([blkdev.h](include/drivers/blkdev.h), [blkdev.c](src/kernel/drivers/blkdev.c)): unified block-device registry (`blkdev_find`/`blkdev_list`), MBR partition scanning (`sd0p1`-style partition devices with LBA offset/length), and `mbr_first_linux()` for installer use. `fs_init` now picks the root via the partition map instead of probing absolute sectors, so a disk with a partition table can no longer be mistaken for a FAT volume (the old destroy-on-boot hazard).
+- **AHCI driver** ([ahci.c](src/kernel/drivers/ahci.c)): pure-polling (no interrupts) LBA48 DMA read/write + IDENTIFY for drives on the ICH9/q35 SATA controller; drives register as `sd0`/`sd1`. Legacy ATA stays `hd0`.
+- **ext2 write support + mount instances** ([ext2.c](src/kernel/fs/ext2.c)): ext2 is no longer boot-root read-only. Per-mount instances (`ext2_mount`/`ext2_umount`) graft the disk tree at any empty directory; `ext2_mkfs()` lays out a 1 KiB-block rev-1 filesystem (2 GiB max); file/dir creation and full-content writes go through bitmaps, inode tables and direct/singly/doubly indirect blocks. Superblock now carries `s_frags_per_group`, `s_state` and `s_first_ino` — e2fsprogs and GRUB both rejected the fs without them.
+- **`mnt` shell command**: `mnt` (list), `mnt <dev> <dir> [rw]`, `mnt umount <dir>`, `mnt selftest` (mkfs → mount → 300 KiB pattern across all three indirection levels → umount).
+- **`kilinstall` shell command** ([shell.c](src/kernel/shell/shell.c)): writes GRUB boot.img into the MBR with one active Linux partition entry at LBA 2048, core.img into the MBR gap (early config boots `/boot/kil0yos.bin` from `(hd0,msdos1)` unattended), mkfs's `sd0p1`, then copies the live root tree plus `/boot/kil0yos.bin`, `/boot/grub/grub.cfg` and a `/boot/.kilinstall` marker into the new ext2 fs. Re-running on an installed disk is the supported **update** path: the old system's file contents are first forced into MEM overlays (they survive the re-format), then the tree is copied back and the boot files rewritten.
+- **Two-pass kernel link** ([Makefile](Makefile)): pass 1 links the full kernel ELF (`kernel-stage1.bin`), which is zstd-compressed and embedded via BLOB_RULE; pass 2 links the live kernel with the stage1 blob (plus GRUB boot/core images) inside. GRUB blob rules sit *before* the link rules — make expands prerequisite lists at parse time, so `:=` variables defined later are empty in the dependency graph (silently stale/missing blobs).
+- `tools/smoke_install.sh`: two-phase smoke — phase 1 installs from the live ISO onto a blank 64 MiB AHCI disk; phase 2 reboots with no cdrom and asserts GRUB boots the disk kernel, `ls /boot` shows the payload and the marker reads `kil0yos-installed` (`INSTALL_BOOT_OK`).
+
+### Fixed
+- **ext2 mkfs block-bitmap off-by-one** ([ext2.c](src/kernel/fs/ext2.c)): the root-directory and lost+found blocks (`meta_end`, `meta_end+1`) were left marked free, so the first allocation handed out the root directory block and the new mount's tree silently overwrote it (root listing showed the mounted subtree's directory block; lost+found vanished). `mnt selftest` never caught this because a write/read-back roundtrip does not traverse the root directory.
+- **Graft-point routing** ([ext2.c](src/kernel/fs/ext2.c)): `ext2_mount` left the mountpoint's backend as MEM, so fs_create_file/fs_create_dir (which require `parent->backend == FS_BACKEND_EXT2`) routed every new file into a RAM overlay — "successful" writes never touched the disk and umount's overlay check silently refused. The graft point now advertises EXT2 + root inode; the previous backend is restored at umount.
+- **Kernel heartbeat starvation** ([ext2.c](src/kernel/fs/ext2.c), [shell.c](src/kernel/shell/shell.c)): multi-megabyte ext2 writes and the installer's tree copy run as one synchronous main-task stretch; the 10 s kwatchdog panicked mid-install ("main task unresponsive"). The mkfs zero loop, per-block write loop and per-file copy/cache loops now touch `kernel_heartbeat_touch()` (same pattern as tar extraction).
+- `tools/make_usb.sh` partition grown to 64 MiB FAT16: the embedded stage1 image roughly doubles kernel.bin, which no longer fits the old 30 MiB partition.
+
 ## [3.9.0] - 2026-10-04
 Memory management & power scheduling optimization: O(1) PMM statistics, per-page TLB invalidation on the exec hot path, cheaper kfree, and a real ACPI \_S5 shutdown instead of brute-forcing SLP_TYP values.
 

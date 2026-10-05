@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build a real-hardware-friendly USB image: MBR + 30MB FAT16 partition +
+# Build a real-hardware-friendly USB image: MBR + 64MB FAT16 partition +
 # GRUB (i386-pc) assembled by hand. No root, no loop devices needed.
 #
 # Why not the hybrid ISO for bare metal: real BIOSes are barely tested on
@@ -36,7 +36,8 @@ for tool in mformat mcopy mmd grub-mkimage; do
 done
 
 PART_START=2048
-PART_SECTORS=61440          # 30MB -> FAT16 (FAT32 needs >=33MB)
+PART_SECTORS=131072         # 64MB FAT16 - kernel.bin doubled when the
+                            # kilinstall stage1 ELF got embedded (v3.10.0)
 IMG_SECTORS=$((PART_START + PART_SECTORS))
 OFFSET=$((PART_START * 512))
 

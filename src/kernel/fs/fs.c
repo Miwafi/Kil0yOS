@@ -4,6 +4,7 @@
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "drivers/disk.h"
+#include "drivers/blkdev.h"
 #include "drivers/video/vga.h"
 
 static fat32_boot_sector_t boot_sector;
@@ -310,6 +311,7 @@ static fs_entry_t* fs_create_entry_from_dir(fat32_dir_entry_t* dir_entry, fs_ent
     entry->backend = FS_BACKEND_FAT;   /* entries read back from FAT disk */
     entry->inode_no = 0;
     entry->mem_data = NULL;
+    entry->mnt = NULL;
     memcpy(entry->disk_name, dir_entry->name, sizeof(entry->disk_name));
     
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
@@ -555,6 +557,14 @@ static void format_short_name_unique(const char* name, uint8_t* output,
 }
 
 static void fs_format() {
+    if (!disk_is_ram()) {
+        /* Live-mode guard: fs_format only ever targets the in-memory RAM
+         * disk. A real hd0/sd0 must never be FAT-formatted behind the
+         * back of the blkdev layer (this used to destroy GRUB/MBR disks
+         * whose partition offset hid the ext2 superblock from probe). */
+        klog("[fs] refusing to format a real disk\n");
+        return;
+    }
     memset(&boot_sector, 0, sizeof(fat32_boot_sector_t));
     
     boot_sector.bpb.jump[0] = 0xEB;
@@ -683,6 +693,7 @@ int fs_load() {
     root->backend = FS_BACKEND_FAT;
     root->inode_no = 0;
     root->mem_data = NULL;
+    root->mnt = NULL;
     memset(root->disk_name, 0, sizeof(root->disk_name));
     
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
@@ -699,6 +710,20 @@ void fs_init() {
     klog("[fs] disk_init start\n");
     disk_init();
     klog("[fs] disk_init done\n");
+
+    /* Root selection. An installed system boots with its ext2 root on the
+     * first Linux MBR partition (sd0p1/hd0p1) - probe partition-relative.
+     * Without a partition, ext2_probe falls back to the legacy absolute-
+     * sector-2 read (unpartitioned ext2 images on hd0). Everything else
+     * lands on the in-memory FAT32 Live root; a real disk is never
+     * formatted (the old code destroyed MBR disks because the partition
+     * offset hid the superblock, making fs_format "helpfully" reformat). */
+    blkdev_t* rootdev = blkdev_find("sd0");
+    if (rootdev == NULL) rootdev = blkdev_find("hd0");
+    if (rootdev != NULL) {
+        blkdev_t* part = mbr_first_linux(rootdev);
+        if (part != NULL) ext2_set_dev(part);
+    }
 
     /* Phase 2: prefer a persistent ext2 root filesystem on the disk. */
     if (ext2_probe()) {
@@ -738,6 +763,13 @@ void fs_init() {
             return;
         }
         klog("[fs] ext2 probe ok but tree build failed, falling back\n");
+    }
+
+    /* Real disk present but no usable ext2 root: switch to the RAM disk so
+     * the Live FAT32 path below can never touch the real device. */
+    if (!disk_is_ram()) {
+        klog("[fs] no ext2 root on disk, switching to RAM disk (Live mode)\n");
+        disk_use_ram_fallback();
     }
 
     if (fs_load() == 0) {
@@ -954,14 +986,37 @@ fs_entry_t* fs_create_file(const char* name) {
     entry->first_cluster = 0;
     entry->attributes = ATTR_ARCHIVE;
     entry->parent = parent_dir;
+    entry->mnt = NULL;
 
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
         entry->children[i] = NULL;
     }
 
-    /* Non-FAT parent (ext2 dir or memfs dir): the overlay creates a
-     * memory-backed node without touching the read-only disk (Phase 2.2). */
+    /* Non-FAT parent (ext2 dir or memfs dir). A writable ext2 mount gets a
+     * REAL directory entry + inode on disk; everything else is the overlay
+     * creating a memory-backed node without touching the read-only disk. */
     if (parent_dir->backend != FS_BACKEND_FAT) {
+        if (parent_dir->backend == FS_BACKEND_EXT2 &&
+            parent_dir->mnt != NULL && ext2_mount_is_writable(parent_dir->mnt)) {
+            uint32_t ino = ext2_create_file(parent_dir->mnt,
+                                            parent_dir->inode_no, base_name);
+            if (ino == 0) {
+                kfree(entry);
+                fs_last_error = FS_ERR_IO;
+                return NULL;
+            }
+            entry->backend = FS_BACKEND_EXT2;
+            entry->inode_no = ino;
+            entry->mnt = parent_dir->mnt;
+            memset(entry->disk_name, 0, sizeof(entry->disk_name));
+            for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+                if (parent_dir->children[i] == NULL) {
+                    parent_dir->children[i] = entry;
+                    break;
+                }
+            }
+            return entry;
+        }
         entry->backend = FS_BACKEND_MEM;
         entry->inode_no = 0;
         entry->mem_data = NULL;
@@ -1033,7 +1088,8 @@ fs_entry_t* fs_create_dir(const char* name) {
         return NULL;
     }
 
-    /* Non-FAT parent (ext2 dir or memfs dir): memory-only directory node. */
+    /* Non-FAT parent (ext2 dir or memfs dir). Writable ext2 mount: real
+     * on-disk directory; otherwise memory-only node. */
     if (parent_dir->backend != FS_BACKEND_FAT) {
         fs_entry_t* entry = (fs_entry_t*)kmalloc(sizeof(fs_entry_t));
         if (entry == NULL) {
@@ -1046,13 +1102,34 @@ fs_entry_t* fs_create_dir(const char* name) {
         entry->first_cluster = 0;
         entry->attributes = ATTR_DIRECTORY;
         entry->parent = parent_dir;
-        entry->backend = FS_BACKEND_MEM;
-        entry->inode_no = 0;
-        entry->mem_data = NULL;
+        entry->mnt = NULL;
         memset(entry->disk_name, 0, sizeof(entry->disk_name));
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
             entry->children[i] = NULL;
         }
+        if (parent_dir->backend == FS_BACKEND_EXT2 &&
+            parent_dir->mnt != NULL && ext2_mount_is_writable(parent_dir->mnt)) {
+            uint32_t ino = ext2_create_dir(parent_dir->mnt,
+                                           parent_dir->inode_no, base_name);
+            if (ino == 0) {
+                kfree(entry);
+                fs_last_error = FS_ERR_IO;
+                return NULL;
+            }
+            entry->backend = FS_BACKEND_EXT2;
+            entry->inode_no = ino;
+            entry->mnt = parent_dir->mnt;
+            for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+                if (parent_dir->children[i] == NULL) {
+                    parent_dir->children[i] = entry;
+                    break;
+                }
+            }
+            return entry;
+        }
+        entry->backend = FS_BACKEND_MEM;
+        entry->inode_no = 0;
+        entry->mem_data = NULL;
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
             if (parent_dir->children[i] == NULL) {
                 parent_dir->children[i] = entry;
@@ -1130,6 +1207,7 @@ fs_entry_t* fs_create_dir(const char* name) {
     entry->backend = FS_BACKEND_FAT;
     entry->inode_no = 0;
     entry->mem_data = NULL;
+    entry->mnt = NULL;
     memcpy(entry->disk_name, dir_entry.name, sizeof(entry->disk_name));
 
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
@@ -1189,11 +1267,20 @@ int fs_write_file(fs_entry_t* file, const uint8_t* data, size_t size) {
         return fs_write_file_mem(file, data, size);
     }
 
-    /* EXT2 backend: overlay copy-on-write - the file becomes memory-backed
-     * and shadows the read-only disk copy (Phase 2.2: memory layer writes,
-     * disk layer reads). fs_write_file replaces the whole content, so the
-     * old data does not need to be read back. */
+    /* EXT2 backend. A writable mount instance (file->mnt) gets a REAL disk
+     * write through the ext2 write driver; the read-only boot root keeps
+     * the copy-on-write overlay (the file becomes memory-backed and
+     * shadows the disk copy). */
     if (file->backend == FS_BACKEND_EXT2) {
+        if (file->mnt != NULL && ext2_mount_is_writable(file->mnt)) {
+            int r = ext2_write_file(file->mnt, file->inode_no, data, size);
+            if (r < 0) {
+                fs_last_error = FS_ERR_IO;
+                return -1;
+            }
+            file->size = (uint32_t)r;
+            return r;
+        }
         file->backend = FS_BACKEND_MEM;
         return fs_write_file_mem(file, data, size);
     }
@@ -1317,8 +1404,12 @@ int fs_read_file(fs_entry_t* file, uint8_t* buffer, size_t size) {
         return (int)size;
     }
 
-    /* EXT2 backend: read through to the disk (Phase 2.2 overlay). */
+    /* EXT2 backend: read through to the owning mount instance (mounted
+     * trees) or the boot root (legacy global probe). */
     if (file->backend == FS_BACKEND_EXT2) {
+        if (file->mnt != NULL) {
+            return ext2_read_file_at(file->mnt, file->inode_no, buffer, size);
+        }
         return ext2_read_file(file->inode_no, buffer, size);
     }
 

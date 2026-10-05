@@ -8,6 +8,8 @@
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "fs/fs.h"
+#include "fs/ext2.h"
+#include "drivers/blkdev.h"
 #include "mm/memory.h"
 #include "sched/scheduler.h"
 #include "core/interrupts.h"
@@ -25,6 +27,7 @@
 #include "net/tftp.h"
 #include "pkg/dpkg.h"
 #include "pkg/kilget.h"
+#include "pkg/zstd.h"
 #include "usb/usb.h"
 #include "drivers/video/jpeg.h"
 #include "drivers/audio/audio.h"
@@ -71,6 +74,8 @@ static int cmd_memstat(int argc, char** argv);
 static int cmd_nmi(int argc, char** argv);
 static int cmd_power(int argc, char** argv);
 static int cmd_painme(int argc, char** argv);
+static int cmd_mnt(int argc, char** argv);
+static int cmd_kilinstall(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -101,6 +106,8 @@ static shell_command_t commands[] = {
     {"nmi", "NMI watchdog status (armed, delivery ticks)", cmd_nmi},
     {"power", "Show ACPI power status and CPU busy/idle", cmd_power},
     {"painme", "Trigger a kernel panic (test)", cmd_painme},
+    {"mnt", "Block devices & ext2 mounts: mnt | mount <dev> <dir> | umount <dir> | selftest", cmd_mnt},
+    {"kilinstall", "Install/update this system to the SATA disk (ext2 + GRUB MBR)", cmd_kilinstall},
     {"date", "Show current date", cmd_date},
     {"time", "Show current time", cmd_time},
     {"exec", "Execute a user program", cmd_exec},
@@ -456,7 +463,7 @@ static int cmd_whoami(int argc, char** argv) {
 }
 
 static int cmd_version(int argc, char** argv) {
-    vga_puts("Kil0yOS v3.9.0\n");
+    vga_puts("Kil0yOS v3.10.0\n");
     vga_puts("A simple 64-bit x86-64 operating system\n");
     vga_puts("User mode (Ring 3) support enabled\n");
     return 0;
@@ -3646,6 +3653,379 @@ static int cmd_painme(int argc, char** argv) {
     klog("painme: test panic requested from shell\n");
     PANIC_CODE("painme: test panic requested from shell", 0x54455354); /* 'TEST' */
     return 0;   /* unreachable - panic() halts */
+}
+
+/* mnt: block device inventory + ext2 mount management + mkfs/mount/write/
+ * read round-trip selftest against the SATA disk. */
+static int cmd_mnt(int argc, char** argv) {
+    char b[24];
+
+    if (argc == 1) {
+        vga_puts("block devices:\n");
+        for (blkdev_t* d = blkdev_list(); d != NULL; d = d->next) {
+            vga_puts("  ");
+            vga_puts(d->name);
+            vga_puts("  ");
+            utoa(d->sector_count >> 11, b, 10, sizeof(b));
+            vga_puts(b);
+            vga_puts(" MiB\n");
+        }
+        int n = ext2_mount_count();
+        if (n == 0) {
+            vga_puts("no ext2 mounts\n");
+        } else {
+            vga_puts("ext2 mounts:\n");
+            for (int i = 0; i < n; i++) {
+                vga_puts("  ");
+                vga_puts(ext2_mount_devname(i));
+                vga_puts(" on ");
+                vga_puts(ext2_mount_path(i));
+                vga_puts(ext2_mount_is_rw(i) ? " (rw)\n" : " (ro)\n");
+            }
+        }
+        return 0;
+    }
+
+    if (strcmp(argv[1], "mount") == 0 && argc == 4) {
+        if (ext2_mount(argv[2], argv[3], 1) != NULL) {
+            vga_puts("mounted ");
+            vga_puts(argv[2]);
+            vga_puts(" at ");
+            vga_puts(argv[3]);
+            vga_puts("\n");
+        } else {
+            vga_puts("mount failed\n");
+        }
+        return 0;
+    }
+
+    if (strcmp(argv[1], "umount") == 0 && argc == 3) {
+        vga_puts(ext2_umount(argv[2]) == 0 ? "unmounted\n" : "umount failed\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "selftest") == 0 && argc == 2) {
+        vga_puts("mnt selftest: mkfs + mount + write/read-back on sd...\n");
+        vga_puts(ext2_selftest() == 0 ? "mnt selftest passed\n"
+                                      : "mnt selftest FAILED\n");
+        return 0;
+    }
+
+    vga_puts("usage: mnt | mnt mount <dev> <dir> | mnt umount <dir> | mnt selftest\n");
+    return 0;
+}
+
+/* ---- kilinstall: deploy the running system onto the SATA disk -----------
+ * Embedded payloads (Makefile two-pass link): user_stage1 = the pass-1
+ * kernel ELF (this kernel minus the stage1 blob itself), user_grub_boot /
+ * user_grub_core = GRUB i386-pc boot.img / core.img whose early config
+ * boots /boot/kil0yos.bin from (hd0,msdos1) unattended.
+ *
+ * Written to sd0: LBA 0 MBR (boot.img + one patched 0x83 entry at LBA
+ * 2048), LBA 1.. core.img, LBA 2048.. ext2 partition (mkfs) holding a
+ * copy of the live root tree plus /boot/kil0yos.bin and the /boot/
+ * .kilinstall marker. Re-running on an installed disk is the supported
+ * update: when the boot root is ext2, every old file's content is first
+ * forced into a MEM overlay (survives the re-format), then the partition
+ * is re-formatted and the tree copied back. */
+extern const uint8_t user_stage1_start[] __attribute__((weak));
+extern const uint8_t user_stage1_end[] __attribute__((weak));
+extern const uint8_t user_grub_boot_start[] __attribute__((weak));
+extern const uint8_t user_grub_boot_end[] __attribute__((weak));
+extern const uint8_t user_grub_core_start[] __attribute__((weak));
+extern const uint8_t user_grub_core_end[] __attribute__((weak));
+
+#define KIL_MAX_FILE_BYTES (24u * 1024u * 1024u)
+
+/* Files under /boot that kilinstall rewrites after the tree copy - they
+ * must not be carried over from an old installation (their ext2 content
+ * is gone after mkfs anyway, and stale copies would survive the overwrite
+ * because fs_create_file refuses existing names). */
+static int kil_is_replaced(const fs_entry_t* c) {
+    if (c == NULL || c->parent == NULL || c->parent->parent != fs_root()) return 0;
+    if (strcmp(c->parent->name, "boot") != 0) return 0;
+    return strcmp(c->name, "kil0yos.bin") == 0 ||
+           strcmp(c->name, "grub.cfg") == 0 ||
+           strcmp(c->name, ".kilinstall") == 0;
+}
+
+/* Expand an embedded blob like process.c blob_raw (zstd frame magic or
+ * verbatim copy), but always into a fresh kmalloc buffer so the caller
+ * can kfree it unconditionally. Returns NULL on failure. */
+static uint8_t* kil_blob_expand(const uint8_t* start, const uint8_t* end,
+                                size_t* out_len) {
+    *out_len = 0;
+    if (start == NULL || end == NULL || end <= start) return NULL;
+    size_t in_len = (size_t)(end - start);
+    if (in_len >= 4 && start[0] == 0x28 && start[1] == 0xB5 &&
+        start[2] == 0x2F && start[3] == 0xFD) {
+        uint8_t* out = NULL;
+        if (zstd_decompress_heap(start, in_len, &out, out_len) != 0 || out == NULL) {
+            return NULL;
+        }
+        return out;
+    }
+    uint8_t* out = kmalloc(in_len);
+    if (out != NULL) {
+        memcpy(out, start, in_len);
+        *out_len = in_len;
+    }
+    return out;
+}
+
+/* Update mode, phase 1 (non-destructive, abortable): force every file of
+ * the ext2 boot root into a MEM overlay so its content survives mkfs.
+ * Returns -1 on the first failure - nothing has been written yet. */
+static int kil_cache_dir(fs_entry_t* dir, int depth) {
+    if (dir == NULL || depth > 16) return 0;
+    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+        fs_entry_t* c = dir->children[i];
+        if (c == NULL) continue;
+        if (c->type == FS_TYPE_DIRECTORY) {
+            if (kil_cache_dir(c, depth + 1) != 0) return -1;
+            continue;
+        }
+        if (c->backend == FS_BACKEND_MEM || c->size == 0 || kil_is_replaced(c)) {
+            continue;
+        }
+        kernel_heartbeat_touch();   /* kwatchdog: per-file update progress */
+        uint8_t* buf = kmalloc(c->size);
+        if (buf == NULL) return -1;
+        int r = fs_read_file(c, buf, c->size);
+        int w = (r == (int)c->size) ? fs_write_file(c, buf, c->size) : -1;
+        kfree(buf);
+        if (r != (int)c->size || w != (int)c->size) return -1;
+    }
+    return 0;
+}
+
+/* Copy src_dir's subtree to dst_path (a directory on the install mount).
+ * Whole-file buffers: fs's read API has no offset parameter, so a fixed
+ * ring buffer cannot stream. skip0 is skipped at the top level (the
+ * /.install mountpoint node itself - copying it would recurse forever). */
+static int kil_copy_dir(fs_entry_t* src_dir, const char* dst_path,
+                        const char* skip0, int* nfiles, uint64_t* nbytes,
+                        int depth) {
+    if (src_dir == NULL || depth > 16) return 0;
+    size_t base_len = strlen(dst_path);
+
+    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+        fs_entry_t* c = src_dir->children[i];
+        if (c == NULL) continue;
+        if (depth == 0 && skip0 != NULL && strcmp(c->name, skip0) == 0) {
+            continue;
+        }
+
+        char path[MAX_PATH_LENGTH];
+        if (base_len + strlen(c->name) + 2 > sizeof(path)) continue;
+        strcpy(path, dst_path);
+        path[base_len] = '/';
+        strcpy(path + base_len + 1, c->name);
+
+        if (c->type == FS_TYPE_DIRECTORY) {
+            fs_entry_t* dd = fs_create_dir(path);
+            if (dd == NULL) dd = fs_resolve_path(path);   /* already exists */
+            if (dd == NULL) return -1;
+            if (kil_copy_dir(c, path, skip0, nfiles, nbytes, depth + 1) != 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (c->size > KIL_MAX_FILE_BYTES || kil_is_replaced(c)) continue;
+        kernel_heartbeat_touch();   /* kwatchdog: per-file copy progress */
+        uint8_t* buf = kmalloc(c->size);
+        if (buf == NULL) return -1;
+        int r = fs_read_file(c, buf, c->size);
+        if (r != (int)c->size) {
+            kfree(buf);
+            return -1;
+        }
+        fs_entry_t* f = fs_create_file(path);
+        int w = -1;
+        if (f != NULL) w = fs_write_file(f, buf, (size_t)r);
+        kfree(buf);
+        if (w != (int)c->size) {
+            if (f == NULL) continue;   /* e.g. name exists - keep going */
+            return -1;
+        }
+        (*nfiles)++;
+        *nbytes += (uint64_t)c->size;
+    }
+    return 0;
+}
+
+static int cmd_kilinstall(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    char b[24];
+
+    if (user_stage1_start == NULL || user_stage1_end == NULL ||
+        user_grub_boot_start == NULL || user_grub_boot_end == NULL ||
+        user_grub_core_start == NULL || user_grub_core_end == NULL) {
+        vga_puts("kilinstall: no installer payload embedded "
+                 "(build host needs grub-mkimage + grub-pc-bin)\n");
+        return 1;
+    }
+
+    blkdev_t* sd = blkdev_find("sd0");
+    if (sd == NULL) {
+        vga_puts("kilinstall: no SATA disk (sd0) detected\n");
+        return 1;
+    }
+
+    int updating = (blkdev_find("sd0p1") != NULL);
+    vga_puts(updating ? "kilinstall: update mode (sd0p1 exists)\n"
+                      : "kilinstall: install mode\n");
+
+    /* Update path: cache the old system's file contents in RAM first -
+     * mkfs wipes the very disk the running root still reads through. */
+    if (updating && fs_ext2_active() && kil_cache_dir(fs_root(), 0) != 0) {
+        vga_puts("kilinstall: out of memory caching the old system, "
+                 "nothing was written\n");
+        return 1;
+    }
+
+    size_t boot_len = 0, core_len = 0, stage_len = 0;
+    uint8_t* boot_img = kil_blob_expand(user_grub_boot_start, user_grub_boot_end, &boot_len);
+    uint8_t* core_img = kil_blob_expand(user_grub_core_start, user_grub_core_end, &core_len);
+    uint8_t* stage1 = kil_blob_expand(user_stage1_start, user_stage1_end, &stage_len);
+    if (boot_img == NULL || core_img == NULL || stage1 == NULL ||
+        boot_len != 512 || stage_len == 0) {
+        vga_puts("kilinstall: payload decompress failed\n");
+        if (boot_img) kfree(boot_img);
+        if (core_img) kfree(core_img);
+        if (stage1) kfree(stage1);
+        return 1;
+    }
+
+    /* GRUB boot.img -> MBR. Wipe all 4 partition slots (the template
+     * carries garbage in slots 2-4, breaks part_msdos probing), then
+     * patch one active Linux entry at LBA 2048. */
+    uint8_t mbr[512];
+    memcpy(mbr, boot_img, 512);
+    memset(mbr + 446, 0, 64);
+    mbr[446] = 0x80;                       /* active                    */
+    mbr[447] = mbr[448] = mbr[449] = 0xFE; /* CHS start                 */
+    mbr[450] = 0x83;                       /* type: Linux               */
+    mbr[451] = mbr[452] = mbr[453] = 0xFE; /* CHS end                   */
+    uint32_t part_sectors = sd->sector_count - 2048;
+    mbr[454] = (uint8_t)(2048);
+    mbr[455] = (uint8_t)(2048 >> 8);
+    mbr[456] = (uint8_t)(2048 >> 16);
+    mbr[457] = (uint8_t)(2048 >> 24);
+    mbr[458] = (uint8_t)part_sectors;
+    mbr[459] = (uint8_t)(part_sectors >> 8);
+    mbr[460] = (uint8_t)(part_sectors >> 16);
+    mbr[461] = (uint8_t)(part_sectors >> 24);
+    if (blkdev_write(sd, 0, 1, mbr) != 0) {
+        vga_puts("kilinstall: MBR write failed\n");
+        goto fail_payload;
+    }
+
+    /* GRUB core.img -> LBA 1 (the MBR gap), zero-padded to a sector.
+     * boot.img's default kernel_sector is 1, no boot.img patch needed. */
+    size_t core_sectors = (core_len + 511) / 512;
+    if (core_sectors == 0 || core_sectors > 2047) {
+        vga_puts("kilinstall: core.img too large for the MBR gap\n");
+        goto fail_payload;
+    }
+    {
+        uint8_t* core_pad = kmalloc(core_sectors * 512);
+        if (core_pad == NULL) {
+            vga_puts("kilinstall: out of memory\n");
+            goto fail_payload;
+        }
+        memset(core_pad, 0, core_sectors * 512);
+        memcpy(core_pad, core_img, core_len);
+        int rw = blkdev_write(sd, 1, (uint32_t)core_sectors, core_pad);
+        kfree(core_pad);
+        if (rw != 0) {
+            vga_puts("kilinstall: core.img write failed\n");
+            goto fail_payload;
+        }
+    }
+
+    if (!updating && mbr_first_linux(sd) == NULL) {
+        vga_puts("kilinstall: failed to register sd0p1\n");
+        goto fail_payload;
+    }
+
+    vga_puts("kilinstall: formatting sd0p1 as ext2...\n");
+    if (ext2_mkfs("sd0p1", updating) != 0) {
+        vga_puts("kilinstall: mkfs failed\n");
+        goto fail_payload;
+    }
+
+    if (fs_mkdir_p("/.install") != 0 ||
+        ext2_mount("sd0p1", "/.install", 1) == NULL) {
+        vga_puts("kilinstall: mount failed\n");
+        goto fail_payload;
+    }
+    if (fs_mkdir_p("/.install/boot/grub") != 0) {
+        vga_puts("kilinstall: cannot create /boot/grub\n");
+        goto fail_mounted;
+    }
+
+    vga_puts("kilinstall: copying the system tree...\n");
+    int nfiles = 0;
+    uint64_t nbytes = 0;
+    if (kil_copy_dir(fs_root(), "/.install", ".install", &nfiles, &nbytes, 0) != 0) {
+        vga_puts("kilinstall: tree copy failed\n");
+        goto fail_mounted;
+    }
+
+    fs_entry_t* kf = fs_create_file("/.install/boot/kil0yos.bin");
+    if (kf == NULL || fs_write_file(kf, stage1, stage_len) != (int)stage_len) {
+        vga_puts("kilinstall: kernel image write failed\n");
+        goto fail_mounted;
+    }
+
+    static const char grub_cfg[] =
+        "set timeout=0\n"
+        "menuentry \"Kil0yOS\" {\n"
+        "    multiboot2 /boot/kil0yos.bin\n"
+        "    boot\n"
+        "}\n";
+    fs_entry_t* cf = fs_create_file("/.install/boot/grub/grub.cfg");
+    if (cf == NULL ||
+        fs_write_file(cf, (const uint8_t*)grub_cfg, sizeof(grub_cfg) - 1)
+            != (int)(sizeof(grub_cfg) - 1)) {
+        vga_puts("kilinstall: grub.cfg write failed\n");
+        goto fail_mounted;
+    }
+
+    fs_entry_t* mf = fs_create_file("/.install/boot/.kilinstall");
+    if (mf != NULL) {
+        fs_write_file(mf, (const uint8_t*)"kil0yos-installed\n", 18);
+    }
+
+    if (ext2_umount("/.install") != 0) {
+        vga_puts("kilinstall: WARNING: umount reported an error\n");
+    }
+    fs_delete_entry("/.install");
+    kfree(boot_img);
+    kfree(core_img);
+    kfree(stage1);
+
+    vga_puts("kilinstall: ");
+    utoa((uint32_t)nfiles, b, 10, sizeof(b));
+    vga_puts(b);
+    vga_puts(" files (");
+    utoa((uint32_t)(nbytes >> 10), b, 10, sizeof(b));
+    vga_puts(b);
+    vga_puts(" KiB) written to sd0p1\n");
+    vga_puts("kilinstall: done - reboot and remove the live medium to boot from disk\n");
+    return 0;
+
+fail_mounted:
+    ext2_umount("/.install");
+    fs_delete_entry("/.install");
+fail_payload:
+    kfree(boot_img);
+    kfree(core_img);
+    kfree(stage1);
+    return 1;
 }
 
 /* Memory usage report: PMM pages, kernel image, static reserves, heap

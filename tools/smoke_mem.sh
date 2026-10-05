@@ -1,5 +1,5 @@
 #!/bin/bash
-# Memory-subsystem smoke (v3.9.0 M1-M3):
+# Memory-subsystem smoke (v3.10.0 M1-M3):
 #   1) boot, capture the boot-time "[pmm]" klog line (O(1) stats path)
 #   2) busybox exec twice (uname -m / echo) - the invlpg TLB path in
 #      vmm_map_page maps thousands of pages per exec

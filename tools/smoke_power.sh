@@ -1,5 +1,5 @@
 #!/bin/bash
-# Power-subsystem smoke (v3.9.0 P1-P2):
+# Power-subsystem smoke (v3.10.0 P1-P2):
 #   1) boot - the "[power] DSDT \_S5 parsed" klog line must appear
 #   2) type `shutdown` - ACPI S5 must terminate QEMU within 15 s
 # Usage (WSL): bash tools/smoke_power.sh

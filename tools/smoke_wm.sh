@@ -34,7 +34,7 @@ qemu-system-x86_64 -cdrom /tmp/kil0yos_wm.iso -m 512M -display none \
   -no-reboot &
 QPID=$!
 
-wait_marker_in "$TDIR/serial_wm.log" "Kil0yOS version 3.9.0" 90
+wait_marker_in "$TDIR/serial_wm.log" "Kil0yOS version 3.10.0" 90
 sleep 6
 
 echo "=== 2) enter desktop (gui) ==="

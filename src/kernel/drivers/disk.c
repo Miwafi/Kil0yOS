@@ -2,6 +2,8 @@
 #include "drivers/io.h"
 #include "drivers/device.h"
 #include "drivers/pci.h"
+#include "drivers/blkdev.h"
+#include "drivers/ahci.h"
 #include "drivers/video/vga.h"
 #include "mm/memory.h"
 #include "lib/string.h"
@@ -204,6 +206,7 @@ static int ata_do_dma(uint32_t sector, uint8_t* buffer, int is_write) {
 
 /* Initialize RAM disk fallback when no real ATA disk is present. */
 static void disk_init_ram_fallback(void) {
+    if (ram_disk != NULL) return; /* already active - never allocate twice */
     size_t pages = (RAM_DISK_BYTES + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t phys = pmm_alloc_pages(pages);
     if (phys != 0) {
@@ -222,7 +225,51 @@ static void disk_init_ram_fallback(void) {
     klog("disk: no ATA disk found, using RAM disk fallback\n");
 }
 
+void disk_use_ram_fallback(void) {
+    disk_init_ram_fallback();
+}
+
+int disk_is_ram(void) {
+    return ram_disk != NULL;
+}
+
+/* hd0: the legacy ATA disk exposed on the blkdev layer (fs_init root
+ * selection reads it for MBR partition probing). Sector count is clamped
+ * to the same limit as the compat shim below - a full LBA28 rework of hd0
+ * is out of scope; kilinstall targets AHCI (sd*) instead. */
+static int hd0_read(blkdev_t* dev, uint32_t lba, uint32_t count, void* buf) {
+    (void)dev;
+    uint8_t* p = (uint8_t*)buf;
+    for (uint32_t i = 0; i < count; i++) {
+        if (disk_read_sector(lba + i, p + (size_t)i * DISK_SECTOR_SIZE) != 0) return -1;
+    }
+    return 0;
+}
+
+static int hd0_write(blkdev_t* dev, uint32_t lba, uint32_t count, const void* buf) {
+    (void)dev;
+    const uint8_t* p = (const uint8_t*)buf;
+    for (uint32_t i = 0; i < count; i++) {
+        if (disk_write_sector(lba + i, p + (size_t)i * DISK_SECTOR_SIZE) != 0) return -1;
+    }
+    return 0;
+}
+
+static blkdev_t hd0_blkdev = {
+    .name = "hd0",
+    .sector_count = DISK_MAX_SECTORS,
+    .read = hd0_read,
+    .write = hd0_write,
+    .priv = NULL,
+    .next = NULL
+};
+
 void disk_init() {
+    /* AHCI (SATA) first: on q35/ICH9 machines the disks hang off the AHCI
+     * controller; the legacy probe below then finds no disk and falls back
+     * to the RAM disk while sd* devices are already registered. */
+    ahci_init();
+
     outb(ATA_PRIMARY_IO_BASE + ATA_REG_DEVICE, 0xA0);
     io_wait();
 
@@ -260,6 +307,10 @@ void disk_init() {
     ata_init_dma();
 
     device_register(&disk_device);
+
+    /* Expose the real disk on the blkdev layer (partition probing happens
+     * in fs_init once disk_init has settled). */
+    blkdev_register(&hd0_blkdev);
 }
 
 int disk_read_sector(uint32_t sector, uint8_t* buffer) {

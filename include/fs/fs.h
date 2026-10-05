@@ -113,6 +113,10 @@ struct fs_entry {
     fs_backend_t backend;
     uint32_t inode_no;      /* ext2 inode number (FS_BACKEND_EXT2) */
     uint8_t* mem_data;      /* content buffer (FS_BACKEND_MEM files) */
+    /* Opaque ext2 mount instance handle (fs.c treats it as opaque; ext2.c
+     * owns the type). NULL for boot-root ext2 nodes (read-only) and all
+     * non-ext2 nodes. Gates real-disk writes on mounted instances. */
+    void* mnt;
     /* The 11-byte on-disk FAT short name as actually stored (may be a
      * mangled NAME~1.EXT form; case-folded). Directory-entry updates and
      * deletes must match against THIS, not against `name` - the plain

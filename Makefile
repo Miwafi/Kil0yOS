@@ -37,6 +37,8 @@ DRIVERS_SRCS = $(SRCDIR)/kernel/drivers/video/vga.c \
                $(SRCDIR)/kernel/drivers/input/keyboard.c \
                $(SRCDIR)/kernel/drivers/input/mouse.c \
                $(SRCDIR)/kernel/drivers/disk.c \
+               $(SRCDIR)/kernel/drivers/blkdev.c \
+               $(SRCDIR)/kernel/drivers/ahci.c \
                $(SRCDIR)/kernel/drivers/device.c \
                $(SRCDIR)/kernel/drivers/power.c \
                $(SRCDIR)/kernel/drivers/pci.c \
@@ -334,8 +336,52 @@ $(BUILDDIR)/kernel/core/ap_trampoline.o: $(BUILDDIR)/ap_trampoline.bin | $(BUILD
 # Dynamic-PIE acceptance program (musl-gcc) + ldso blob (musl libc.so)
 DYN_PROG_BLOB := $(if $(MUSL_GCC),$(BUILDDIR)/user_blob_hello-dyn.o,)
 
-$(BUILDDIR)/kernel.bin: $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BOOT_OBJ) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS)
-	$(LD) $(LDFLAGS) $(BOOT_OBJ) $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS) -o $@
+# --- GRUB hard-disk images (embedded for kilinstall) ----------------------
+# core.img carries an early config that boots /boot/kil0yos.bin from the
+# ext2 partition unattended; all listed modules are built in, so the early
+# config must NOT insmod them (insmod would look for .mod files on disk).
+# NOTE: these variables MUST be defined before the two-pass rules below -
+# make expands a rule's prerequisite list immediately at parse time, so
+# the *deps* of kernel.bin/kernel-stage1.bin see only what exists here,
+# while the *recipes* expand later (a later := silently drops the blobs
+# from the dependency graph while still putting them on the ld line).
+GRUB_MKIMAGE := $(shell command -v grub-mkimage 2>/dev/null)
+GRUB_PC_DIR := /usr/lib/grub/i386-pc
+GRUB_BOOT_SRC := $(wildcard $(GRUB_PC_DIR)/boot.img)
+GRUB_BOOT_BLOB := $(if $(and $(GRUB_MKIMAGE),$(GRUB_BOOT_SRC)),$(BUILDDIR)/user_blob_grub-boot.o,)
+GRUB_CORE_BLOB := $(if $(and $(GRUB_MKIMAGE),$(GRUB_BOOT_SRC)),$(BUILDDIR)/user_blob_grub-core.o,)
+
+$(BUILDDIR)/grub-early.cfg: $(MAKEFILE_LIST)
+	@mkdir -p $(BUILDDIR)
+	printf 'serial --unit=0 --speed=115200\nterminal_output --append serial\nset root=(hd0,msdos1)\nmultiboot2 /boot/kil0yos.bin\nboot\n' > $@
+
+$(BUILDDIR)/grub-hd-core.img: $(BUILDDIR)/grub-early.cfg
+	grub-mkimage -O i386-pc -d $(GRUB_PC_DIR) -o $@ -p '(hd0,msdos1)/boot/grub' -c $< biosdisk part_msdos ext2 multiboot2 serial terminal normal
+
+ifneq ($(GRUB_BOOT_BLOB),)
+$(eval $(call BLOB_RULE,grub-boot,grub_boot,$(GRUB_BOOT_SRC),1))
+$(eval $(call BLOB_RULE,grub-core,grub_core,$(BUILDDIR)/grub-hd-core.img,1))
+endif
+$(eval $(call BLOB_RULE,stage1,stage1,$(BUILDDIR)/kernel-stage1.bin,1))
+
+# --- Two-pass link for the disk installer (kilinstall) --------------------
+# Pass 1 links every kernel object WITHOUT the stage1 blob into a complete
+# ELF (kernel-stage1.bin). That image is staged as a blob and pass 2 links
+# the live kernel with it appended. kilinstall then deploys the embedded
+# stage1 ELF + GRUB boot/core images onto the target disk at runtime - the
+# live image must not contain itself, hence the split. The GRUB blobs are
+# part of STAGE1_OBJS so an installed system can re-run kilinstall to
+# update itself.
+STAGE1_OBJS = $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS) $(GRUB_BOOT_BLOB) $(GRUB_CORE_BLOB)
+STAGE1_DEPS = $(BOOT_OBJ) $(STAGE1_OBJS)
+
+$(BUILDDIR)/kernel-stage1.bin: $(STAGE1_DEPS)
+	$(LD) $(LDFLAGS) $(STAGE1_DEPS) -o $@
+
+$(BUILDDIR)/kernel.bin: $(STAGE1_DEPS) $(BUILDDIR)/user_blob_stage1.o
+	$(LD) $(LDFLAGS) $(STAGE1_DEPS) $(BUILDDIR)/user_blob_stage1.o -o $@
+
+.SECONDARY: $(BUILDDIR)/kernel-stage1.bin $(STAGE)/stage1.blob $(STAGE)/grub-boot.blob $(STAGE)/grub-core.blob
 
 # GRUB 完整 Unicode 字体（含制表符字形），用于修复 gfxterm 菜单边框显示成 '?' 的问题。
 # 使用构建机自带的 unicode.pf2；缺失时跳过（菜单退回纯文本，仍可正常引导）。
