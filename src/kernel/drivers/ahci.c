@@ -269,24 +269,50 @@ static int port_identify(ahci_port_t* p, uint64_t* sectors) {
 void ahci_init(void) {
     /* fs_init (and thus disk_init -> ahci_init) runs BEFORE pci_init, so
      * the pci_find_class() device list is still empty here - probe the
-     * config space directly for a class 0106 (SATA/AHCI) controller. */
+     * config space directly. Real machines expose the SATA controller as
+     * class 0106 (AHCI) or 0104 (RAID mode: the ABAR is still there);
+     * class 0101 means IDE-compatibility mode in the firmware setup -
+     * no ABAR exists and this driver cannot work there, so report it
+     * clearly instead of failing silently. */
     uint32_t ahci_bus = 0, ahci_dev = 0, ahci_fn = 0;
-    int found = 0;
+    uint32_t ide_bus = 0, ide_dev = 0, ide_fn = 0;
+    int found = 0, ide_found = 0;
     for (uint32_t b = 0; b < 16 && !found; b++) {
         for (uint32_t d = 0; d < 32 && !found; d++) {
             for (uint32_t f = 0; f < 8 && !found; f++) {
                 if (pci_read_word(b, d, f, 0x00) == 0xFFFF) continue;
-                if (pci_read_byte(b, d, f, 0x0B) == 0x01 &&
-                    pci_read_byte(b, d, f, 0x0A) == 0x06) {
+                if (pci_read_byte(b, d, f, 0x0B) != 0x01) continue;
+                uint8_t sub = pci_read_byte(b, d, f, 0x0A);
+                if (sub == 0x06 || sub == 0x04) {
                     ahci_bus = b; ahci_dev = d; ahci_fn = f;
                     found = 1;
+                } else if (sub == 0x01 && !ide_found) {
+                    ide_bus = b; ide_dev = d; ide_fn = f;
+                    ide_found = 1;
                 }
             }
         }
     }
     if (!found) {
-        klog("[ahci] no controller found\n");
+        klog("[ahci] no AHCI/RAID controller found\n");
+        if (ide_found) {
+            char num[8];
+            klog("[ahci] storage controller at ");
+            itoa((int)ide_bus, num, 10, sizeof(num)); klog(num);
+            klog(":"); itoa((int)ide_dev, num, 10, sizeof(num)); klog(num);
+            klog("."); itoa((int)ide_fn, num, 10, sizeof(num)); klog(num);
+            klog(" is in IDE compatibility mode (no ABAR) -");
+            klog(" set SATA Mode to AHCI in the firmware setup\n");
+        }
         return;
+    }
+    {
+        char num[8];
+        klog("[ahci] controller ");
+        itoa((int)ahci_bus, num, 10, sizeof(num)); klog(num);
+        klog(":"); itoa((int)ahci_dev, num, 10, sizeof(num)); klog(num);
+        klog("."); itoa((int)ahci_fn, num, 10, sizeof(num)); klog(num);
+        klog("\n");
     }
 
     uint32_t bar5 = pci_read_dword(ahci_bus, ahci_dev, ahci_fn, 0x24);
@@ -295,6 +321,11 @@ void ahci_init(void) {
         return;
     }
     uint64_t bar_phys = bar5 & ~0xFULL;
+    if (((bar5 >> 1) & 0x3u) == 0x2u) {
+        /* 64-bit MMIO BAR: real firmware may place the ABAR above 4 GiB */
+        bar_phys |= (uint64_t)pci_read_dword(ahci_bus, ahci_dev, ahci_fn, 0x28)
+                    << 32;
+    }
 
     /* enable memory space + bus master */
     uint32_t cmd = pci_read_word(ahci_bus, ahci_dev, ahci_fn, 0x04);
@@ -327,7 +358,7 @@ void ahci_init(void) {
 
     /* enable AHCI mode, interrupts off (pure polling) */
     uint32_t ghc = *(volatile uint32_t*)(uintptr_t)(bar + AHCI_GHC);
-    *(volatile uint32_t*)(uintptr_t)(bar + AHCI_GHC) = ghc | GHC_AE;
+    *(volatile uint32_t*)(uintptr_t)(bar + AHCI_GHC) = (ghc | GHC_AE) & ~1u;
 
     uint32_t pi = *(volatile uint32_t*)(uintptr_t)(bar + AHCI_PI);
 
@@ -337,14 +368,38 @@ void ahci_init(void) {
         ahci_port_t* p = &ports[ndisks];
         p->port_base = AHCI_PORT0 + pidx * AHCI_PORT_STRIDE;
 
-        uint32_t ssts = pr32(p, PxSSTS);
-        if ((ssts & 0xF) != PxSSTS_DET_PRESENT) continue; /* no device */
+        /* Real drives need spin-up time before the link establishes
+         * (QEMU answers instantly, which is why this never mattered
+         * there): power on + spin up, then grade the wait by what DET
+         * reports - 3 = online, 1 = link coming up, 0 = recheck once
+         * shortly before declaring the port empty. */
+        pw32(p, PxIE, 0);
+        pw32(p, PxCMD, pr32(p, PxCMD) | PxCMD_SUD | PxCMD_POD);
+        uint32_t det = pr32(p, PxSSTS) & 0xF;
+        if (det != PxSSTS_DET_PRESENT) {
+            uint64_t wait_us = (det == 0x1) ? 2000000 : 300000;
+            uint64_t deadline = pit_uptime_us() + wait_us;
+            while (pit_uptime_us() < deadline) {
+                det = pr32(p, PxSSTS) & 0xF;
+                if (det == PxSSTS_DET_PRESENT) break;
+                __asm__ volatile("pause");
+            }
+            if (det != PxSSTS_DET_PRESENT) continue;   /* empty port */
+        }
 
-        /* QEMU's ich9-ahci reports DET=3 even on EMPTY ports - the device
-         * signature (0x101 for ATA) is the reliable gate. Skip ATAPI
-         * (0xEB140101, e.g. an IDE-mounted CDROM on q35) outright: IDENTIFY
-         * is invalid for packet devices and would only burn a timeout. */
-        uint32_t sig = pr32(p, PxSIG);
+        /* link is up - the device signature may lag briefly on real hw */
+        uint32_t sig = 0xFFFFFFFF;
+        {
+            uint64_t deadline = pit_uptime_us() + 500000;
+            while (pit_uptime_us() < deadline) {
+                sig = pr32(p, PxSIG);
+                if (sig != 0xFFFFFFFF) break;
+                __asm__ volatile("pause");
+            }
+        }
+        /* Skip ATAPI (0xEB140101, e.g. an IDE-mounted CDROM on q35)
+         * outright: IDENTIFY is invalid for packet devices and would
+         * only burn a timeout. */
         if (sig == 0 || sig == 0xFFFFFFFF || sig == 0xEB140101u) continue;
 
         if (port_start(p) != 0) {
