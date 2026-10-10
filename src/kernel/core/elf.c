@@ -47,6 +47,17 @@ typedef struct {
 static uint64_t page_down(uint64_t a) { return a & ~0xFFFULL; }
 static uint64_t page_up(uint64_t a)   { return (a + 0xFFF) & ~0xFFFULL; }
 
+/* Overflow-safe check that the file range [off, off+len) lies within
+ * [0, size). A plain `off + len > size` wraps around for attacker-chosen
+ * uint64_t values (e.g. off = 2^64-16, len = 0x20), letting a malformed
+ * ELF bypass the bounds check and make the loader read far past the
+ * image buffer. Reject any overflow explicitly. */
+static int elf_range_ok(uint64_t off, uint64_t len, size_t size) {
+    if (off > size) return 0;
+    if (len > (uint64_t)size - off) return 0;
+    return 1;
+}
+
 int elf_is_elf64(const uint8_t* data, size_t size) {
     if (size < sizeof(elf_ehdr_t)) return 0;
     return data[0] == 0x7F && data[1] == 'E' && data[2] == 'L' && data[3] == 'F';
@@ -114,7 +125,7 @@ static int elf_load_at(process_t* proc, const uint8_t* data, size_t size,
     const char* interp = "";
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_INTERP) {
-            if (ph[i].p_offset + ph[i].p_filesz > size ||
+            if (!elf_range_ok(ph[i].p_offset, ph[i].p_filesz, size) ||
                 ph[i].p_filesz == 0 ||
                 ph[i].p_filesz >= sizeof(out->interp)) {
                 return ELF_ERR_FORMAT;
@@ -144,7 +155,7 @@ static int elf_load_at(process_t* proc, const uint8_t* data, size_t size,
     for (int i = 0; i < eh->e_phnum; i++) {
         const elf_phdr_t* p = &ph[i];
         if (p->p_type != PT_LOAD || p->p_memsz == 0) continue;
-        if (p->p_offset + p->p_filesz > size) return ELF_ERR_FORMAT;
+        if (!elf_range_ok(p->p_offset, p->p_filesz, size)) return ELF_ERR_FORMAT;
 
         uint32_t prot = 0;
         if (p->p_flags & PF_R) prot |= UVM_PROT_READ;
@@ -153,6 +164,10 @@ static int elf_load_at(process_t* proc, const uint8_t* data, size_t size,
         if (prot == 0) prot = UVM_PROT_READ;
 
         uint64_t vs = bias + p->p_vaddr;
+        /* Reject a segment whose virtual range wraps around: ve would
+         * otherwise be < vs and uvm_map_range's end<=start guard would
+         * silently skip the mapping (or map the wrong span). */
+        if (p->p_memsz > ~0ULL - vs) return ELF_ERR_FORMAT;
         uint64_t ve = vs + p->p_memsz;      /* BSS included: mapped + zeroed */
         if (uvm_map_range(proc, vs, ve, prot) != 0) return ELF_ERR_MAP;
 
@@ -177,6 +192,7 @@ static int elf_load_at(process_t* proc, const uint8_t* data, size_t size,
         const elf_phdr_t* p = &ph[i];
         if (p->p_type != PT_LOAD || p->p_memsz == 0) continue;
         if (eh->e_phoff >= p->p_offset &&
+            elf_range_ok(p->p_offset, p->p_filesz, size) &&
             eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(elf_phdr_t)
                 <= p->p_offset + p->p_filesz) {
             phdr_va = bias + p->p_vaddr + (eh->e_phoff - p->p_offset);
