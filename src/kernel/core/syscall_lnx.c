@@ -246,9 +246,13 @@ static uint64_t sc_write(uint64_t fd, uint64_t buf, uint64_t count,
         }
         udp_socket_t* us = (udp_socket_t*)s;
         if (us->remote_ip == 0) return (uint64_t)-L_EINVAL;   /* not connected */
+        /* Clamp before truncating, exactly like the TCP branch above:
+         * a bare (uint16_t)count wraps for count > 0xFFFF (0x10000 -> 0),
+         * sending the wrong length and reporting a bogus byte count. */
+        uint16_t len = (uint16_t)(count > 0xFFFF ? 0xFFFF : count);
         int r = udp_sendto(us, us->remote_ip, us->remote_port,
-                           (const uint8_t*)buf, (uint16_t)count);
-        return r < 0 ? (uint64_t)-L_EIO : (uint64_t)count;
+                           (const uint8_t*)buf, len);
+        return r < 0 ? (uint64_t)-L_EIO : (uint64_t)len;
     }
 
     if (fd >= LNX_MAX_FDS) return -L_EBADF;
@@ -294,10 +298,11 @@ static uint64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t iovcnt,
         }
         udp_socket_t* us = (udp_socket_t*)s;
         if (us->remote_ip == 0) return (uint64_t)-L_EINVAL;   /* not connected */
-        int r = udp_sendto(us, us->remote_ip, us->remote_port,
-                           kbuf, (uint16_t)total);
-        (void)r;
-        return (uint64_t)total;
+        /* Clamp before truncating (see sc_write): total is already bounded
+         * by MSG_KBUF_SZ, but keep the guard explicit and consistent. */
+        uint16_t len = (uint16_t)(total > 0xFFFF ? 0xFFFF : total);
+        int r = udp_sendto(us, us->remote_ip, us->remote_port, kbuf, len);
+        return r < 0 ? (uint64_t)-L_EIO : (uint64_t)len;
     }
     /* Single redirected file fd: delegate (must not split the vector) */
     if (fd_is_file(fd)) {
