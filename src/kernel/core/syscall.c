@@ -97,7 +97,9 @@ uint64_t sys_puts(uint64_t str, uint64_t unused1, uint64_t unused2,
      * pointer leaves the process's mapped user regions, so a kernel
      * pointer is rejected on the first byte. */
     uint64_t p = str;
-    uint64_t checked_page = 0;
+    /* Sentinel that can never equal a page base, so the first page is always
+     * validated (a 0 initial value would skip validation for page 0). */
+    uint64_t checked_page = ~0ULL;
     for (;;) {
         if ((p & ~0xFFFULL) != checked_page) {
             if (!process_check_user_range(p, 1)) {
@@ -211,7 +213,9 @@ uint64_t sys_gfx_text(uint64_t x, uint64_t y, uint64_t str,
      * kernel's 8x8 font. */
     char tmp[64];
     uint64_t p = str;
-    uint64_t checked_page = 0;
+    /* Sentinel that can never equal a page base, so the first page is always
+     * validated (a 0 initial value would skip validation for page 0). */
+    uint64_t checked_page = ~0ULL;
     size_t n = 0;
     for (;;) {
         if ((p & ~0xFFFULL) != checked_page) {
