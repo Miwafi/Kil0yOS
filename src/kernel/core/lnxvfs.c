@@ -40,20 +40,13 @@ typedef struct lnx_file {
     int dir_index;       /* next child index for getdents64 */
 } lnx_file_t;
 
+/* Resolve a unified-table fd to this layer's payload. Only FILE_T_VFS
+ * entries belong here; sockets/ttys get EBADF from these calls just like
+ * a wrong-kind fd would on Linux. */
 static lnx_file_t* fd_get(int fd) {
-    process_t* proc = process_get_current();
-    if (proc == NULL || fd < 0 || fd >= LNX_MAX_FDS) return NULL;
-    /* fds[0..2] are console (NULL) unless redirected via dup2 */
-    return proc->fds[fd];
-}
-
-static int fd_alloc(void) {
-    process_t* proc = process_get_current();
-    if (proc == NULL) return -1;
-    for (int i = 3; i < LNX_MAX_FDS; i++) {
-        if (proc->fds[i] == NULL) return i;
-    }
-    return -1;
+    struct file* uf = fd_get_file(fd);
+    if (uf == NULL || uf->kind != FILE_T_VFS) return NULL;
+    return (lnx_file_t*)uf->priv;
 }
 
 /* Create a file or directory at an arbitrary absolute/relative path by
@@ -104,9 +97,6 @@ int lnxvfs_open(const char* path, int flags, int mode) {
         return -L_ENOTDIR;
     }
 
-    int fd = fd_alloc();
-    if (fd < 0) return -L_ENOMEM;
-
     lnx_file_t* f = kmalloc(sizeof(lnx_file_t));
     if (f == NULL) return -L_ENOMEM;
     memset(f, 0, sizeof(*f));
@@ -126,8 +116,17 @@ int lnxvfs_open(const char* path, int flags, int mode) {
         }
     }
 
-    process_t* proc = process_get_current();
-    proc->fds[fd] = f;
+    struct file* uf = file_new(FILE_T_VFS, &vfs_file_ops, f);
+    if (uf == NULL) {
+        if (f->cache) kfree(f->cache);
+        kfree(f);
+        return -L_ENOMEM;
+    }
+    int fd = fd_install(uf);
+    if (fd < 0) {
+        file_close(uf);
+        return -L_ENOMEM;
+    }
     return fd;
 }
 
@@ -138,32 +137,37 @@ static void fd_flush(lnx_file_t* f) {
     f->dirty = 0;
 }
 
-int lnxvfs_close(int fd) {
-    lnx_file_t* f = fd_get(fd);
-    if (f == NULL) return -L_EBADF;
+/* VFS backend release: flush write-back, free cache and payload. The
+ * struct file itself is freed by the unified layer. */
+static int vfs_f_close(struct file* uf) {
+    lnx_file_t* f = (lnx_file_t*)uf->priv;
+    if (f == NULL) return 0;
     fd_flush(f);
-    process_t* proc = process_get_current();
-    proc->fds[fd] = NULL;
     if (f->cache) kfree(f->cache);
     kfree(f);
     return 0;
 }
 
-void lnxvfs_close_all(struct process* proc) {
-    if (proc == NULL) return;
-    for (int i = 3; i < LNX_MAX_FDS; i++) {
-        lnx_file_t* f = proc->fds[i];
-        if (f == NULL) continue;
-        fd_flush(f);
-        if (f->cache) kfree(f->cache);
-        kfree(f);
-        proc->fds[i] = NULL;
-    }
+static int vfs_f_poll(struct file* uf) {
+    (void)uf;
+    return POLL_IN | POLL_OUT;              /* memory fs is always ready */
 }
 
-void lnxvfs_inherit_fds(struct process* parent, struct process* child) {
-    if (parent == NULL || child == NULL) return;
-    for (int i = 0; i < LNX_MAX_FDS; i++) child->fds[i] = parent->fds[i];
+static int vfs_f_ioctl(struct file* uf, uint64_t req, uint64_t arg) {
+    (void)uf; (void)req; (void)arg;
+    return -25;                             /* ENOTTY */
+}
+
+const struct file_ops vfs_file_ops = {
+    .close = vfs_f_close,
+    .poll = vfs_f_poll,
+    .ioctl = vfs_f_ioctl,
+    /* read/write/getdents stay on the lnxvfs_* functions: they need the
+     * lnx_file_t payload and the syscall layer routes through fd_get. */
+};
+
+int lnxvfs_close(int fd) {
+    return fd_close(fd);
 }
 
 int lnxvfs_read(int fd, char* buf, size_t count) {
@@ -443,19 +447,7 @@ int lnxvfs_statx_path(const char* path, void* ubuf) {
 }
 
 int lnxvfs_dup2(int oldfd, int newfd) {
-    process_t* proc = process_get_current();
-    if (proc == NULL) return -L_EBADF;
-    if (oldfd < 0 || oldfd >= LNX_MAX_FDS || newfd < 0 || newfd >= LNX_MAX_FDS) {
-        return -L_EBADF;
-    }
-    if (oldfd == newfd) return oldfd;
-    if (oldfd >= 3 && proc->fds[oldfd] == NULL) return -L_EBADF;
-
-    if (newfd >= 3 && proc->fds[newfd] != NULL) {
-        lnxvfs_close(newfd);
-    }
-    proc->fds[newfd] = proc->fds[oldfd];   /* fd 0/1/2: console alias */
-    return newfd;
+    return fd_dup2(oldfd, newfd);           /* unified: works on all kinds */
 }
 
 /* --- namespace mutation --- */

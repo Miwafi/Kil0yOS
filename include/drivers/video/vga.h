@@ -64,7 +64,9 @@ void vga_draw_rect(int x, int y, int w, int h, uint8_t color);
 void vga_draw_char(int x, int y, char c, uint8_t color);
 void vga_draw_string(int x, int y, const char* str, uint8_t color);
 
-/* Kernel log – prints timestamped message to both VGA and serial */
+/* Kernel log – prints a message to the console (fb/VGA), the serial log
+ * and the GUI ring buffer; during the status-line boot the console is
+ * muted and only serial + ring receive diagnostics. */
 extern void klog(const char* s);
 extern void klog_hex(const char* prefix, uint64_t v);
 /* GUI log pane: ring-buffer mirror of every klog byte. klog_seq() returns

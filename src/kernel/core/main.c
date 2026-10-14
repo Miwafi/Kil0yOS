@@ -68,7 +68,7 @@ static void serial_puts(const char* s) {
     }
 }
 
-/* Kernel-log mirror ring: every klog() byte (timestamp + text) lands here
+/* Kernel-log mirror ring: every klog() byte lands here
  * so GUI panes can render recent output without touching the serial UART.
  * Power-of-two size, masked indexing; guarded by irq_save because klog is
  * legal from IRQ context (exception dump, device handlers). */
@@ -112,25 +112,36 @@ uint32_t klog_copy_from(uint32_t* seq, char* dst, uint32_t max) {
     return n;
 }
 
-void klog(const char* s) {
-    char ts[24];
-    pit_format_time(ts, sizeof(ts));
+/* Boot console quiet flag: while set, subsystem diagnostics stay off the
+ * screen (systemd-style clean boot) but still reach the serial log and the
+ * GUI log ring for debugging. Cleared once the status-line boot finishes. */
+static int klog_muted = 0;
+
+/* Unconditional emit to every sink: console + GUI ring + serial. Used by
+ * the boot status helpers, which must print even while diagnostics are
+ * muted. */
+static void klog_out(const char* s) {
     /* fb terminal takes priority when GOP grabbed the display; in VGA
      * graphics mode the text VRAM window is not mapped as text - keep
      * those logs serial-only (BIOS path behaviour unchanged).  The GOP
      * desktop additionally mutes the fb console so diagnostics never
      * paint over the desktop UI (isr.c's exception dump bypasses this). */
     if (fb_is_active() && !fb_console_muted()) {
-        fb_puts(ts);
         fb_puts(s);
     } else if (!vga_is_graphics()) {
-        vga_puts(ts);
         vga_puts(s);
     }
-    klog_ring_write(ts);
     klog_ring_write(s);
-    serial_puts(ts);
     serial_puts(s);
+}
+
+void klog(const char* s) {
+    if (klog_muted) {
+        klog_ring_write(s);
+        serial_puts(s);
+        return;
+    }
+    klog_out(s);
 }
 
 void klog_hex(const char* prefix, uint64_t v) {
@@ -146,159 +157,229 @@ void klog_hex(const char* prefix, uint64_t v) {
     klog("\n");
 }
 
+/* Boot status lines, systemd style: boot_start() prints the step label and
+ * pads it to the status column; boot_ok()/boot_fail() close the line with a
+ * right-aligned verdict tag, green for OK / red for FAILED. Timestamp-free
+ * and console-unconditional (they bypass klog_muted). */
+#define BOOT_STATUS_COL 60   /* column where the verdict tag starts */
+
+static void boot_start(const char* label) {
+    klog_out(label);
+    uint32_t len = 0;
+    while (label[len]) len++;
+    if (len + 9 > BOOT_STATUS_COL) {   /* 9 = one space + 8-char tag */
+        klog_out(" ");
+        return;
+    }
+    for (uint32_t i = len; i < BOOT_STATUS_COL - 9; i++) klog_out(" ");
+}
+
+/* Verdict tag color on whichever console is active; boot_tag_color_reset()
+ * restores the boot-screen default (fb light grey / VGA white-on-black). */
+static void boot_tag_color(int ok) {
+    uint8_t ega = ok ? (uint8_t)COLOR_LIGHT_GREEN : (uint8_t)COLOR_LIGHT_RED;
+    if (fb_is_active() && !fb_console_muted()) {
+        fb_set_color(ega);
+    } else if (!vga_is_graphics()) {
+        vga_set_color(vga_entry_color(ega, COLOR_BLACK));
+    }
+}
+
+static void boot_tag_color_reset(void) {
+    if (fb_is_active() && !fb_console_muted()) {
+        fb_set_color(COLOR_GREY);   /* fb default fg 0xAAAAAA = EGA 7 */
+    } else if (!vga_is_graphics()) {
+        vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
+    }
+}
+
+static void boot_ok(void) {
+    boot_tag_color(1);
+    klog_out("[  OK  ]\n");
+    boot_tag_color_reset();
+}
+
+static void boot_fail(void) {
+    boot_tag_color(0);
+    klog_out("[FAILED]\n");
+    boot_tag_color_reset();
+}
+
 void kernel_main(uint64_t mb_info_phys) {
     serial_init();
     serial_puts("kernel_main entered\n");
+
+    /* Clean boot screen: mute subsystem diagnostics from the very first
+     * klog so the console shows only the banner + status lines. Serial and
+     * the GUI log ring keep capturing everything for debugging. */
+    klog_muted = 1;
 
     /* UEFI boots: locate GOP, pick 1024x768x32, snapshot the EFI memory
      * map and ExitBootServices - all before PMM needs the memory map.
      * BIOS boots bail out here with a single serial line, VGA untouched. */
     efi_gop_init(mb_info_phys);
 
-    /* Start the timestamp clock before any klog() so early boot logs get
-     * monotonic timestamps. IRQ0 delivery is unmasked separately right
-     * after the PIC remap below. */
+    /* Start the uptime clock before any driver init so early timeout
+     * decisions have a monotonic time source. IRQ0 delivery is unmasked
+     * separately right after the PIC remap below. */
     pit_init(100);
 
     vga_init();
 
     vga_set_color(vga_entry_color(COLOR_LIGHT_CYAN, COLOR_BLACK));
-    klog("Kil0yOS version 3.10.0\n");
-    klog("Command line: (none)\n");
+    klog_out("Kil0yOS version 3.10.0\n");
+    klog_out("Command line: (none)\n");
     vga_set_color(vga_entry_color(COLOR_WHITE, COLOR_BLACK));
 
-    klog("GDT: loading GDT...\n");
+    boot_start("GDT: loading GDT");
     gdt_init();
+    boot_ok();
 
-    klog("TSS: initializing Task State Segment...\n");
+    boot_start("TSS: initializing Task State Segment");
     tss_init();
+    boot_ok();
 
-    klog("IDT: loading IDT...\n");
+    boot_start("IDT: loading IDT");
     idt_init();
+    boot_ok();
 
-    klog("ISRs: registering handlers...\n");
+    boot_start("ISRs: registering handlers");
     isr_init();
+    boot_ok();
 
-    klog("PIC: initializing 8259A...\n");
+    boot_start("PIC: initializing 8259A");
     interrupts_init();
+    boot_ok();
 
     /* pic_init() masked all IRQ lines - unmask IRQ0 now so timer ticks
-     * (and timestamps) keep flowing once interrupts are enabled. */
+     * keep flowing once interrupts are enabled. */
     pic_enable_irq(0);
 
-    klog("PMM: initializing physical memory...\n");
+    boot_start("PMM: initializing physical memory");
     pmm_init(mb_info_phys);
+    boot_ok();
 
-    klog("VMM: initializing virtual memory...\n");
+    boot_start("VMM: initializing virtual memory");
     vmm_init();
+    boot_ok();
 
-    klog("Memory: initializing heap...\n");
+    boot_start("Memory: initializing heap");
     memory_map_t map = {0};
     memory_init(&map, 1);
+    boot_ok();
 
-    klog("devtmpfs: initializing device manager...\n");
+    boot_start("devtmpfs: initializing device manager");
     device_init();
+    boot_ok();
 
-    klog("VFS: initializing filesystem...\n");
+    boot_start("VFS: initializing filesystem");
     fs_init();
     heap_verify("fs_init");
+    boot_ok();
 
-    klog("user: installing built-in user programs...\n");
+    boot_start("user: installing built-in user programs");
     user_programs_install();
     heap_verify("user_install");
+    boot_ok();
 
-    klog("Shell: initializing command interpreter...\n");
+    boot_start("Shell: initializing command interpreter");
     shell_init();
     heap_verify("shell_init");
-    klog("[init] shell_init done\n");
+    boot_ok();
 
-    klog("input: keyboard initializing...\n");
+    boot_start("input: keyboard initializing");
     keyboard_init();
     heap_verify("keyboard");
-    klog("[init] keyboard_init done\n");
+    boot_ok();
 
-    klog("input: mouse initializing...\n");
+    boot_start("input: mouse initializing");
     mouse_init();
     heap_verify("mouse");
-    klog("[init] mouse_init done\n");
+    boot_ok();
 
     /* mouse.c rewrites the 8042 CDB; force the keyboard interrupt bits
      * back on in case its CDB read consumed a stray keystroke byte */
     keyboard_rearm_interrupt();
 
-    klog("Speaker: initializing...\n");
+    boot_start("Speaker: initializing");
     speaker_init();
     heap_verify("speaker");
-    klog("[init] speaker_init done\n");
+    boot_ok();
 
-    klog("Scheduler: initializing round-robin scheduler...\n");
+    boot_start("Scheduler: initializing round-robin scheduler");
     scheduler_init();
     heap_verify("sched");
-    klog("[init] scheduler_init done\n");
+    boot_ok();
 
-    klog("ACPI: initializing...\n");
+    boot_start("ACPI: initializing");
     power_init();
     heap_verify("acpi");
-    klog("[init] power_init done\n");
+    boot_ok();
 
-    klog("PCI: initializing bus...\n");
+    boot_start("PCI: initializing bus");
     pci_init();
     heap_verify("pci");
-    klog("[init] pci_init done\n");
+    boot_ok();
 
-    klog("net: initializing network stack...\n");
+    boot_start("net: initializing network stack");
     netif_init();
     arp_init();
     udp_init();
     tcp_init();
+    boot_ok();
+
+    boot_start("net: probing network interface");
     const char* nic = netif_probe();
     if (nic) {
+        boot_ok();
         klog("net: ");
         klog(nic);
         klog(" found\n");
 
         /* Auto-configuration: try DHCP first, fall back to the classic
          * QEMU user-network static settings when no server answers. */
+        boot_start("net: requesting DHCP lease");
         if (dhcp_autoconfig(&g_netif) == 0) {
-            klog("net: DHCP ok\n");
+            boot_ok();
         } else {
+            boot_fail();
             g_netif.ip      = 0x0A00020F; /* 10.0.2.15 */
             g_netif.netmask = 0xFFFFFF00; /* 255.255.255.0 */
             g_netif.gateway = 0x0A000202; /* 10.0.2.2 */
             g_netif.dns     = 0x0A000203; /* 10.0.2.3 (slirp DNS proxy) */
             klog("net: DHCP failed, using static fallback\n");
         }
-        klog("net: configured\n");
     } else {
+        boot_fail();
         klog("net: no NIC found\n");
     }
-    klog("[init] net done\n");
     heap_verify("net");
 
-    klog("USB: initializing (UHCI + HID)...\n");
+    boot_start("USB: initializing (UHCI + HID)");
     usb_init();
     heap_verify("usb");
-    klog("[init] usb_init done\n");
+    boot_ok();
 
-    klog("SMP: initializing multiprocessor...\n");
+    boot_start("SMP: initializing multiprocessor");
     smp_init();
-    klog("[init] smp_init done\n");
+    boot_ok();
 
-    klog("watchdog: starting kernel heartbeat thread (10s poll)...\n");
+    boot_start("watchdog: starting kernel heartbeat thread (10s poll)");
     heartbeat_watchdog_init();
-    klog("[init] heartbeat watchdog ready\n");
+    boot_ok();
 
-    klog("watchdog: arming NMI watchdog (cli-wedge coverage)...\n");
+    boot_start("watchdog: arming NMI watchdog (cli-wedge coverage)");
     nmi_wdt_init();
-    klog("[init] nmi watchdog done\n");
+    boot_ok();
+
+    /* Boot finished: diagnostics back on the console for runtime messages. */
+    klog_muted = 0;
 
     klog("\n");
     klog("Welcome to Kil0yOS!\n");
     klog("Type 'help' for available commands.\n\n");
-    klog("[init] before enable_interrupts\n");
 
     enable_interrupts();
-    klog("[init] interrupts enabled\n");
     /* Anchor the tick clock to the polling clock while the polling clock is
      * still accurate (last sample was milliseconds ago). Waiting until some
      * later first caller risks anchoring to a stale/wrapped poll reading. */

@@ -3,6 +3,7 @@
 #include "net/netif.h"
 #include "timer/pit.h"
 #include "core/interrupts.h"
+#include "sched/wait.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
 
@@ -140,6 +141,8 @@ static void tcp_rx_push(tcp_socket_t* sock, const uint8_t* data, uint16_t len) {
         sock->rx_buf[sock->rx_head] = data[i];
         sock->rx_head = next;
     }
+    /* Data arrival: wake blocking read/recv/poll waiters (P1.1) */
+    wait_wake(&g_net_wq, 1);
 }
 
 /* --- RX state machine ---------------------------------------------------- */
@@ -247,6 +250,8 @@ void tcp_receive(netif_t* iface, uint32_t src_ip, const uint8_t* data, uint16_t 
             uint32_t fin_end = seq + payload_len + 1;
             if (fin_end > sock->rcv_nxt) sock->rcv_nxt = fin_end;
             sock->rx_fin = 1;
+            /* EOF for blocking readers/pollers (P1.1) */
+            wait_wake(&g_net_wq, -1);
             tcp_transmit_seg(sock, sock->snd_nxt, TCP_FLAG_ACK, NULL, 0);
             if (sock->state == TCP_ESTABLISHED) sock->state = TCP_CLOSE_WAIT;
             else if (sock->state == TCP_FIN_WAIT1) sock->state = TCP_CLOSING;

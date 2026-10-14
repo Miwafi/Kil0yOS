@@ -55,6 +55,11 @@ void scheduler_set_main_return(void (*entry)(void));
  * user process exits or is killed by a fault). */
 uint64_t scheduler_main_return_rsp(void);
 
+/* Record that the CPU is returning to the kernel main task without a
+ * scheduler_tick pass (direct kill/fault return path). Call immediately
+ * before returning scheduler_main_return_rsp() to the stub. */
+void scheduler_take_main_cpu(void);
+
 int task_get_count(void);
 const char* task_get_name(int idx);
 int task_get_status(int idx);

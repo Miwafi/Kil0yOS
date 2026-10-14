@@ -5,6 +5,7 @@
 #include "core/elf.h"
 #include "mm/memory.h"
 #include "timer/pit.h"
+#include "sched/wait.h"
 #include "lib/string.h"
 #include "lib/stdlib.h"
 #include "drivers/video/vga.h"
@@ -34,10 +35,9 @@
 #define L_ECONNREFUSED 111
 #define L_EADDRINUSE 98
 
-/* socket fds live above the file-fd range (sc_close needs this early) */
-#define SOCK_FD_BASE   64
+/* socket fd plumbing now rides the unified per-process fd table (P1.2):
+ * sockets are struct file entries (FILE_T_SOCK_TCP/UDP), no high range */
 #define MSG_KBUF_SZ    4096   /* kernel staging buffer for msg coalescing */
-#define SOCK_FD_COUNT  64
 
 /* Socket types shared by the syscall layer (needed by sc_read/sc_poll
  * which run before the Phase 3.3 section below). */
@@ -184,14 +184,8 @@ void syscall_lnx_write_fs_base(uint64_t base) {
 
 /* Console output shared by write/writev. Goes through the TTY line
  * discipline (\n -> \r\n) to the VGA console AND COM1 so headless QEMU
- * runs (serial log) see program output. */
-/* fd routing: 0/1/2 are the TTY console unless dup2 redirected them to a
- * file; fds >= 3 always go through the lnxvfs fd layer. */
-static int fd_is_file(uint64_t fd) {
-    process_t* proc = process_get_current();
-    if (proc == NULL || fd >= LNX_MAX_FDS) return 0;
-    return proc->fds[fd] != NULL;
-}
+ * runs (serial log) see program output. fd routing is kind-based since
+ * P1.2: sockets/ttys/files are all struct file entries. */
 
 static uint64_t sc_read(uint64_t fd, uint64_t buf, uint64_t count,
                         uint64_t u3, uint64_t u4, uint64_t u5) {
@@ -199,32 +193,47 @@ static uint64_t sc_read(uint64_t fd, uint64_t buf, uint64_t count,
     if (count == 0) return 0;
     if (!process_check_user_range(buf, (size_t)count)) return -L_EINVAL;
 
+    struct file* f = fd_get_file((int)fd);
+    if (f == NULL) return -L_EBADF;
+
     /* Socket fds: musl recv()/busybox code paths often fall back to plain
      * read(2) on the socket (e.g. busybox nslookup reads the DNS reply
      * with read(fd) after poll()). */
-    if (fd >= SOCK_FD_BASE) {
+    if (f->kind == FILE_T_SOCK_TCP || f->kind == FILE_T_SOCK_UDP) {
         enum sock_kind kind;
         void* s = sock_fd_get(fd, &kind);
         if (s == NULL) return -L_EBADF;
         if (kind == SOCK_TCP) {
-            int r = tcp_recv((tcp_socket_t*)s, (uint8_t*)buf,
-                             (uint16_t)(count > 0xFFFF ? 0xFFFF : count), 15000);
-            return r < 0 ? (uint64_t)-L_EIO : (uint64_t)r;
+            tcp_socket_t* ts = (tcp_socket_t*)s;
+            uint16_t want = (uint16_t)(count > 0xFFFF ? 0xFFFF : count);
+            for (;;) {
+                int r = tcp_recv(ts, (uint8_t*)buf, want, 0);
+                if (r >= 0) return (uint64_t)r;
+                if (ts->state == TCP_CLOSED &&
+                    ts->rx_head == ts->rx_tail) return (uint64_t)-L_EIO;
+                /* no data yet: park; the wake resumes user mode so this
+                 * read(2) re-executes and re-checks (P1.1) */
+                wait_block(lnx_frame_rsp, &g_net_wq, WAIT_RESTART, 0, 0);
+            }
         }
+        udp_socket_t* us = (udp_socket_t*)s;
         uint8_t kbuf[2048];
         uint32_t src_ip = 0;
         uint16_t src_port = 0;
         uint16_t want = (uint16_t)(count > sizeof(kbuf) ? sizeof(kbuf) : count);
-        int r = udp_recvfrom((udp_socket_t*)s, kbuf, want, &src_ip, &src_port, 15000);
-        if (r < 0) return (uint64_t)-L_EAGAIN;
-        memcpy((void*)buf, kbuf, (size_t)r);
-        return (uint64_t)r;
+        for (;;) {
+            int r = udp_recvfrom(us, kbuf, want, &src_ip, &src_port, 0);
+            if (r >= 0) {
+                memcpy((void*)buf, kbuf, (size_t)r);
+                return (uint64_t)r;
+            }
+            wait_block(lnx_frame_rsp, &g_net_wq, WAIT_RESTART, 0, 0);
+        }
     }
 
-    if (fd >= LNX_MAX_FDS) return -L_EBADF;
-    if (fd_is_file(fd)) return (uint64_t)lnxvfs_read((int)fd, (char*)buf, (size_t)count);
-    if (fd != 0) return -L_EBADF;
-    return (uint64_t)tty_read((char*)buf, (size_t)count);
+    if (f->kind == FILE_T_VFS)
+        return (uint64_t)lnxvfs_read((int)fd, (char*)buf, (size_t)count);
+    return (uint64_t)f->ops->read(f, (char*)buf, (size_t)count);
 }
 
 static uint64_t sc_write(uint64_t fd, uint64_t buf, uint64_t count,
@@ -233,9 +242,12 @@ static uint64_t sc_write(uint64_t fd, uint64_t buf, uint64_t count,
     if (count == 0) return 0;
     if (!process_check_user_range(buf, (size_t)count)) return -L_EINVAL;
 
+    struct file* f = fd_get_file((int)fd);
+    if (f == NULL) return -L_EBADF;
+
     /* write(2) on a connected socket (busybox nslookup sends DNS queries
      * with plain write after connect()). */
-    if (fd >= SOCK_FD_BASE) {
+    if (f->kind == FILE_T_SOCK_TCP || f->kind == FILE_T_SOCK_UDP) {
         enum sock_kind kind;
         void* s = sock_fd_get(fd, &kind);
         if (s == NULL) return -L_EBADF;
@@ -255,10 +267,9 @@ static uint64_t sc_write(uint64_t fd, uint64_t buf, uint64_t count,
         return r < 0 ? (uint64_t)-L_EIO : (uint64_t)len;
     }
 
-    if (fd >= LNX_MAX_FDS) return -L_EBADF;
-    if (fd_is_file(fd)) return (uint64_t)lnxvfs_write((int)fd, (const char*)buf, (size_t)count);
-    if (fd != 1 && fd != 2) return -L_EBADF;
-    return (uint64_t)tty_write((const char*)buf, (size_t)count);
+    if (f->kind == FILE_T_VFS)
+        return (uint64_t)lnxvfs_write((int)fd, (const char*)buf, (size_t)count);
+    return (uint64_t)f->ops->write(f, (const char*)buf, (size_t)count);
 }
 
 struct lnx_iovec { uint64_t base; uint64_t len; };
@@ -273,10 +284,10 @@ static uint64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t iovcnt,
     }
     /* writev(2) on a socket: musl stdio flushes FILE* output through
      * writev (busybox wget sends its HTTP GET request this way), so the
-     * vectors must be coalesced and handed to the TCP/UDP layer. NOTE:
-     * socket fds (>= SOCK_FD_BASE) live above the file-fd table, so this
-     * branch MUST come before the LNX_MAX_FDS bound check below. */
-    if (fd >= SOCK_FD_BASE) {
+     * vectors must be coalesced and handed to the TCP/UDP layer. */
+    struct file* uf = fd_get_file((int)fd);
+    if (uf == NULL) return -L_EBADF;
+    if (uf->kind == FILE_T_SOCK_TCP || uf->kind == FILE_T_SOCK_UDP) {
         enum sock_kind kind;
         void* s = sock_fd_get(fd, &kind);
         if (s == NULL) return -L_EBADF;
@@ -305,7 +316,7 @@ static uint64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t iovcnt,
         return r < 0 ? (uint64_t)-L_EIO : (uint64_t)len;
     }
     /* Single redirected file fd: delegate (must not split the vector) */
-    if (fd_is_file(fd)) {
+    if (uf->kind == FILE_T_VFS) {
         const struct lnx_iovec* v0 = (const struct lnx_iovec*)iov;
         if (iovcnt == 1) {
             if (v0[0].len == 0) return 0;
@@ -314,8 +325,6 @@ static uint64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t iovcnt,
         }
         return -L_EINVAL;
     }
-    if (fd >= LNX_MAX_FDS) return -L_EBADF;
-    if (fd != 1 && fd != 2) return -L_EBADF;
     uint64_t total = 0;
     const struct lnx_iovec* v = (const struct lnx_iovec*)iov;
     for (uint64_t i = 0; i < iovcnt; i++) {
@@ -323,7 +332,7 @@ static uint64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t iovcnt,
         if (!process_check_user_range(v[i].base, (size_t)v[i].len)) {
             return -L_EINVAL;
         }
-        total += (uint64_t)tty_write((const char*)v[i].base, (size_t)v[i].len);
+        total += (uint64_t)uf->ops->write(uf, (const char*)v[i].base, (size_t)v[i].len);
     }
     return total;
 }
@@ -342,7 +351,9 @@ static uint64_t sc_readv(uint64_t fd, uint64_t uiov, uint64_t iovcnt,
     struct lnx_iovec iv[16];
     memcpy(iv, (const void*)uiov, (size_t)(iovcnt * sizeof(struct lnx_iovec)));
 
-    if (fd >= SOCK_FD_BASE) {
+    struct file* uf = fd_get_file((int)fd);
+    if (uf == NULL) return -L_EBADF;
+    if (uf->kind == FILE_T_SOCK_TCP || uf->kind == FILE_T_SOCK_UDP) {
         enum sock_kind kind;
         void* s = sock_fd_get(fd, &kind);
         if (s == NULL) return -L_EBADF;
@@ -375,9 +386,8 @@ static uint64_t sc_readv(uint64_t fd, uint64_t uiov, uint64_t iovcnt,
         return 0;
     }
 
-    if (fd >= LNX_MAX_FDS) return -L_EBADF;
     uint64_t total = 0;
-    if (fd_is_file(fd)) {
+    if (uf->kind == FILE_T_VFS) {
         for (uint64_t i = 0; i < iovcnt; i++) {
             if (iv[i].len == 0) continue;
             if (!process_check_user_range(iv[i].base, (size_t)iv[i].len))
@@ -389,12 +399,11 @@ static uint64_t sc_readv(uint64_t fd, uint64_t uiov, uint64_t iovcnt,
         }
         return total;
     }
-    if (fd != 0) return -L_EBADF;
     for (uint64_t i = 0; i < iovcnt; i++) {
         if (iv[i].len == 0) continue;
         if (!process_check_user_range(iv[i].base, (size_t)iv[i].len))
             return -L_EINVAL;
-        long r = tty_read((char*)iv[i].base, (size_t)iv[i].len);
+        long r = uf->ops->read(uf, (char*)iv[i].base, (size_t)iv[i].len);
         if (r < 0) return total > 0 ? total : (uint64_t)r;
         total += (uint64_t)r;
         if (total > 0) break;   /* one read per call is fine for a tty */
@@ -437,11 +446,9 @@ static uint64_t sc_open(uint64_t upath, uint64_t flags, uint64_t mode,
 static uint64_t sc_close(uint64_t fd, uint64_t u2, uint64_t u3,
                          uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
-    if (fd >= SOCK_FD_BASE) { sock_fd_close(fd); return 0; }
-    if (fd >= LNX_MAX_FDS) return -L_EBADF;
-    if (fd_is_file(fd)) return (uint64_t)lnxvfs_close((int)fd);
-    if (fd <= 2) return 0;   /* console: always "open" */
-    return -L_EBADF;
+    /* Unified layer: files, sockets and console ttys all close here
+     * (ttys are real refcounted objects now, mirroring close(0..2)). */
+    return (uint64_t)fd_close((int)fd);
 }
 
 static uint64_t sc_lseek(uint64_t fd, uint64_t off, uint64_t whence,
@@ -547,15 +554,20 @@ static uint64_t sc_access(uint64_t upath, uint64_t mode, uint64_t u3,
     return fs_resolve_path(path) ? 0 : (uint64_t)-L_ENOENT;
 }
 
-/* nanosleep(2): busy-wait (single CPU, syscalls run with IF=0) */
+/* nanosleep(2): park the caller; a one-shot timer completes the parked
+ * frame with 0 at the deadline (P1.1 blocking syscalls). */
 static uint64_t sc_nanosleep(uint64_t req, uint64_t u2, uint64_t u3,
                              uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
     if (!process_check_user_range(req, 16)) return -L_EINVAL;
     const uint64_t* t = (const uint64_t*)req;
     uint64_t us = t[0] * 1000000ULL + t[1] / 1000ULL;
-    uint64_t start = pit_uptime_us();
-    while (pit_uptime_us() - start < us) { __asm__ volatile("pause"); }
+    if (us != 0) {
+        wait_block(lnx_frame_rsp, &g_sleep_wq, WAIT_COMPLETE, 0, us);
+        /* only reachable via the timer-pool spin fallback: re-check */
+        uint64_t start = pit_uptime_us();
+        while (pit_uptime_us() - start < us) { __asm__ volatile("pause"); }
+    }
     return 0;
 }
 
@@ -655,16 +667,7 @@ static uint64_t sc_dup2(uint64_t oldfd, uint64_t newfd, uint64_t u3,
 static uint64_t sc_dup(uint64_t oldfd, uint64_t u2, uint64_t u3,
                        uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
-    process_t* proc = process_get_current();
-    if (proc == NULL || oldfd >= LNX_MAX_FDS) return -L_EBADF;
-    if (oldfd >= 3 && proc->fds[oldfd] == NULL) return -L_EBADF;
-    /* Allocate the lowest free descriptor above the console range */
-    for (int fd = 3; fd < LNX_MAX_FDS; fd++) {
-        if (proc->fds[fd] == NULL) {
-            return (uint64_t)lnxvfs_dup2((int)oldfd, fd);
-        }
-    }
-    return -L_EBADF;
+    return (uint64_t)fd_dup((int)oldfd);
 }
 
 /* Phase 0.2: anonymous mmap. Phase 3.0: file-backed MAP_PRIVATE (the
@@ -689,7 +692,8 @@ static uint64_t sc_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 
     int is_file = !(flags & LNX_MAP_ANONYMOUS);
     if (is_file) {
-        if (fd >= LNX_MAX_FDS || !fd_is_file(fd)) {
+        struct file* uf = fd_get_file((int)fd);
+        if (uf == NULL || uf->kind != FILE_T_VFS) {
             klog("[mmap] file: bad fd\n");
             return -L_EBADF;
         }
@@ -856,7 +860,8 @@ static uint64_t sc_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 static uint64_t sc_pread64(uint64_t fd, uint64_t ubuf, uint64_t count,
                            uint64_t off, uint64_t u5, uint64_t u6) {
     (void)u5; (void)u6;
-    if (fd >= LNX_MAX_FDS || !fd_is_file(fd)) return -L_EBADF;
+    struct file* uf = fd_get_file((int)fd);
+    if (uf == NULL || uf->kind != FILE_T_VFS) return -L_EBADF;
     if (count > 0 && !process_check_user_range(ubuf, count)) return -L_EINVAL;
     uint64_t done = 0;
     uint8_t kbuf[512];
@@ -909,50 +914,61 @@ static uint64_t sc_prlimit64(uint64_t pid, uint64_t res, uint64_t unew,
 }
 
 /* --- Phase 3.3: sockets --------------------------------------------------
- * Socket fds live in their own high range (SOCK_FD_BASE..) so they never
- * collide with the lnxvfs file-fd table (LNX_MAX_FDS = 16 entries). The
- * fd layer routes: fd < 16 -> file/tty, fd >= 64 -> socket table. */
-
-static struct {
-    enum sock_kind kind;
-    void* sock;
-} sock_fds[SOCK_FD_COUNT];
-
-static int sock_fd_alloc(enum sock_kind kind, void* sock) {
-    for (int i = 0; i < SOCK_FD_COUNT; i++) {
-        if (sock_fds[i].kind == SOCK_NONE) {
-            sock_fds[i].kind = kind;
-            sock_fds[i].sock = sock;
-            return SOCK_FD_BASE + i;
-        }
-    }
-    return -1;
-}
+ * Sockets are struct file entries (FILE_T_SOCK_TCP/UDP) in the unified
+ * per-process fd table (P1.2) - no private fd range anymore. sock_fd_get
+ * resolves any fd to its backend object so the syscall bodies below stay
+ * unchanged. */
 
 static void* sock_fd_get(uint64_t fd, enum sock_kind* kind) {
-    if (fd < SOCK_FD_BASE || fd >= SOCK_FD_BASE + SOCK_FD_COUNT) return NULL;
-    if (sock_fds[fd - SOCK_FD_BASE].kind == SOCK_NONE) return NULL;
-    if (kind) *kind = sock_fds[fd - SOCK_FD_BASE].kind;
-    return sock_fds[fd - SOCK_FD_BASE].sock;
-}
-
-static void sock_fd_free(uint64_t fd) {
-    if (fd >= SOCK_FD_BASE && fd < SOCK_FD_BASE + SOCK_FD_COUNT) {
-        sock_fds[fd - SOCK_FD_BASE].kind = SOCK_NONE;
-        sock_fds[fd - SOCK_FD_BASE].sock = NULL;
+    struct file* f = fd_get_file((int)fd);
+    if (f == NULL) return NULL;
+    if (f->kind == FILE_T_SOCK_TCP) {
+        if (kind) *kind = SOCK_TCP;
+        return f->priv;
     }
+    if (f->kind == FILE_T_SOCK_UDP) {
+        if (kind) *kind = SOCK_UDP;
+        return f->priv;
+    }
+    return NULL;
 }
 
-/* Close a socket fd: TCP does the active-close handshake (best effort,
- * bounded), UDP just frees. Always releases the fd slot. */
-static void sock_fd_close(uint64_t fd) {
-    enum sock_kind kind;
-    void* s = sock_fd_get(fd, &kind);
-    if (s == NULL) return;
-    if (kind == SOCK_TCP) tcp_close((tcp_socket_t*)s);
-    else                  udp_socket_close((udp_socket_t*)s);
-    sock_fd_free(fd);
+/* Backend close/poll ops for socket file objects. */
+static int sock_tcp_f_close(struct file* f) {
+    tcp_close((tcp_socket_t*)f->priv);
+    return 0;
 }
+
+static int sock_udp_f_close(struct file* f) {
+    udp_socket_close((udp_socket_t*)f->priv);
+    return 0;
+}
+
+static int sock_tcp_f_poll(struct file* f) {
+    tcp_socket_t* s = (tcp_socket_t*)f->priv;
+    int rev = 0;
+    if (s->rx_head != s->rx_tail) rev |= POLL_IN;
+    if (s->state == TCP_ESTABLISHED) rev |= POLL_OUT;
+    if (s->state == TCP_CLOSED) rev |= POLL_ERR;
+    return rev;
+}
+
+static int sock_udp_f_poll(struct file* f) {
+    udp_socket_t* s = (udp_socket_t*)f->priv;
+    int rev = POLL_OUT;
+    if (s->rx_count != 0) rev |= POLL_IN;
+    return rev;
+}
+
+static const struct file_ops sock_tcp_ops = {
+    .close = sock_tcp_f_close,
+    .poll = sock_tcp_f_poll,
+};
+
+static const struct file_ops sock_udp_ops = {
+    .close = sock_udp_f_close,
+    .poll = sock_udp_f_poll,
+};
 
 static uint64_t sc_socket(uint64_t domain, uint64_t type, uint64_t proto,
                           uint64_t u4, uint64_t u5, uint64_t u6) {
@@ -967,15 +983,19 @@ static uint64_t sc_socket(uint64_t domain, uint64_t type, uint64_t proto,
     if (t == LNX_SOCK_STREAM) {
         tcp_socket_t* s = tcp_socket_create();
         if (s == NULL) return -L_ENOMEM;
-        int fd = sock_fd_alloc(SOCK_TCP, s);
-        if (fd < 0) { tcp_socket_close(s); return -L_ENOMEM; }
+        struct file* f = file_new(FILE_T_SOCK_TCP, &sock_tcp_ops, s);
+        if (f == NULL) { tcp_socket_close(s); return -L_ENOMEM; }
+        int fd = fd_install(f);
+        if (fd < 0) { file_close(f); return -L_ENOMEM; }
         return (uint64_t)fd;
     }
     if (t == LNX_SOCK_DGRAM) {
         udp_socket_t* s = udp_socket_create();
         if (s == NULL) return -L_ENOMEM;
-        int fd = sock_fd_alloc(SOCK_UDP, s);
-        if (fd < 0) { udp_socket_close(s); return -L_ENOMEM; }
+        struct file* f = file_new(FILE_T_SOCK_UDP, &sock_udp_ops, s);
+        if (f == NULL) { udp_socket_close(s); return -L_ENOMEM; }
+        int fd = fd_install(f);
+        if (fd < 0) { file_close(f); return -L_ENOMEM; }
         return (uint64_t)fd;
     }
     return -L_EINVAL;
@@ -1267,6 +1287,28 @@ static uint64_t sc_recvmsg(uint64_t fd, uint64_t umsg, uint64_t flags,
 
 struct lnx_pollfd { int32_t fd; int16_t events; int16_t revents; };
 
+static uint64_t poll_scan(struct lnx_pollfd* fds, uint64_t nfds) {
+    int ready = 0;
+    for (uint64_t i = 0; i < nfds; i++) {
+        int16_t rev = 0;
+        struct file* f = fd_get_file((int)fds[i].fd);
+        if (f == NULL || f->ops == NULL || f->ops->poll == NULL) {
+            rev = LNX_POLLNVAL;
+        } else {
+            /* Kind-uniform readiness via the file layer: sockets probe
+             * their ring/flags, ttys and memory files are always ready. */
+            rev = (int16_t)(f->ops->poll(f) & 0xFFFF);
+        }
+        fds[i].revents = (int16_t)(rev & (fds[i].events | LNX_POLLERR | LNX_POLLNVAL));
+        if (fds[i].revents) ready++;
+    }
+    return (uint64_t)ready;
+}
+
+/* poll(2): supports sockets + files/console. pollfd layout matches Linux
+ * x86-64: { int fd; short events; short revents; }. Blocking uses the
+ * P1.1 wait queue: park, wake re-executes the syscall, and the deadline
+ * survives restarts in proc->block_scratch. */
 static uint64_t sc_poll(uint64_t ufds, uint64_t nfds, uint64_t timeout_ms,
                         uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u4; (void)u5; (void)u6;
@@ -1275,40 +1317,37 @@ static uint64_t sc_poll(uint64_t ufds, uint64_t nfds, uint64_t timeout_ms,
     if (!process_check_user_range(ufds, nfds * sizeof(struct lnx_pollfd))) return -L_EINVAL;
     struct lnx_pollfd* fds = (struct lnx_pollfd*)ufds;
 
-    uint32_t waited = 0;
-    while (1) {
-        int ready = 0;
-        for (uint64_t i = 0; i < nfds; i++) {
-            int16_t rev = 0;
-            int32_t fd = fds[i].fd;
-            if (fd >= SOCK_FD_BASE) {
-                enum sock_kind kind;
-                void* s = sock_fd_get((uint64_t)fd, &kind);
-                if (s == NULL) { rev = LNX_POLLNVAL; }
-                else if (kind == SOCK_TCP) {
-                    if (tcp_rx_ready((tcp_socket_t*)s)) rev |= LNX_POLLIN;
-                    rev |= LNX_POLLOUT;
-                } else {
-                    udp_socket_t* us = (udp_socket_t*)s;
-                    if (us->rx_count != 0) rev |= LNX_POLLIN;
-                    rev |= LNX_POLLOUT;
-                }
-            } else if (fd >= 0 && fd < (int32_t)LNX_MAX_FDS && fd_is_file((uint64_t)fd)) {
-                rev = LNX_POLLIN | LNX_POLLOUT;
-            } else if (fd >= 0 && fd <= 2) {
-                rev = LNX_POLLIN | LNX_POLLOUT;
-            } else {
-                rev = LNX_POLLNVAL;
-            }
-            fds[i].revents = (int16_t)(rev & (fds[i].events | LNX_POLLERR | LNX_POLLNVAL));
-            if (fds[i].revents) ready++;
+    for (;;) {
+        uint64_t ready = poll_scan(fds, nfds);
+        if (ready != 0) {
+            process_get_current()->block_scratch = 0;
+            return ready;
         }
-        if (ready != 0) return (uint64_t)ready;
         if (timeout_ms == 0) return 0;
-        if (timeout_ms != 0xFFFFFFFF && waited >= timeout_ms) return 0;
+
+        /* Deadline persists across restarts (block_scratch) */
+        process_t* proc = process_get_current();
+        uint64_t deadline = proc->block_scratch;
+        if (deadline == 0) {
+            if (timeout_ms == 0xFFFFFFFF) {
+                /* infinite: park until any wake source fires */
+                wait_block(lnx_frame_rsp, &g_poll_wq, WAIT_RESTART, 0, 0);
+                continue;
+            }
+            deadline = pit_uptime_us() + timeout_ms * 1000ULL;
+            proc->block_scratch = deadline;
+        }
+
+        uint64_t now = pit_uptime_us();
+        if (now >= deadline) {
+            proc->block_scratch = 0;
+            return 0;
+        }
         netif_poll();
-        pit_delay_ms(2);
-        waited += 2;
+        /* Park until deadline; timer wake restarts the poll(2). Only the
+         * timer-pool spin fallback returns here. */
+        wait_block(lnx_frame_rsp, &g_poll_wq, WAIT_RESTART, 0,
+                   deadline - now);
     }
 }
 
@@ -1392,21 +1431,12 @@ static uint64_t sc_arch_prctl(uint64_t code, uint64_t addr,
 static uint64_t sc_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
                          uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u4; (void)u5; (void)u6;
-    if (fd != 0 && fd != 1 && fd != 2) return -L_EBADF;
-
-    if (cmd == LNX_TIOCGWINSZ) {
-        if (!process_check_user_range(arg, 8)) return -L_EINVAL;
-        uint16_t* ws = (uint16_t*)arg;
-        ws[0] = 24; ws[1] = 80; ws[2] = 0; ws[3] = 0;   /* rows, cols */
-        return 0;
-    }
-    if (cmd == LNX_TCGETS) {
-        /* Zeroed termios => isatty() true => musl line-buffers stdout */
-        if (!process_check_user_range(arg, 60)) return -L_EINVAL;
-        memset((void*)arg, 0, 60);
-        return 0;
-    }
-    return -L_ENOTTY;
+    /* Route through the unified file layer: tty files answer TCGETS /
+     * TIOCGWINSZ, everything else reports ENOTTY (musl isatty() then
+     * falls back to buffered mode - same as a pipe or file on Linux). */
+    struct file* f = fd_get_file((int)fd);
+    if (f == NULL || f->ops == NULL || f->ops->ioctl == NULL) return -L_EBADF;
+    return (uint64_t)f->ops->ioctl(f, cmd, arg);
 }
 
 struct lnx_utsname { char v[6][65]; };

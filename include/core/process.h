@@ -2,10 +2,11 @@
 #define PROCESS_H
 
 #include "lib/types.h"
+#include "core/file.h"
 #include "core/lnxvfs.h"
 
 /* Maximum number of processes */
-#define MAX_PROCESSES 16
+#define MAX_PROCESSES 128
 
 /* Process states */
 typedef enum {
@@ -86,8 +87,9 @@ typedef struct process {
     /* File system */
     int current_dir_cluster;
 
-    /* Linux-ABI open file table (fd 0/1/2 = console, never in the array) */
-    struct lnx_file* fds[LNX_MAX_FDS];
+    /* Unified open-file table (P1.2): VFS files, sockets and the console
+     * ttys are all struct file entries, refcount-shared across fork. */
+    struct file* fds[LNX_MAX_FDS];
 
     /* Address space + fork/wait state (Phase 1.5). cr3 is the phys of
      * this process's PML4 (0 = legacy kernel-shared). parked_rsp holds a
@@ -97,6 +99,17 @@ typedef struct process {
     int parent_pid;
     int wait_pid;             /* -1 = any child */
     uint64_t wait_status_ptr; /* user pointer for the wait4 status int */
+
+    /* Blocking-syscall support (P1.1). A process blocked inside a syscall
+     * parks its IRQ-layout frame in parked_frame (kernel BSS: mapped in
+     * every CR3, never overlaps a live C stack) and sits on a wait queue
+     * through wait_next; parked_rsp points at it. block_scratch carries
+     * per-syscall state across restarts (e.g. poll deadline). fpu is the
+     * fxsave image swapped in at every user-context switch. */
+    struct process* wait_next;
+    uint64_t block_scratch;
+    __attribute__((aligned(16))) uint64_t parked_frame[22]; /* IRQ frame */
+    __attribute__((aligned(16))) uint64_t fpu[66];   /* 512-byte fxsave area */
 } process_t;
 
 /* Process management functions */
@@ -163,6 +176,26 @@ process_t* process_pick_ready(uint32_t exclude_pid);
 
 /* Scheduler hook: mark the given process RUNNING and current */
 void process_become_current(process_t* proc);
+
+/* Detach the CPU from the current process (wait-queue park fallback) */
+void process_set_current_none(void);
+
+/* P1.1 blocking-syscall support (used by sched/wait.c):
+ *  - park_entry_frame converts the live syscall-entry frame at
+ *    entry_frame_rsp into an IRQ-layout frame parked below it and stores
+ *    it in proc->parked_rsp. restart!=0 rewrites the parked RIP so the
+ *    iretq re-executes the user `syscall` instruction (the frame's arg
+ *    registers are untouched); on an unrecognized opcode it falls back
+ *    to a plain return with fallback_ret in RAX.
+ *  - frame_set_ret stores a return value into a parked frame's RAX slot.
+ *  - fpu_save/fpu_restore move the fxsave image between the PCB and the
+ *    live FPU/SSE state at every user-context switch (the kernel itself
+ *    is built -mno-sse and never touches it). */
+uint64_t process_park_entry_frame(process_t* p, uint64_t entry_frame_rsp,
+                                  int restart, uint64_t fallback_ret);
+void process_frame_set_ret(process_t* p, uint64_t ret);
+void fpu_save(process_t* p);
+void fpu_restore(process_t* p);
 
 /* Top of the current process's kernel stack; the Linux-ABI `syscall`
  * entry switches to it because the syscall instruction does not load

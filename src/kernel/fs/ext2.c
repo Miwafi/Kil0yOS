@@ -502,7 +502,15 @@ static fs_entry_t* ext2_new_node(ext2_mount_t* m, const char* name,
     e->mem_data = NULL;
     e->mnt = m;
     memset(e->disk_name, 0, sizeof(e->disk_name));
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) e->children[i] = NULL;
+    /* P1.2: children table lives only on directories (fs.c helper is
+     * static there; replicate the two lines here) */
+    if (type == FS_TYPE_DIRECTORY) {
+        e->children = (fs_entry_t**)kmalloc(sizeof(fs_entry_t*) * MAX_DIR_ENTRIES);
+        if (e->children == NULL) { kfree(e); return NULL; }
+        for (int i = 0; i < MAX_DIR_ENTRIES; i++) e->children[i] = NULL;
+    } else {
+        e->children = NULL;
+    }
     return e;
 }
 

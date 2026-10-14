@@ -75,44 +75,6 @@ static uint64_t pit_poll_elapsed_us(void) {
     return counts * 1000000ULL / PIT_BASE_FREQ;
 }
 
-void pit_format_time(char* buf, size_t len) {
-    if (len < 24) { buf[0] = '\0'; return; }
-
-    uint64_t usec = pit_uptime_us();
-    uint64_t sec = usec / 1000000ULL;
-    uint64_t frac = usec % 1000000ULL;
-
-    /* Cap seconds to avoid buffer overflow (max ~136 years at 100Hz) */
-    if (sec > 99999) sec = 99999;
-
-    char sec_str[8];
-    int sec_len = 0;
-    uint64_t t = sec;
-    do {
-        sec_str[sec_len++] = '0' + (t % 10);
-        t /= 10;
-    } while (t > 0 && sec_len < 7);
-
-    int pos = 0;
-    buf[pos++] = '[';
-    int padding = 5 - sec_len;
-    if (padding < 0) padding = 0;
-    for (int i = 0; i < padding; i++) buf[pos++] = ' ';
-    for (int i = sec_len - 1; i >= 0; i--) buf[pos++] = sec_str[i];
-
-    buf[pos++] = '.';
-
-    uint64_t div = 100000;
-    while (div > 0) {
-        buf[pos++] = '0' + (frac / div) % 10;
-        div /= 10;
-    }
-
-    buf[pos++] = ']';
-    buf[pos++] = ' ';
-    buf[pos] = '\0';
-}
-
 void pit_init(uint32_t frequency) {
     if (frequency == 0 || frequency > PIT_BASE_FREQ) frequency = 1000;
 

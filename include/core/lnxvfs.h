@@ -2,16 +2,17 @@
 #define LNXVFS_H
 
 #include "lib/types.h"
+#include "core/file.h"
 
-/* Linux-ABI fd layer over the memory fs (Phase 1). Each open file is
- * cached in a kernel buffer; writes flush back to the fs on close(). */
-
-#define LNX_MAX_FDS 16
+/* Linux-ABI fd layer over the memory fs (Phase 1). Each open VFS file is
+ * a struct file (kind FILE_T_VFS) in the unified fd table whose priv
+ * points at its lnx_file_t payload; writes flush back to the fs on
+ * close(). The fd table itself lives in the file layer (LNX_MAX_FDS). */
 
 struct process;
 struct lnx_file;
 
-/* Open descriptors are inherited by fork (table copied by pointer). */
+/* Open descriptors are inherited by fork (shared, refcounted). */
 int  lnxvfs_open(const char* path, int flags, int mode);
 int  lnxvfs_close(int fd);
 int  lnxvfs_read(int fd, char* buf, size_t count);
@@ -37,10 +38,8 @@ int  lnxvfs_unlink(const char* path);
 int  lnxvfs_chdir(const char* path);
 long long lnxvfs_getcwd(char* buf, size_t size);
 
-/* Close every open fd of the process (flush + free). Called on exit. */
-void lnxvfs_close_all(struct process* proc);
-
-/* Copy the fd pointer table of parent into child (fork). */
-void lnxvfs_inherit_fds(struct process* parent, struct process* child);
+/* VFS backend ops installed on every FILE_T_VFS file; exposed so the
+ * syscall layer can route poll through the unified file layer. */
+extern const struct file_ops vfs_file_ops;
 
 #endif

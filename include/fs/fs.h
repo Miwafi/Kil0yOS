@@ -6,7 +6,7 @@
 #define MAX_PATH_LENGTH 260
 /* Real Ubuntu libc6 ships 256 files in usr/lib/x86_64-linux-gnu/gconv -
  * the old 128 cap made tar extraction fail with FS_ERR_FULL mid-unpack. */
-#define MAX_DIR_ENTRIES 512
+#define MAX_DIR_ENTRIES 2048
 /* Match the RAM disk capacity: real Ubuntu libc6.deb is 5.27 MB and was
  * silently truncated to the old 4 MB cap (fs_write_file clamps without
  * an error, dpkg then failed the ar magic check on the truncated copy). */
@@ -123,7 +123,11 @@ struct fs_entry {
      * name differs in case/truncation from what format_short_name wrote. */
     uint8_t disk_name[11];
     struct fs_entry* parent;
-    struct fs_entry* children[MAX_DIR_ENTRIES];
+    /* Child list, lazily allocated for DIRECTORIES ONLY (files keep it
+     * NULL - with a flat MAX_DIR_ENTRIES array every file entry would
+     * burn 16KB of BSS/heap for pointers it never uses). Capacity is
+     * MAX_DIR_ENTRIES pointers whenever non-NULL. */
+    struct fs_entry** children;
 };
 
 void fs_init();

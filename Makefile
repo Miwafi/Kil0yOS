@@ -27,7 +27,8 @@ CORE_SRCS = $(SRCDIR)/kernel/core/main.c \
             $(SRCDIR)/kernel/core/syscall.c \
             $(SRCDIR)/kernel/core/syscall_lnx.c \
             $(SRCDIR)/kernel/core/tty.c \
-            $(SRCDIR)/kernel/core/lnxvfs.c
+            $(SRCDIR)/kernel/core/lnxvfs.c \
+            $(SRCDIR)/kernel/core/file.c
 
 # --- Memory Management ---
 MM_SRCS = $(SRCDIR)/kernel/mm/memory.c
@@ -75,7 +76,8 @@ SHELL_SRCS = $(SRCDIR)/kernel/shell/shell.c \
              $(SRCDIR)/kernel/shell/terminal.c
 
 # --- Scheduler ---
-SCHED_SRCS = $(SRCDIR)/kernel/sched/scheduler.c
+SCHED_SRCS = $(SRCDIR)/kernel/sched/scheduler.c \
+             $(SRCDIR)/kernel/sched/wait.c
 
 # --- Timer ---
 TIMER_SRCS = $(SRCDIR)/kernel/timer/pit.c

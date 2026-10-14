@@ -5,6 +5,7 @@
 #include "drivers/device.h"
 #include "drivers/video/vga.h"
 #include "sched/scheduler.h"
+#include "sched/wait.h"
 
 #define BUFFER_SIZE 256
 #define KEYBOARD_STATUS_PORT 0x64
@@ -50,6 +51,8 @@ static void buf_push(char c) {
         buffer_count++;
     }
     irq_restore(irqon);
+    /* Key arrival: wake poll/tty waiters (P1.1) */
+    wait_wake(&g_tty_wq, 1);
 }
 
 static void process_scancode(uint8_t scancode) {

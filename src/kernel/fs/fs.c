@@ -298,10 +298,24 @@ done_counting:
     return 0;
 }
 
+/* P1.2: children is a lazily allocated directory-only array. Files keep
+ * it NULL; every directory gets a full MAX_DIR_ENTRIES pointer table
+ * (16KB) so all existing e->children[i] code keeps working unchanged. */
+static int fs_children_init(fs_entry_t* entry) {
+    if (entry->type != FS_TYPE_DIRECTORY) {
+        entry->children = NULL;
+        return 0;
+    }
+    entry->children = (fs_entry_t**)kmalloc(sizeof(fs_entry_t*) * MAX_DIR_ENTRIES);
+    if (entry->children == NULL) return -1;
+    for (int i = 0; i < MAX_DIR_ENTRIES; i++) entry->children[i] = NULL;
+    return 0;
+}
+
 static fs_entry_t* fs_create_entry_from_dir(fat32_dir_entry_t* dir_entry, fs_entry_t* parent) {
     fs_entry_t* entry = (fs_entry_t*)kmalloc(sizeof(fs_entry_t));
     if (entry == NULL) return NULL;
-    
+
     parse_short_name(dir_entry->name, entry->name);
     entry->type = (dir_entry->attributes & ATTR_DIRECTORY) ? FS_TYPE_DIRECTORY : FS_TYPE_FILE;
     entry->size = dir_entry->file_size;
@@ -313,11 +327,12 @@ static fs_entry_t* fs_create_entry_from_dir(fat32_dir_entry_t* dir_entry, fs_ent
     entry->mem_data = NULL;
     entry->mnt = NULL;
     memcpy(entry->disk_name, dir_entry->name, sizeof(entry->disk_name));
-    
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        entry->children[i] = NULL;
+
+    if (fs_children_init(entry) != 0) {
+        kfree(entry);
+        return NULL;
     }
-    
+
     return entry;
 }
 
@@ -695,11 +710,13 @@ int fs_load() {
     root->mem_data = NULL;
     root->mnt = NULL;
     memset(root->disk_name, 0, sizeof(root->disk_name));
-    
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        root->children[i] = NULL;
+
+    if (fs_children_init(root) != 0) {
+        kfree(root);
+        fs_last_error = FS_ERR_FULL;
+        return NULL;
     }
-    
+
     fs_load_directory(root);
     current = root;
     
@@ -988,8 +1005,10 @@ fs_entry_t* fs_create_file(const char* name) {
     entry->parent = parent_dir;
     entry->mnt = NULL;
 
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        entry->children[i] = NULL;
+    if (fs_children_init(entry) != 0) {
+        kfree(entry);
+        fs_last_error = FS_ERR_FULL;
+        return NULL;
     }
 
     /* Non-FAT parent (ext2 dir or memfs dir). A writable ext2 mount gets a
@@ -1104,8 +1123,10 @@ fs_entry_t* fs_create_dir(const char* name) {
         entry->parent = parent_dir;
         entry->mnt = NULL;
         memset(entry->disk_name, 0, sizeof(entry->disk_name));
-        for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-            entry->children[i] = NULL;
+        if (fs_children_init(entry) != 0) {
+            kfree(entry);
+            fs_last_error = FS_ERR_FULL;
+            return NULL;
         }
         if (parent_dir->backend == FS_BACKEND_EXT2 &&
             parent_dir->mnt != NULL && ext2_mount_is_writable(parent_dir->mnt)) {
@@ -1210,8 +1231,10 @@ fs_entry_t* fs_create_dir(const char* name) {
     entry->mnt = NULL;
     memcpy(entry->disk_name, dir_entry.name, sizeof(entry->disk_name));
 
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        entry->children[i] = NULL;
+    if (fs_children_init(entry) != 0) {
+        kfree(entry);
+        fs_last_error = FS_ERR_FULL;
+        return NULL;
     }
 
     if (fs_write_directory_entry(parent_dir->first_cluster, &dir_entry) != 0) {
@@ -1449,13 +1472,15 @@ int fs_read_file(fs_entry_t* file, uint8_t* buffer, size_t size) {
 void fs_delete_entry_recursive(fs_entry_t* entry) {
     if (entry == NULL) return;
 
-    if (entry->type == FS_TYPE_DIRECTORY) {
+    if (entry->type == FS_TYPE_DIRECTORY && entry->children != NULL) {
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
             if (entry->children[i] != NULL) {
                 fs_delete_entry_recursive(entry->children[i]);
                 entry->children[i] = NULL;
             }
         }
+        kfree(entry->children);     /* P1.2: lazily allocated child table */
+        entry->children = NULL;
     }
 
     /* Only FAT-backed nodes own cluster chains; MEM files own a buffer. */

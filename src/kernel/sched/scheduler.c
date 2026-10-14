@@ -49,6 +49,14 @@ uint64_t scheduler_main_return_rsp(void) {
     return tasks[0].rsp;
 }
 
+/* Announce that the CPU is about to resume the kernel main task without
+ * passing through scheduler_tick (e.g. process_kill_current's direct
+ * return to the stub). current_task_idx must follow the CPU, or the next
+ * kern-save will file task0's frame under the old task again. */
+void scheduler_take_main_cpu(void) {
+    current_task_idx = 0;
+}
+
 void scheduler_init() {
     task_count = 1;
     current_task_idx = 0;
@@ -151,6 +159,11 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
     if (main_switch_requested) {
         main_switch_requested = 0;
         user_frame_valid = 0;
+        /* The CPU is about to resume the kernel main task, but the tick
+         * may have interrupted ANY kernel task (or a process context on
+         * behalf of one). current_task_idx must follow the CPU or the
+         * next kern-save will file task0's frame under the old task. */
+        current_task_idx = 0;
         return tasks[0].rsp;
     }
 
@@ -167,6 +180,7 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
              * instead of resuming the same user process. */
             process_t* next = process_pick_ready(uproc->pid);
             if (next != NULL) {
+                fpu_restore(next);
                 uproc->parked_rsp = user_frame;   /* park, do not lose */
                 uproc->state = PROCESS_STATE_READY;
                 process_become_current(next);
@@ -175,17 +189,37 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
                 if (next->cr3) vmm_switch_cr3(next->cr3);
                 return next->parked_rsp;
             }
+            fpu_restore(uproc);
             return user_frame;              /* resume user process */
         } else {
             /* current frame belongs to the user process (or its syscall) */
+            fpu_save(uproc);
             user_frame = current_rsp;
             user_frame_valid = 1;
+            /* Alternation hands the CPU back to the kernel main task:
+             * current_task_idx must follow (it may still name the kernel
+             * task that launched the now-suspended user process). */
+            current_task_idx = 0;
             return tasks[0].rsp;            /* run kernel main */
         }
     }
     user_frame_valid = 0;  /* no user process: stale frame, drop it */
 
     tasks[current_task_idx].rsp = current_rsp;
+
+    /* A parked user process became READY while the kernel tasks ran
+     * (IRQ/other-syscall wakeup): hand it the CPU immediately. */
+    {
+        process_t* wk = process_pick_ready(0);
+        if (wk != NULL) {
+            fpu_restore(wk);
+            process_become_current(wk);
+            tss_set_kernel_stack(wk->kernel_stack);
+            syscall_kernel_rsp = wk->kernel_stack;
+            if (wk->cr3) vmm_switch_cr3(wk->cr3);
+            return wk->parked_rsp;
+        }
+    }
 
     if (task_count <= 1) {
         cpu_idle_ticks++;

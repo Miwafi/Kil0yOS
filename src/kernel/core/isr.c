@@ -6,6 +6,7 @@
 #include "core/interrupts.h"
 #include "core/nmi_wdt.h"
 #include "sched/scheduler.h"
+#include "sched/wait.h"
 #include "timer/pit.h"
 #include "core/syscall.h"
 #include "core/tss.h"
@@ -318,6 +319,7 @@ uint64_t irq_handler(interrupt_frame_t* frame) {
         pit_ticks++;
         pic_send_eoi(0);
         usb_tick();   /* UHCI report poll + root-hub hotplug (IF=0, gated) */
+        wait_timers_poll();   /* expire blocking-syscall wake timers */
         return scheduler_tick((uint64_t)frame);
     }
 

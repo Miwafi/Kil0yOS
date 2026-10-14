@@ -3,6 +3,7 @@
 #include "net/netif.h"
 #include "core/interrupts.h"
 #include "timer/pit.h"
+#include "sched/wait.h"
 #include "lib/string.h"
 
 static udp_socket_t sockets[UDP_MAX_SOCKETS];
@@ -49,6 +50,8 @@ void udp_receive(netif_t* iface, uint32_t src_ip, const uint8_t* data, uint16_t 
             memcpy(sockets[i].rx_buf, payload, copy_len);
             sockets[i].rx_count = copy_len;
             irq_restore(enabled);
+            /* Data arrival: wake blocking recv/poll waiters (P1.1) */
+            wait_wake(&g_net_wq, 1);
             return;
         }
     }

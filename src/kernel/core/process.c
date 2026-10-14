@@ -31,6 +31,13 @@ process_t* process_find_waiter(int child_pid);
 process_t* process_find_child(process_t* parent, int pid);
 extern void restore_frame(uint64_t rsp);   /* isr.asm */
 
+/* P1.1 FPU/SSE per-process image (definitions below process_become_current) */
+static uint64_t fpu_template[66] __attribute__((aligned(16)));
+static int fpu_template_ready = 0;
+static void fpu_init_template(void);
+void fpu_save(process_t* p);
+void fpu_restore(process_t* p);
+
 /* --- Saved-frame layouts -------------------------------------------------
  * syscall_lnx_entry frame (indexes of uint64_t from RSP):
  *   0..14  r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax
@@ -132,6 +139,7 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
 
     proc->entry_point = entry;
     proc->state = PROCESS_STATE_READY;
+    /* fds already initialized by process_alloc_slot (fd_table_init) */
 
     klog("[create] code mapped\n");
     return proc->pid;
@@ -188,7 +196,7 @@ uint64_t process_kill_current(int status) {
     if (proc == NULL) return 0;
 
     /* Flush and free the process's open files */
-    lnxvfs_close_all(proc);
+    fd_table_exit(proc);
 
     /* Same IRQ0-exclusion rule as process_exit(): no tick may observe the
      * half-updated state. isr_handler already runs with IF=0 (interrupt
@@ -198,6 +206,10 @@ uint64_t process_kill_current(int status) {
     current_process = -1;
 
     scheduler_request_main_switch();
+    /* The stub will iretq straight into the kernel main task's frame with
+     * no scheduler_tick pass in between: record the CPU handover or the
+     * next kern-save files task0's frame under the dying task. */
+    scheduler_take_main_cpu();
     return scheduler_main_return_rsp();
 }
 
@@ -213,7 +225,7 @@ void process_exit(int status) {
     process_t* proc = &processes[current_process];
 
     /* Flush and free the process's open files before anything else */
-    lnxvfs_close_all(proc);
+    fd_table_exit(proc);
 
     /* A parent blocked in wait4 resumes directly from here with the
      * child's status delivered into its parked frame. */
@@ -238,8 +250,8 @@ void process_exit(int status) {
         tss_set_kernel_stack(par->kernel_stack);
         syscall_kernel_rsp = par->kernel_stack;
         if (par->cr3) vmm_switch_cr3(par->cr3);
+        fpu_restore(par);
         scheduler_invalidate_user_frame();
-
         restore_frame(par->parked_rsp);      /* never returns */
     }
 
@@ -266,6 +278,12 @@ void process_exit(int status) {
 process_t* process_get_current(void) {
     if (current_process < 0) return NULL;
     return &processes[current_process];
+}
+
+/* Detach the CPU from the current process (wait-queue park fallback
+ * path before the software IRQ0 hands control to the kernel task). */
+void process_set_current_none(void) {
+    current_process = -1;
 }
 
 process_t* process_get_by_pid(uint32_t pid) {
@@ -309,6 +327,11 @@ void process_run(uint32_t pid) {
     /* Fresh TLS state: the previous process's FS base must not leak */
     wrmsr(MSR_FS_BASE, 0);
     proc->fs_base = 0;
+
+    /* Fresh FPU/SSE state for the new program */
+    if (!fpu_template_ready) fpu_init_template();
+    memcpy(proc->fpu, fpu_template, sizeof(fpu_template));
+    fpu_restore(proc);
 
     /* The shell context is about to be abandoned by iretq below. Park a
      * fresh kernel-main frame (shell_run on the scheduler stack) so that
@@ -485,6 +508,8 @@ static process_t* process_alloc_slot(const char* name) {
         return NULL;
     }
     proc->parent_pid = (current_process >= 0) ? processes[current_process].pid : 0;
+    /* Fresh process: console ttys at fd 0/1/2 (P1.2 unified fd layer) */
+    fd_table_init(proc);
     return proc;
 }
 
@@ -1055,7 +1080,13 @@ int process_fork(uint64_t frame_rsp) {
         memset(c, 0, sizeof(process_t));
         return -1;
     }
-    lnxvfs_inherit_fds(p, c);
+    fd_table_fork(p, c);                    /* shared, refcounted fds */
+
+    /* Child starts with a snapshot of the parent's live FPU/SSE state */
+    if (!fpu_template_ready) fpu_init_template();
+    memcpy(c->fpu, fpu_template, sizeof(fpu_template));
+    fpu_save(p);
+    memcpy(c->fpu, p->fpu, sizeof(c->fpu));
 
     uint64_t* e = (uint64_t*)frame_rsp;               /* entry layout */
     uint64_t frsp = ((c->kernel_stack - FRAME_BYTES) & ~0xFULL);
@@ -1089,10 +1120,10 @@ void process_wait_run(process_t* child, uint64_t status_ptr, uint64_t frame_rsp)
     __asm__ volatile("cli");
 
     /* Convert the caller's live entry-layout frame into a resumable
-     * IRQ-layout frame parked below it on the caller's kernel stack. */
+     * IRQ-layout frame parked in the PCB (kernel BSS - the region below
+     * the entry frame is the still-live C stack of this syscall). */
     uint64_t* e = (uint64_t*)frame_rsp;
-    uint64_t frsp = ((frame_rsp - FRAME_BYTES) & ~0xFULL);
-    uint64_t* f = (uint64_t*)frsp;
+    uint64_t* f = p->parked_frame;
     for (int i = 0; i < 15; i++) f[i] = e[i];
     f[IRQ_RAX] = 0;                    /* patched with child pid at exit */
     f[IRQ_INTNUM] = 32;
@@ -1106,9 +1137,11 @@ void process_wait_run(process_t* child, uint64_t status_ptr, uint64_t frame_rsp)
     p->state = PROCESS_STATE_BLOCKED;
     p->wait_pid = (int)child->pid;
     p->wait_status_ptr = status_ptr;
-    p->parked_rsp = frsp;
+    p->parked_rsp = (uint64_t)f;
 
-    /* Hand the CPU to the child */
+    /* Hand the CPU to the child (swap FPU/SSE state along the way) */
+    fpu_save(p);
+    fpu_restore(child);
     current_process = child - processes;
     child->state = PROCESS_STATE_RUNNING;
     tss_set_kernel_stack(child->kernel_stack);
@@ -1137,6 +1170,85 @@ process_t* process_pick_ready(uint32_t exclude_pid) {
 void process_become_current(process_t* proc) {
     current_process = proc - processes;
     proc->state = PROCESS_STATE_RUNNING;
+}
+
+/* --- P1.1: frame parking + FPU switching for blocking syscalls ----------
+ *
+ * A blocking syscall parks the caller the same way wait4 does: the live
+ * entry-layout frame is converted into a resumable IRQ-layout frame on
+ * the caller's kernel stack. Two resume flavors exist:
+ *   - restart: the parked RIP is rewound by 2 bytes so the iretq lands
+ *     back ON the user `syscall` instruction; every argument register in
+ *     the frame is untouched, so the kernel re-enters the same syscall
+ *     and re-evaluates its condition (data ready, non-empty pipe, ...).
+ *   - complete: the parked RAX slot carries the final return value.
+ * The kernel is built -mno-sse, so FPU/SSE state belongs to user mode
+ * only and is swapped at the switch sites below. */
+
+static void fpu_init_template(void) {
+    __asm__ volatile("fninit");
+    __asm__ volatile("fxsave %0" : "=m"(fpu_template));
+    fpu_template_ready = 1;
+}
+
+void fpu_save(process_t* p) {
+    if (p) __asm__ volatile("fxsave %0" : "=m"(p->fpu));
+}
+
+void fpu_restore(process_t* p) {
+    if (p) __asm__ volatile("fxrstor %0" : : "m"(p->fpu));
+}
+
+void process_frame_set_ret(process_t* p, uint64_t ret) {
+    if (p && p->parked_rsp) {
+        ((uint64_t*)p->parked_rsp)[IRQ_RAX] = ret;
+    }
+}
+
+/* Read user bytes in the blocking process's own syscall context: its CR3
+ * is active, so the code bytes can be dereferenced directly. */
+static void read_user_bytes(uint64_t uaddr, uint8_t* out, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        out[i] = *(volatile uint8_t*)(uaddr + i);
+    }
+}
+
+uint64_t process_park_entry_frame(process_t* p, uint64_t frame_rsp,
+                                  int restart, uint64_t fallback_ret) {
+    uint64_t* e = (uint64_t*)frame_rsp;
+    /* Park in the PCB, not on the kernel stack: below the entry frame lies
+     * the live C chain of this very syscall (dispatch -> sc_* -> wait_*),
+     * and code still runs on that stack after parking (queue push, FPU
+     * save, park_switch). The BSS copy is also reachable from any CR3,
+     * which the tick-path resume relies on. */
+    uint64_t* f = p->parked_frame;
+    for (int i = 0; i < 15; i++) f[i] = e[i];
+    f[IRQ_INTNUM] = 32;
+    f[IRQ_ERR] = 0;
+    f[IRQ_RIP] = e[ENTY_RIP];
+    f[IRQ_CS] = e[ENTY_CS];
+    f[IRQ_RFLAGS] = e[ENTY_RFLAGS];
+    f[IRQ_RSP] = e[ENTY_RSP];
+    f[IRQ_SS] = e[ENTY_SS];
+
+    if (restart) {
+        /* Verify the instruction before the saved user RIP is the 2-byte
+         * `syscall` opcode (0F 05); rewind so iretq re-executes it. */
+        uint8_t op[2] = {0, 0};
+        if (e[ENTY_RIP] >= 2) {
+            read_user_bytes(e[ENTY_RIP] - 2, op, 2);
+        }
+        if (op[0] == 0x0F && op[1] == 0x05) {
+            f[IRQ_RIP] = e[ENTY_RIP] - 2;
+        } else {
+            f[IRQ_RAX] = fallback_ret;      /* cannot restart: return as-is */
+        }
+    } else {
+        f[IRQ_RAX] = fallback_ret;
+    }
+
+    p->parked_rsp = (uint64_t)f;
+    return (uint64_t)f;
 }
 
 /* execve (Phase 1.5): replace the current process image with a new ELF.
