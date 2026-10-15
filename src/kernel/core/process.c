@@ -884,6 +884,8 @@ extern const uint8_t user_pthread_end[] __attribute__((weak));
 /* musl REAL multithreading probe (Phase 1.3 clone/futex/TLS) */
 extern const uint8_t user_threads_start[] __attribute__((weak));
 extern const uint8_t user_threads_end[] __attribute__((weak));
+extern const uint8_t user_unix_start[] __attribute__((weak));
+extern const uint8_t user_unix_end[] __attribute__((weak));
 
 /* Freestanding Linux-ABI syscall probe (always embedded) */
 extern const uint8_t user_mini_start[];
@@ -1102,6 +1104,8 @@ void user_programs_install(void) {
                       user_pthread_end, "glibc pthread probe");
     user_install_blob("/bin", "hello-threads", user_threads_start,
                       user_threads_end, "musl multithreading probe");
+    user_install_blob("/bin", "hello-unix", user_unix_start,
+                      user_unix_end, "musl AF_UNIX probe");
 
     /* Desktop art assets: user/art/* -> /home/user/art */
     user_install_blob("/home/user/art", "103.mp3", user_art_103_mp3_start,
@@ -1250,6 +1254,11 @@ static int fork_common(process_t* p, process_t* c, uint64_t frame_rsp,
     fpu_save(p);
     memcpy(c->fpu, p->fpu, sizeof(c->fpu));
 
+    /* TLS pointer is inherited across fork/clone (Linux semantics);
+     * CLONE_SETTLS overrides it afterwards for new threads. Without this
+     * a dynamic child faults on its first TLS access. */
+    c->fs_base = p->fs_base;
+
     uint64_t* e = (uint64_t*)frame_rsp;               /* entry layout */
     uint64_t frsp = ((c->kernel_stack - FRAME_BYTES) & ~0xFULL);
     uint64_t* f = (uint64_t*)frsp;
@@ -1352,10 +1361,12 @@ int process_clone(uint64_t frame_rsp, uint64_t flags, uint64_t child_stack,
     }
     c->current_dir_cluster = p->current_dir_cluster;   /* (CLONE_FS: copy) */
 
-    if (flags & LNX_CLONE_SETTLS) c->fs_base = tls;
     if (flags & LNX_CLONE_CHILD_CLEARTID) c->clear_child_tid = child_tidptr;
 
     fork_common(p, c, frame_rsp, (flags & LNX_CLONE_VM) ? child_stack : 0);
+
+    /* SETTLS overrides the inherited fs_base (fork_common) */
+    if (flags & LNX_CLONE_SETTLS) c->fs_base = tls;
 
     if (flags & LNX_CLONE_PARENT_SETTID && parent_tidptr) {
         process_write_user_int(p, parent_tidptr, (int)c->tid);

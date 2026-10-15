@@ -283,9 +283,11 @@ int uvm_fork(process_t* parent, process_t* child) {
         if (!r->used) continue;
 
         for (uint64_t v = r->start; v < r->end; v += PAGE_SIZE) {
-            uint64_t pphys = vmm_get_phys(v);
-            if (pphys == 0) continue;
-            pphys &= ~0xFFF;
+            uint64_t pte = vmm_get_pte(v);
+            if (!(pte & VMM_PRESENT)) continue;
+            /* PTE physical bits only - the raw value still carries NX in
+             * bit 63, which would make the address non-canonical. */
+            uint64_t pphys = pte & 0x000FFFFFFFFFF000ULL;
 
             uint64_t cphys = pmm_alloc_page();
             if (cphys == 0) {
@@ -295,9 +297,13 @@ int uvm_fork(process_t* parent, process_t* child) {
             }
             memcpy((void*)cphys, (const void*)pphys, PAGE_SIZE);
 
-            /* Map into the child's address space */
+            /* Map into the child's address space. Inherit the parent's
+             * LIVE PTE flags, not r->prot: overlapping regions (merged
+             * PT_LOADs) may have widened the PTE after the region was
+             * committed, and a later stale region would re-map the page
+             * read-only. */
             vmm_set_root_ptr(cmm->cr3);
-            vmm_map_page(v, cphys, prot_to_pte(r->prot));
+            vmm_map_page(v, cphys, pte & 0xFFF);
             vmm_set_root_ptr(pmm->cr3);
         }
 

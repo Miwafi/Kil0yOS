@@ -17,7 +17,8 @@ enum file_kind {
     FILE_T_VFS,                 /* memory-fs file/dir payload (lnxvfs) */
     FILE_T_SOCK_TCP,
     FILE_T_SOCK_UDP,
-    /* P1.4: FILE_T_SOCK_UNIX; P1.7: FILE_T_PIPE, FILE_T_EVENTFD;
+    FILE_T_SOCK_UNIX,           /* P1.4 */
+    /* P1.7: FILE_T_PIPE, FILE_T_EVENTFD;
      * P1.9: FILE_T_DEVFB, FILE_T_EVDEV */
 };
 

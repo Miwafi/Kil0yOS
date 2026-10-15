@@ -94,6 +94,7 @@ NET_SRCS = $(SRCDIR)/kernel/net/netif.c \
            $(SRCDIR)/kernel/net/http.c \
            $(SRCDIR)/kernel/net/dhcp.c \
            $(SRCDIR)/kernel/net/tftp.c \
+           $(SRCDIR)/kernel/net/unix_sock.c \
            $(SRCDIR)/kernel/net/realtek/rtl8139.c \
            $(SRCDIR)/kernel/net/realtek/rtl8111.c \
            $(SRCDIR)/kernel/net/intel/e1000.c
@@ -231,6 +232,13 @@ $(BUILDDIR)/user/hello-threads: user/elf/hello_threads.c
 	@mkdir -p $(dir $@)
 	$(MUSL_GCC) -O2 $< -o $@ -lpthread
 
+# --- hello-unix: musl AF_UNIX probe (Phase 1.4 clone/fd-sharing) --------
+UNIX_BLOB := $(if $(MUSL_GCC),$(BUILDDIR)/user_blob_unix.o,)
+
+$(BUILDDIR)/user/hello-unix: user/elf/hello_unix.c
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) -O2 $< -o $@
+
 # --- mini: freestanding Linux-ABI syscall probe (no libc needed) ---
 .SECONDARY: $(BUILDDIR)/user/mini
 MINI_BLOB_OBJ := $(BUILDDIR)/user_blob_mini.o
@@ -280,6 +288,7 @@ $(eval $(call BLOB_RULE,ldlinux,ldlinux,$(GLIBC_LD_SRC),1))
 $(eval $(call BLOB_RULE,glibc,glibc,$(GLIBC_LIBC_SRC),1))
 $(eval $(call BLOB_RULE,pthread,pthread,$(BUILDDIR)/user/hello-pthread,1))
 $(eval $(call BLOB_RULE,threads,threads,$(BUILDDIR)/user/hello-threads,1))
+$(eval $(call BLOB_RULE,unix,unix,$(BUILDDIR)/user/hello-unix,1))
 $(eval $(call BLOB_RULE,probe-ld,probe_ld,$(BUILDDIR)/user/probe-ld,1))
 $(eval $(call BLOB_RULE,mini,mini,$(BUILDDIR)/user/mini,1))
 $(eval $(call BLOB_RULE,nettest,nettest,$(BUILDDIR)/user/nettest,1))
@@ -382,7 +391,7 @@ $(eval $(call BLOB_RULE,stage1,stage1,$(BUILDDIR)/kernel-stage1.bin,1))
 # live image must not contain itself, hence the split. The GRUB blobs are
 # part of STAGE1_OBJS so an installed system can re-run kilinstall to
 # update itself.
-STAGE1_OBJS = $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(THREADS_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS) $(GRUB_BOOT_BLOB) $(GRUB_CORE_BLOB)
+STAGE1_OBJS = $(KERNEL_OBJS) $(KERNEL_ASM_OBJS) $(BUILDDIR)/kernel/core/ap_trampoline.o $(USER_BLOB_OBJS) $(MINI_BLOB_OBJ) $(MMT_BLOB_OBJ) $(NETTEST_BLOB_OBJ) $(LNX_BLOB_OBJS) $(DYN_PROG_BLOB) $(LDSO_BLOB) $(GLIBC_PROG_BLOB) $(GLIBC_LD_BLOB) $(GLIBC_LIBC_BLOB) $(PROBE_BLOB_OBJ) $(PTHREAD_BLOB) $(THREADS_BLOB) $(UNIX_BLOB) $(BUSYBOX_BLOB) $(ART_BLOB_OBJS) $(GRUB_BOOT_BLOB) $(GRUB_CORE_BLOB)
 STAGE1_DEPS = $(BOOT_OBJ) $(STAGE1_OBJS)
 
 $(BUILDDIR)/kernel-stage1.bin: $(STAGE1_DEPS)

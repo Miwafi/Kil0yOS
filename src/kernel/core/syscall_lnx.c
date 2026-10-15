@@ -17,6 +17,7 @@
 #include "net/netif.h"
 #include "net/tcp.h"
 #include "net/udp.h"
+#include "net/unix_sock.h"
 
 /* --- Linux errno values used here --- */
 #define L_EPERM   1
@@ -34,17 +35,28 @@
 #define L_EMSGSIZE 90
 #define L_ECONNREFUSED 111
 #define L_EADDRINUSE 98
+#define L_EPIPE     32
+#define L_EISCONN  106
+#define L_ENOTCONN 107
+#define L_EOPNOTSUPP 95
+#define L_ECONNRESET 104
 
 /* socket fd plumbing now rides the unified per-process fd table (P1.2):
  * sockets are struct file entries (FILE_T_SOCK_TCP/UDP), no high range */
 #define MSG_KBUF_SZ    4096   /* kernel staging buffer for msg coalescing */
 
 /* Socket types shared by the syscall layer (needed by sc_read/sc_poll
- * which run before the Phase 3.3 section below). */
+ * which run before the Phase 3.3 socket section below). */
 #define LNX_AF_INET     2
+#define LNX_AF_UNIX     1
 #define LNX_SOCK_STREAM 1
 #define LNX_SOCK_DGRAM  2
+#define LNX_SOCK_SEQPACKET 5
 #define LNX_MSG_PEEK    2
+#define LNX_MSG_DONTWAIT 0x40
+#define LNX_SOL_SOCKET  1
+#define LNX_SO_PEERCRED 17
+#define LNX_SCM_RIGHTS  1
 
 struct lnx_sockaddr_in {
     uint16_t family;
@@ -53,7 +65,7 @@ struct lnx_sockaddr_in {
     uint8_t  zero[8];
 };
 
-enum sock_kind { SOCK_NONE = 0, SOCK_TCP, SOCK_UDP };
+enum sock_kind { SOCK_NONE = 0, SOCK_TCP, SOCK_UDP, SOCK_UNIX };
 
 static void* sock_fd_get(uint64_t fd, enum sock_kind* kind);
 
@@ -138,6 +150,9 @@ static void* sock_fd_get(uint64_t fd, enum sock_kind* kind);
 #define LNX_sendmsg        46
 #define LNX_recvmsg        47
 #define LNX_bind           49
+#define LNX_listen         50
+#define LNX_socketpair     53
+#define LNX_accept4       288
 
 /* Entry-frame pointer saved by syscall_lnx_entry (isr.asm): points at
  * the first saved register (r15) of the interrupted user context. fork/
@@ -231,6 +246,16 @@ static uint64_t sc_read(uint64_t fd, uint64_t buf, uint64_t count,
         }
     }
 
+    /* AF_UNIX: X11/D-Bus clients read with plain read(2) as well. */
+    if (f->kind == FILE_T_SOCK_UNIX) {
+        unix_sock_t* us = (unix_sock_t*)f->priv;
+        for (;;) {
+            int r = unix_recv(us, (void*)buf, (int)(count > 0x7FFFFFFF ? 0x7FFFFFFF : count));
+            if (r >= 0) return (uint64_t)r;
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
+    }
+
     if (f->kind == FILE_T_VFS)
         return (uint64_t)lnxvfs_read((int)fd, (char*)buf, (size_t)count);
     return (uint64_t)f->ops->read(f, (char*)buf, (size_t)count);
@@ -265,6 +290,17 @@ static uint64_t sc_write(uint64_t fd, uint64_t buf, uint64_t count,
         int r = udp_sendto(us, us->remote_ip, us->remote_port,
                            (const uint8_t*)buf, len);
         return r < 0 ? (uint64_t)-L_EIO : (uint64_t)len;
+    }
+
+    /* AF_UNIX stream write */
+    if (f->kind == FILE_T_SOCK_UNIX) {
+        unix_sock_t* us = (unix_sock_t*)f->priv;
+        for (;;) {
+            int r = unix_send(us, (const void*)buf, (int)(count > 0x7FFFFFFF ? 0x7FFFFFFF : count));
+            if (r >= 0) return (uint64_t)r;
+            if (r != -L_EAGAIN) return (uint64_t)r;     /* EPIPE / ENOTCONN */
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
     }
 
     if (f->kind == FILE_T_VFS)
@@ -314,6 +350,28 @@ static uint64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t iovcnt,
         uint16_t len = (uint16_t)(total > 0xFFFF ? 0xFFFF : total);
         int r = udp_sendto(us, us->remote_ip, us->remote_port, kbuf, len);
         return r < 0 ? (uint64_t)-L_EIO : (uint64_t)len;
+    }
+    /* AF_UNIX writev: coalesce and push (X11 requests are small writevs) */
+    if (uf->kind == FILE_T_SOCK_UNIX) {
+        unix_sock_t* us = (unix_sock_t*)uf->priv;
+        const struct lnx_iovec* v0 = (const struct lnx_iovec*)iov;
+        uint8_t kbuf[MSG_KBUF_SZ];
+        size_t total = 0;
+        for (uint64_t i = 0; i < iovcnt; i++) {
+            if (v0[i].len == 0) continue;
+            size_t n = v0[i].len;
+            if (n > sizeof(kbuf) - total) n = sizeof(kbuf) - total;
+            if (!process_check_user_range(v0[i].base, v0[i].len)) return -L_EINVAL;
+            memcpy(kbuf + total, (const void*)v0[i].base, n);
+            total += n;
+        }
+        if (total == 0) return 0;
+        for (;;) {
+            int r = unix_send(us, kbuf, (int)total);
+            if (r >= 0) return (uint64_t)total;
+            if (r != -L_EAGAIN) return (uint64_t)r;
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
     }
     /* Single redirected file fd: delegate (must not split the vector) */
     if (uf->kind == FILE_T_VFS) {
@@ -382,6 +440,22 @@ static uint64_t sc_readv(uint64_t fd, uint64_t uiov, uint64_t iovcnt,
             if (r < 0) return (uint64_t)-L_EAGAIN;
             memcpy((void*)iv[i].base, kbuf, (size_t)r);
             return (uint64_t)r;
+        }
+        return 0;
+    }
+
+    /* AF_UNIX readv: fill the first non-empty vector (stream semantics) */
+    if (uf->kind == FILE_T_SOCK_UNIX) {
+        unix_sock_t* us = (unix_sock_t*)uf->priv;
+        for (uint64_t i = 0; i < iovcnt; i++) {
+            if (iv[i].len == 0) continue;
+            if (!process_check_user_range(iv[i].base, (size_t)iv[i].len))
+                return -L_EINVAL;
+            for (;;) {
+                int r = unix_recv(us, (void*)iv[i].base, (int)iv[i].len);
+                if (r >= 0) return (uint64_t)r;
+                wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+            }
         }
         return 0;
     }
@@ -520,6 +594,8 @@ static uint64_t sc_unlink(uint64_t upath, uint64_t u2, uint64_t u3,
     (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
     char path[MAX_PATH_LENGTH];
     if (fetch_user_path(upath, path, sizeof(path)) < 0) return -L_EINVAL;
+    /* pathname AF_UNIX socket nodes live in the kernel bind table (P1.4) */
+    if (unix_unlink_path(path) == 0) return 0;
     return (uint64_t)lnxvfs_unlink(path);
 }
 
@@ -1061,6 +1137,10 @@ static void* sock_fd_get(uint64_t fd, enum sock_kind* kind) {
         if (kind) *kind = SOCK_UDP;
         return f->priv;
     }
+    if (f->kind == FILE_T_SOCK_UNIX) {
+        if (kind) *kind = SOCK_UNIX;
+        return f->priv;
+    }
     return NULL;
 }
 
@@ -1101,11 +1181,153 @@ static const struct file_ops sock_udp_ops = {
     .poll = sock_udp_f_poll,
 };
 
+/* --- P1.4: AF_UNIX ------------------------------------------------------- */
+
+static int sock_unix_f_close(struct file* f) {
+    unix_sock_close((unix_sock_t*)f->priv);
+    return 0;
+}
+
+static int sock_unix_f_poll(struct file* f) {
+    return unix_poll_bits((unix_sock_t*)f->priv);
+}
+
+static const struct file_ops sock_unix_ops = {
+    .close = sock_unix_f_close,
+    .poll = sock_unix_f_poll,
+};
+
+/* Parse a user sockaddr_un. Returns 0 on success with the raw address in
+ * kpath and *abstract set; negative errno otherwise. Abstract addresses
+ * (leading NUL) are the next (addrlen-2) bytes, NULs included. */
+static int unix_fetch_addr(uint64_t uaddr, uint64_t addrlen,
+                           char* kpath, int* abstract) {
+    *abstract = 0;
+    if (addrlen < 3 || addrlen > sizeof(struct lnx_sockaddr_un)) return -L_EINVAL;
+    if (!process_check_user_range(uaddr, addrlen)) return -L_EINVAL;
+    const struct lnx_sockaddr_un* a = (const struct lnx_sockaddr_un*)uaddr;
+    if (a->family != LNX_AF_UNIX) return -L_EINVAL;
+    uint64_t plen = addrlen - 2;
+    if (a->path[0] == '\0') {
+        if (plen == 0 || plen > UNIX_PATH_MAX) return -L_EINVAL;
+        memcpy(kpath, a->path, plen);
+        *abstract = 1;
+        return 0;
+    }
+    /* pathname: NUL-terminated within the provided length */
+    if (plen >= UNIX_PATH_MAX) plen = UNIX_PATH_MAX - 1;
+    uint64_t n = 0;
+    while (n < plen && a->path[n] != '\0') n++;
+    if (n == 0 || n >= plen + 1 || a->path[n] != '\0') return -L_EINVAL;
+    memcpy(kpath, a->path, n);
+    kpath[n] = '\0';
+    return 0;
+}
+
+/* sockaddr_un output helper: fills the user address and updates *ulen. */
+static int unix_put_addr(unix_sock_t* s, uint64_t uaddr, uint64_t ulen_p) {
+    if (uaddr == 0 || ulen_p == 0) return 0;
+    if (!process_check_user_range(uaddr, sizeof(struct lnx_sockaddr_un)) ||
+        !process_check_user_range(ulen_p, 4))
+        return -L_EINVAL;
+    char pth[UNIX_PATH_MAX];
+    int n = unix_getsockname(s, pth);
+    struct lnx_sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.family = LNX_AF_UNIX;
+    int len = 2;
+    if (n != 0) {
+        int alen = n < 0 ? -n : n;
+        memcpy(sa.path, pth, (size_t)alen);
+        len = 2 + alen;                     /* abstract keeps raw bytes */
+    }
+    memcpy((void*)uaddr, &sa, sizeof(sa));
+    *(uint32_t*)ulen_p = (uint32_t)len;
+    return 0;
+}
+
+static uint64_t sc_listen(uint64_t fd, uint64_t backlog, uint64_t u3,
+                          uint64_t u4, uint64_t u5, uint64_t u6) {
+    (void)u3; (void)u4; (void)u5; (void)u6;
+    enum sock_kind kind;
+    void* s = sock_fd_get(fd, &kind);
+    if (s == NULL) return -L_ENOTSOCK;
+    if (kind != SOCK_UNIX) return 0;        /* INET listeners: pretend ok */
+    return (uint64_t)unix_listen((unix_sock_t*)s, (int)backlog);
+}
+
+static uint64_t sc_accept4(uint64_t fd, uint64_t uaddr, uint64_t ulen_p,
+                           uint64_t flags, uint64_t u5, uint64_t u6) {
+    (void)flags;   /* SOCK_CLOEXEC/NONBLOCK: sockets stay blocking */
+    (void)u5; (void)u6;
+    enum sock_kind kind;
+    void* s = sock_fd_get(fd, &kind);
+    if (s == NULL) return -L_ENOTSOCK;
+    if (kind != SOCK_UNIX) return -L_EOPNOTSUPP;
+
+    for (;;) {
+        unix_sock_t* c = unix_accept((unix_sock_t*)s);
+        if (c != NULL) {
+            struct file* f = file_new(FILE_T_SOCK_UNIX, &sock_unix_ops, c);
+            if (f == NULL) { unix_sock_close(c); return -L_ENOMEM; }
+            int nfd = fd_install(f);
+            if (nfd < 0) { file_close(f); return -L_ENOMEM; }
+            if (unix_put_addr(c, uaddr, ulen_p) != 0) return -L_EINVAL;
+            return (uint64_t)nfd;
+        }
+        if (unix_sock_state((unix_sock_t*)s) != US_LISTENING) return -L_EINVAL;
+        wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+    }
+}
+
+static uint64_t sc_socketpair(uint64_t domain, uint64_t type, uint64_t proto,
+                              uint64_t sv, uint64_t u5, uint64_t u6) {
+    (void)u5; (void)u6;
+    if (domain != LNX_AF_UNIX) return -L_EOPNOTSUPP;
+    uint64_t t = type & 0xFF;               /* strip SOCK_CLOEXEC/NONBLOCK */
+    if (t != LNX_SOCK_STREAM && t != LNX_SOCK_DGRAM && t != LNX_SOCK_SEQPACKET)
+        return -L_EINVAL;
+    (void)proto;
+    if (!process_check_user_range(sv, 2 * sizeof(int))) return -L_EINVAL;
+
+    unix_sock_t* a = unix_socket_create((int)t);
+    if (a == NULL) return -L_ENOMEM;
+    unix_sock_t* b = unix_socket_create((int)t);
+    if (b == NULL) { unix_sock_close(a); return -L_ENOMEM; }
+    if (unix_socketpair(a, b) != 0) {
+        unix_sock_close(a); unix_sock_close(b);
+        return -L_EINVAL;
+    }
+    struct file* fa = file_new(FILE_T_SOCK_UNIX, &sock_unix_ops, a);
+    if (fa == NULL) { unix_sock_close(a); unix_sock_close(b); return -L_ENOMEM; }
+    struct file* fb = file_new(FILE_T_SOCK_UNIX, &sock_unix_ops, b);
+    if (fb == NULL) { file_close(fa); unix_sock_close(b); return -L_ENOMEM; }
+    int fda = fd_install(fa);
+    if (fda < 0) { file_close(fa); file_close(fb); return -L_ENOMEM; }
+    int fdb = fd_install(fb);
+    if (fdb < 0) { fd_close(fda); file_close(fb); return -L_ENOMEM; }
+    int* usv = (int*)sv;
+    usv[0] = fda;
+    usv[1] = fdb;
+    return 0;
+}
+
 static uint64_t sc_socket(uint64_t domain, uint64_t type, uint64_t proto,
                           uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u4; (void)u5; (void)u6;
     /* musl passes SOCK_CLOEXEC(0x80000)/SOCK_NONBLOCK(0x800) inside type */
     uint64_t t = type & 0xFF;
+    if (domain == LNX_AF_UNIX) {
+        if (t != LNX_SOCK_STREAM && t != LNX_SOCK_DGRAM && t != LNX_SOCK_SEQPACKET)
+            return -L_EINVAL;
+        unix_sock_t* s = unix_socket_create((int)t);
+        if (s == NULL) return -L_ENOMEM;
+        struct file* f = file_new(FILE_T_SOCK_UNIX, &sock_unix_ops, s);
+        if (f == NULL) { unix_sock_close(s); return -L_ENOMEM; }
+        int fd = fd_install(f);
+        if (fd < 0) { file_close(f); return -L_ENOMEM; }
+        return (uint64_t)fd;
+    }
     if (domain != LNX_AF_INET) return -L_EINVAL;
     if (proto != 0 && !(domain == LNX_AF_INET && t == LNX_SOCK_STREAM && proto == 6) &&
         !(domain == LNX_AF_INET && t == LNX_SOCK_DGRAM && proto == 17)) {
@@ -1138,6 +1360,20 @@ static uint64_t sc_connect(uint64_t fd, uint64_t uaddr, uint64_t addrlen,
     enum sock_kind kind;
     void* s = sock_fd_get(fd, &kind);
     if (s == NULL) return -L_ENOTSOCK;
+    if (addrlen < 2 || !process_check_user_range(uaddr, 2)) return -L_EINVAL;
+    if (*(const uint16_t*)uaddr == LNX_AF_UNIX) {
+        if (kind != SOCK_UNIX) return -L_EINVAL;
+        char kpath[UNIX_PATH_MAX];
+        int abstract = 0;
+        if (unix_fetch_addr(uaddr, addrlen, kpath, &abstract) != 0) return -L_EINVAL;
+        int n = abstract ? -(int)(addrlen - 2) : (int)strlen(kpath);
+        for (;;) {
+            int r = unix_connect((unix_sock_t*)s, kpath, n);
+            if (r == 0) return 0;
+            if (r != -L_EAGAIN) return (uint64_t)r;
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
+    }
     if (addrlen < sizeof(struct lnx_sockaddr_in)) return -L_EINVAL;
     if (!process_check_user_range(uaddr, sizeof(struct lnx_sockaddr_in))) return -L_EINVAL;
     const struct lnx_sockaddr_in* a = (const struct lnx_sockaddr_in*)uaddr;
@@ -1185,6 +1421,15 @@ static uint64_t sc_bind(uint64_t fd, uint64_t uaddr, uint64_t addrlen,
     enum sock_kind kind;
     void* s = sock_fd_get(fd, &kind);
     if (s == NULL) return -L_ENOTSOCK;
+    if (addrlen < 2 || !process_check_user_range(uaddr, 2)) return -L_EINVAL;
+    if (*(const uint16_t*)uaddr == LNX_AF_UNIX) {
+        if (kind != SOCK_UNIX) return -L_EINVAL;
+        char kpath[UNIX_PATH_MAX];
+        int abstract = 0;
+        if (unix_fetch_addr(uaddr, addrlen, kpath, &abstract) != 0) return -L_EINVAL;
+        int n = abstract ? -(int)(addrlen - 2) : (int)strlen(kpath);
+        return (uint64_t)unix_bind((unix_sock_t*)s, kpath, n);
+    }
     if (addrlen < sizeof(struct lnx_sockaddr_in)) return -L_EINVAL;
     if (!process_check_user_range(uaddr, sizeof(struct lnx_sockaddr_in))) return -L_EINVAL;
     const struct lnx_sockaddr_in* a = (const struct lnx_sockaddr_in*)uaddr;
@@ -1209,6 +1454,34 @@ static uint64_t sock_sendto(uint64_t fd, uint64_t buf, uint64_t len,
     if (len == 0) return 0;
     if (len > NET_MTU && kind == SOCK_UDP) return -L_EMSGSIZE;
     if (!process_check_user_range(buf, (size_t)len)) return -L_EINVAL;
+
+    /* AF_UNIX */
+    if (kind == SOCK_UNIX) {
+        unix_sock_t* us = (unix_sock_t*)s;
+        char kpath[UNIX_PATH_MAX];
+        int abstract = 0;
+        int have_dst = 0;
+        if (uaddr != 0) {
+            if (addrlen < 2 || !process_check_user_range(uaddr, 2)) return -L_EINVAL;
+            if (*(const uint16_t*)uaddr != LNX_AF_UNIX) return -L_EINVAL;
+            if (unix_fetch_addr(uaddr, addrlen, kpath, &abstract) != 0) return -L_EINVAL;
+            have_dst = 1;
+        }
+        int n = abstract ? -(int)(addrlen - 2) : (int)strlen(kpath);
+        for (;;) {
+            int r;
+            if (unix_sock_type(us) == 1) {
+                if (have_dst) return -L_EINVAL;
+                r = unix_send(us, (const void*)buf, (int)len);
+            } else {
+                r = unix_sendto_dgram(us, (const void*)buf, (int)len,
+                                      have_dst ? kpath : NULL, have_dst ? n : 0);
+            }
+            if (r >= 0) return (uint64_t)r;
+            if (r != -L_EAGAIN) return (uint64_t)r;
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
+    }
 
     uint32_t dst_ip = 0;
     uint16_t dst_port = 0;
@@ -1250,6 +1523,24 @@ static uint64_t sc_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fl
     if (s == NULL) return -L_EBADF;
     if (len == 0) return 0;
     if (!process_check_user_range(buf, (size_t)len)) return -L_EINVAL;
+
+    /* AF_UNIX: peer address from the socket (stream) or zeroed (dgram) */
+    if (kind == SOCK_UNIX) {
+        unix_sock_t* us = (unix_sock_t*)s;
+        for (;;) {
+            int r = (unix_sock_type(us) == 1)
+                        ? unix_recv(us, (void*)buf, (int)len)
+                        : unix_recvmsg(us, &(struct unix_iovec){ (void*)buf, (size_t)len },
+                                       1, NULL, &(int){0});
+            if (r >= 0) {
+                if (uaddr != 0 && unix_sock_type(us) == 1)
+                    unix_put_addr(us, uaddr, uaddrlen);
+                return (uint64_t)r;
+            }
+            if (r != -L_EAGAIN) return (uint64_t)r;
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
+    }
 
     if (kind == SOCK_TCP) {
         int r = tcp_recv((tcp_socket_t*)s, (uint8_t*)buf,
@@ -1295,12 +1586,73 @@ struct lnx_msghdr {
     int      msg_flags;
 };
 
+/* cmsghdr layout (x86-64): size_t len; int level; int type; payload */
+struct lnx_cmsghdr { uint64_t len; int32_t level; int32_t type; };
+#define LNX_CMSG_HDRSZ 16
+
 static uint64_t sc_sendmsg(uint64_t fd, uint64_t umsg, uint64_t flags,
                            uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)flags; (void)u4; (void)u5; (void)u6;
     enum sock_kind kind;
     void* s = sock_fd_get(fd, &kind);
     if (s == NULL) return -L_ENOTSOCK;
+
+    /* AF_UNIX: iovecs straight from user memory + SCM_RIGHTS cmsg */
+    if (kind == SOCK_UNIX) {
+        if (!process_check_user_range(umsg, sizeof(struct lnx_msghdr))) return -L_EINVAL;
+        const struct lnx_msghdr* mh = (const struct lnx_msghdr*)umsg;
+        if (mh->msg_iovlen == 0 || mh->msg_iovlen > 64) return -L_EMSGSIZE;
+        if (!process_check_user_range((uint64_t)mh->msg_iov,
+                                      mh->msg_iovlen * sizeof(struct lnx_iovec)))
+            return -L_EINVAL;
+        struct unix_iovec kiv[64];
+        for (uint64_t i = 0; i < mh->msg_iovlen; i++) {
+            kiv[i].base = (void*)(uintptr_t)mh->msg_iov[i].base;
+            kiv[i].len  = (size_t)mh->msg_iov[i].len;
+            if (kiv[i].len != 0 &&
+                !process_check_user_range((uint64_t)kiv[i].base, kiv[i].len))
+                return -L_EINVAL;
+        }
+        /* SCM_RIGHTS: gather the referenced files (ref for the transfer) */
+        struct file* fds[UNIX_SCM_MAX];
+        int nfds = 0;
+        if (mh->msg_control != 0 && mh->msg_controllen >= LNX_CMSG_HDRSZ) {
+            if (!process_check_user_range((uint64_t)mh->msg_control, mh->msg_controllen))
+                return -L_EINVAL;
+            const uint8_t* cp = (const uint8_t*)mh->msg_control;
+            const uint8_t* cend = cp + mh->msg_controllen;
+            while (cp + LNX_CMSG_HDRSZ <= cend && nfds < UNIX_SCM_MAX) {
+                const struct lnx_cmsghdr* ch = (const struct lnx_cmsghdr*)cp;
+                if (ch->len < LNX_CMSG_HDRSZ || cp + ch->len > cend) break;
+                if (ch->level == LNX_SOL_SOCKET && ch->type == LNX_SCM_RIGHTS) {
+                    const int* uf = (const int*)(cp + LNX_CMSG_HDRSZ);
+                    int cnt = (int)((ch->len - LNX_CMSG_HDRSZ) / 4);
+                    for (int i = 0; i < cnt && nfds < UNIX_SCM_MAX; i++) {
+                        struct file* sf = fd_get_file(uf[i]);
+                        if (sf == NULL) {
+                            for (int j = 0; j < nfds; j++) file_close(fds[j]);
+                            return -L_EBADF;
+                        }
+                        fds[nfds++] = file_ref(sf);
+                    }
+                }
+                cp += ch->len;
+            }
+        }
+        int r = unix_sendmsg((unix_sock_t*)s, kiv, (int)mh->msg_iovlen, fds, nfds);
+        if (r == -L_EAGAIN) {
+            /* park; WAIT_RESTART re-executes the whole syscall (refs are
+             * dropped first so they are re-taken on the retry) */
+            for (int i = 0; i < nfds; i++) file_close(fds[i]);
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
+        if (r < 0) {
+            for (int i = 0; i < nfds; i++) file_close(fds[i]);   /* undo refs */
+            return (uint64_t)r;
+        }
+        return (uint64_t)r;
+    }
+
     if (!process_check_user_range(umsg, sizeof(struct lnx_msghdr))) return -L_EINVAL;
     const struct lnx_msghdr* mh = (const struct lnx_msghdr*)umsg;
     if (mh->msg_iovlen == 0 || mh->msg_iovlen > 1024) return -L_EMSGSIZE;
@@ -1358,6 +1710,60 @@ static uint64_t sc_recvmsg(uint64_t fd, uint64_t umsg, uint64_t flags,
     enum sock_kind kind;
     void* s = sock_fd_get(fd, &kind);
     if (s == NULL) return -L_ENOTSOCK;
+
+    /* AF_UNIX: scatter read + SCM_RIGHTS delivery */
+    if (kind == SOCK_UNIX) {
+        if (!process_check_user_range(umsg, sizeof(struct lnx_msghdr))) return -L_EINVAL;
+        struct lnx_msghdr* mh = (struct lnx_msghdr*)umsg;
+        if (mh->msg_iovlen == 0 || mh->msg_iovlen > 64) return -L_EMSGSIZE;
+        if (!process_check_user_range((uint64_t)mh->msg_iov,
+                                      mh->msg_iovlen * sizeof(struct lnx_iovec)))
+            return -L_EINVAL;
+        struct unix_iovec kiv[64];
+        for (uint64_t i = 0; i < mh->msg_iovlen; i++) {
+            kiv[i].base = (void*)(uintptr_t)mh->msg_iov[i].base;
+            kiv[i].len  = (size_t)mh->msg_iov[i].len;
+            if (kiv[i].len != 0 &&
+                !process_check_user_range((uint64_t)kiv[i].base, kiv[i].len))
+                return -L_EINVAL;
+        }
+        struct file* ofds[UNIX_SCM_MAX];
+        int nfds = 0;
+        int r = unix_recvmsg((unix_sock_t*)s, kiv, (int)mh->msg_iovlen, ofds, &nfds);
+        if (r == -L_EAGAIN) {
+            if (mh->msg_flags & LNX_MSG_DONTWAIT) return (uint64_t)-L_EAGAIN;
+            wait_block(lnx_frame_rsp, &g_unix_wq, WAIT_RESTART, 0, 0);
+        }
+        if (r < 0) return (uint64_t)r;
+
+        mh->msg_flags = 0;
+        /* install received fds and write the cmsg if the caller has room */
+        int ifd[UNIX_SCM_MAX];
+        int installed = 0;
+        for (int i = 0; i < nfds; i++) {
+            ifd[i] = fd_install(ofds[i]);
+            if (ifd[i] < 0) break;
+            installed++;
+        }
+        uint64_t need = LNX_CMSG_HDRSZ + (uint64_t)installed * 4;
+        int written = 0;
+        if (installed > 0 && mh->msg_control != 0 && mh->msg_controllen >= need &&
+            process_check_user_range((uint64_t)mh->msg_control, need)) {
+            struct lnx_cmsghdr* ch = (struct lnx_cmsghdr*)mh->msg_control;
+            ch->len = need;
+            ch->level = LNX_SOL_SOCKET;
+            ch->type = LNX_SCM_RIGHTS;
+            int* out = (int*)(mh->msg_control + LNX_CMSG_HDRSZ);
+            for (int i = 0; i < installed; i++) out[i] = ifd[i];
+            mh->msg_controllen = need;
+            written = 1;
+            installed = 0;      /* consumed */
+        }
+        for (int i = 0; i < installed; i++) fd_close(ifd[i]);  /* no room */
+        if (mh->msg_control != 0 && !written) mh->msg_controllen = 0;
+        return (uint64_t)r;
+    }
+
     if (!process_check_user_range(umsg, sizeof(struct lnx_msghdr))) return -L_EINVAL;
     struct lnx_msghdr* mh = (struct lnx_msghdr*)umsg;
     if (mh->msg_iov == NULL || mh->msg_iovlen == 0 || mh->msg_iovlen > 1024)
@@ -1482,13 +1888,60 @@ static uint64_t sc_poll(uint64_t ufds, uint64_t nfds, uint64_t timeout_ms,
     }
 }
 
-/* getsockopt: report success / zeroed values (enough for SO_ERROR etc.) */
+/* getsockopt: SO_PEERCRED for AF_UNIX (Xorg local auth / dbus policy);
+ * everything else reports success / zeroed values (SO_ERROR etc.). */
 static uint64_t sc_getsockopt_stub(uint64_t fd, uint64_t level, uint64_t optname,
                                    uint64_t optval, uint64_t optlen, uint64_t u6) {
-    (void)fd; (void)level; (void)optname; (void)u6;
+    (void)u6;
+    if (level == LNX_SOL_SOCKET && optname == LNX_SO_PEERCRED) {
+        enum sock_kind kind;
+        void* s = sock_fd_get(fd, &kind);
+        if (s == NULL || kind != SOCK_UNIX) return (uint64_t)-92;   /* ENOPROTOOPT */
+        if (optlen < 12 || !process_check_user_range(optval, 12)) return -L_EINVAL;
+        int pid, uid, gid;
+        unix_peer_cred((unix_sock_t*)s, &pid, &uid, &gid);
+        int* u = (int*)optval;
+        u[0] = pid; u[1] = uid; u[2] = gid;
+        if (optlen >= 16 && process_check_user_range(optlen, 4))
+            *(uint32_t*)optlen = 12;
+        return 0;
+    }
     if (optval != 0 && optlen >= 4) {
         if (!process_check_user_range(optval, 4)) return -L_EINVAL;
         *(uint32_t*)optval = 0;
+    }
+    return 0;
+}
+
+static uint64_t sc_getsockname(uint64_t fd, uint64_t uaddr, uint64_t ulen_p,
+                               uint64_t u4, uint64_t u5, uint64_t u6) {
+    (void)u4; (void)u5; (void)u6;
+    struct file* f = fd_get_file((int)fd);
+    if (f == NULL) return -L_EBADF;
+    if (f->kind == FILE_T_SOCK_UNIX)
+        return (uint64_t)unix_put_addr((unix_sock_t*)f->priv, uaddr, ulen_p);
+    /* INET: zeroed sockaddr_in is enough for the current consumers */
+    if (uaddr != 0 && ulen_p != 0 &&
+        process_check_user_range(uaddr, sizeof(struct lnx_sockaddr_in)) &&
+        process_check_user_range(ulen_p, 4)) {
+        struct lnx_sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.family = LNX_AF_INET;
+        memcpy((void*)uaddr, &sa, sizeof(sa));
+        *(uint32_t*)ulen_p = (uint32_t)sizeof(sa);
+    }
+    return 0;
+}
+
+static uint64_t sc_getpeername(uint64_t fd, uint64_t uaddr, uint64_t ulen_p,
+                               uint64_t u4, uint64_t u5, uint64_t u6) {
+    (void)u4; (void)u5; (void)u6;
+    struct file* f = fd_get_file((int)fd);
+    if (f == NULL) return -L_EBADF;
+    if (f->kind == FILE_T_SOCK_UNIX) {
+        unix_sock_t* s = (unix_sock_t*)f->priv;
+        if (!unix_sock_has_peer(s)) return -L_ENOTCONN;
+        return (uint64_t)unix_put_addr(unix_sock_peer(s), uaddr, ulen_p);
     }
     return 0;
 }
@@ -1666,6 +2119,14 @@ void syscall_lnx_init(void) {
     lnx_table[LNX_shutdown]   = sc_close;          /* close semantics suffice */
     lnx_table[LNX_setsockopt] = sc_stub_ok;        /* common no-op options */
     lnx_table[LNX_getsockopt] = sc_getsockopt_stub;
+
+    /* P1.4: AF_UNIX + socket plumbing */
+    lnx_table[LNX_listen]       = sc_listen;
+    lnx_table[LNX_accept]       = sc_accept4;
+    lnx_table[LNX_accept4]      = sc_accept4;
+    lnx_table[LNX_socketpair]   = sc_socketpair;
+    lnx_table[LNX_getsockname]  = sc_getsockname;
+    lnx_table[LNX_getpeername]  = sc_getpeername;
 
     /* Enable the `syscall` instruction (EFER.SCE) */
     uint64_t efer = lnx_rdmsr(0xC0000080);
