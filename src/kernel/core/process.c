@@ -16,6 +16,54 @@
 static process_t processes[MAX_PROCESSES];
 static int current_process = -1;
 static uint32_t next_pid = 1;
+/* Thread tids live in a disjoint high namespace so a thread tid can
+ * never equal any leader pid (the leader test is is_thread anyway, but
+ * musl uses gettid() as an identity, so uniqueness matters). */
+static uint32_t next_tid = 0x40000000;
+
+/* --- mm_t lifecycle (P1.3): refcounted memory groups --------------------- */
+
+static mm_t* mm_new(void) {
+    mm_t* mm = (mm_t*)kmalloc(sizeof(mm_t));
+    if (mm == NULL) return NULL;
+    memset(mm, 0, sizeof(mm_t));
+    mm->refs = 1;
+    mm->cr3 = vmm_create_address_space();
+    if (mm->cr3 == 0) {
+        kfree(mm);
+        return NULL;
+    }
+    return mm;
+}
+
+static mm_t* mm_get(mm_t* mm) {
+    if (mm) mm->refs++;
+    return mm;
+}
+
+static void mm_put(mm_t* mm) {
+    if (mm == NULL) return;
+    if (--mm->refs > 0) return;
+    uvm_release_mm(mm);
+    vmm_destroy_address_space(mm->cr3);
+    kfree(mm);
+}
+
+static sighand_t* sighand_new(void) {
+    sighand_t* sh = (sighand_t*)kmalloc(sizeof(sighand_t));
+    if (sh) sh->refs = 1;
+    return sh;
+}
+
+static sighand_t* sighand_get(sighand_t* sh) {
+    if (sh) sh->refs++;
+    return sh;
+}
+
+static void sighand_put(sighand_t* sh) {
+    if (sh == NULL) return;
+    if (--sh->refs == 0) kfree(sh);
+}
 
 /* Top of the current process's kernel stack. The Linux-ABI `syscall`
  * entry cannot use the TSS (the instruction does not switch stacks), so
@@ -75,6 +123,7 @@ void process_init(void) {
     memset(processes, 0, sizeof(processes));
     current_process = -1;
     next_pid = 1;
+    next_tid = 0x40000000;
 }
 
 static process_t* find_free_process(void) {
@@ -98,7 +147,7 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
      * visible as READY, or the shell's process_any_active() check will
      * hang the input loop forever. */
     memset(proc, 0, sizeof(process_t));
-    proc->pid = next_pid++;
+    proc->pid = proc->tid = proc->tgid = next_pid++;
     strncpy(proc->name, name, sizeof(proc->name) - 1);
 
     /* Set up kernel stack for this process (used during syscalls) */
@@ -106,8 +155,10 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
 
     proc->wait_pid = 0;
-    proc->cr3 = vmm_create_address_space();
-    if (proc->cr3 == 0) {
+    proc->sighand = sighand_new();
+    proc->mm = mm_new();
+    if (proc->mm == NULL) {
+        sighand_put(proc->sighand);
         memset(proc, 0, sizeof(process_t));
         vga_puts("[proc] create failed: no address space\n");
         return -1;
@@ -116,15 +167,15 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
     /* Legacy raw-binary layout: one RWX code image at USER_CODE_BASE
      * (above the kernel heap arena) plus the user stack, tracked as
      * ordinary uvm regions so teardown/exit works for every format. */
-    proc->code_base = USER_CODE_BASE;
-    proc->stack_top = USER_STACK_BASE;
+    proc->mm->code_base = USER_CODE_BASE;
+    proc->mm->stack_top = USER_STACK_BASE;
 
     if (uvm_map_range(proc, USER_CODE_BASE, USER_CODE_BASE + code_size,
                       UVM_PROT_READ | UVM_PROT_WRITE | UVM_PROT_EXEC) != 0) {
         vga_puts("[proc] create failed: PMM out of pages (code)\n");
         goto fail;
     }
-    proc->code_pages = (uint32_t)((code_size + 4095) / 4096);
+    proc->mm->code_pages = (uint32_t)((code_size + 4095) / 4096);
     uvm_write_user_va(proc, USER_CODE_BASE, code, code_size);
 
     if (uvm_map_range(proc, USER_STACK_BASE - USER_STACK_SIZE, USER_STACK_BASE,
@@ -132,22 +183,23 @@ int process_create(const char* name, uint8_t* code, size_t code_size, uint64_t e
         vga_puts("[proc] create failed: PMM out of pages (stack)\n");
         goto fail;
     }
-    proc->stack_pages = USER_STACK_SIZE / 4096;
+    proc->mm->stack_pages = USER_STACK_SIZE / 4096;
 
-    proc->brk_start = proc->brk_cur = (USER_CODE_BASE + code_size + 4095) & ~4095ULL;
-    proc->mmap_top = UVM_MMAP_BASE;
+    proc->mm->brk_start = proc->mm->brk_cur =
+        (USER_CODE_BASE + code_size + 4095) & ~4095ULL;
+    proc->mm->mmap_top = UVM_MMAP_BASE;
 
     proc->entry_point = entry;
+    fd_table_init(proc);
     proc->state = PROCESS_STATE_READY;
-    /* fds already initialized by process_alloc_slot (fd_table_init) */
 
     klog("[create] code mapped\n");
     return proc->pid;
 
 fail:
     /* Undo partial allocation so no half-initialized process remains */
-    uvm_release_all(proc);
-    vmm_destroy_address_space(proc->cr3);
+    mm_put(proc->mm);
+    sighand_put(proc->sighand);
     memset(proc, 0, sizeof(process_t));
     return -1;
 }
@@ -155,9 +207,8 @@ fail:
 /* Release all user pages of a process and free its slot.
  * Only safe for processes that are not running. */
 static void process_release_memory(process_t* proc) {
-    uvm_release_all(proc);
-    proc->code_pages = 0;
-    proc->stack_pages = 0;
+    mm_put(proc->mm);
+    proc->mm = NULL;
 }
 
 void process_reap_zombies(void) {
@@ -172,10 +223,8 @@ void process_reap_zombies(void) {
  * (wait4 reaping). The process must not be running. */
 void process_reap(process_t* proc) {
     process_release_memory(proc);
-    if (proc->cr3) {
-        vmm_destroy_address_space(proc->cr3);
-        proc->cr3 = 0;
-    }
+    sighand_put(proc->sighand);
+    proc->sighand = NULL;
     proc->parked_rsp = 0;
     proc->state = PROCESS_STATE_UNUSED;
 }
@@ -191,9 +240,83 @@ int process_any_active(void) {
     return 0;
 }
 
+/* --- P1.3 thread-group exit helpers -------------------------------------- */
+
+/* futex wake for CLONE_CHILD_CLEARTID (defined in syscall_lnx.c) */
+void futex_wake_user(uint64_t uaddr, int n);
+
+/* CLONE_CHILD_CLEARTID: store 0 into the futex word and wake one
+ * waiter - pthread_join() in the reaper thread un-parks here. */
+static void thread_clear_tid(process_t* t) {
+    if (t->clear_child_tid == 0) return;
+    process_write_user_int(t, t->clear_child_tid, 0);
+    futex_wake_user(t->clear_child_tid, 1);
+    t->clear_child_tid = 0;
+}
+
+/* Release the resource-group references held by a thread and free its
+ * slot directly (threads never become zombies). The caller must have
+ * removed the thread from every scheduler-visible path. */
+static void thread_release(process_t* t) {
+    thread_clear_tid(t);
+    fd_table_exit(t);
+    mm_put(t->mm);
+    t->mm = NULL;
+    sighand_put(t->sighand);
+    t->sighand = NULL;
+    t->parked_rsp = 0;
+    t->wait_pid = 0;
+    t->state = PROCESS_STATE_UNUSED;
+}
+
+/* exit_group: force-kill every sibling thread of the leader's group.
+ * Linux semantics: the whole group dies, only the leader becomes a
+ * zombie for wait4. */
+static void exit_group_kill_threads(process_t* leader) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* t = &processes[i];
+        if (t == leader || t->state == PROCESS_STATE_UNUSED) continue;
+        if (t->tgid != leader->tgid) continue;
+        thread_release(t);
+    }
+}
+
+/* A non-leader thread exiting (exit(2) from a clone(CLONE_THREAD) task).
+ * Drops its references and hands the CPU back to the kernel main task.
+ * Never returns. */
+static __attribute__((noreturn)) void thread_exit_current(process_t* proc) {
+    __asm__ volatile("cli");
+    thread_release(proc);
+    current_process = -1;
+
+    scheduler_request_main_switch();
+
+    /* sti takes effect after the next instruction (nop), so the software
+     * IRQ0 fires with IF=1 recorded in its frame - same protocol as
+     * process_exit. */
+    __asm__ volatile("sti; nop; int $32");
+    __builtin_unreachable();
+}
+
 uint64_t process_kill_current(int status) {
     process_t* proc = process_get_current();
     if (proc == NULL) return 0;
+
+    __asm__ volatile("cli");
+
+    /* A non-leader thread faulting: no zombie, just drop it (a real
+     * SIGSEGV would take the group down, but keeping the group alive
+     * with one broken thread is the less destructive choice here). */
+    if (proc->is_thread) {
+        thread_release(proc);
+        current_process = -1;
+        scheduler_request_main_switch();
+        scheduler_take_main_cpu();
+        return scheduler_main_return_rsp();
+    }
+
+    /* A fault in the leader kills the whole group */
+    exit_group_kill_threads(proc);
 
     /* Flush and free the process's open files */
     fd_table_exit(proc);
@@ -224,6 +347,16 @@ void process_exit(int status) {
 
     process_t* proc = &processes[current_process];
 
+    /* Non-leader thread: drop the slot, no zombie (musl pthread_exit
+     * reaches here via exit(2); the leader must outlive the group). */
+    if (proc->is_thread) {
+        thread_exit_current(proc);          /* never returns */
+    }
+
+    /* exit(2) from the leader == exit_group(2): every sibling thread
+     * dies with the group. */
+    exit_group_kill_threads(proc);
+
     /* Flush and free the process's open files before anything else */
     fd_table_exit(proc);
 
@@ -249,8 +382,9 @@ void process_exit(int status) {
         par->wait_pid = 0;
         tss_set_kernel_stack(par->kernel_stack);
         syscall_kernel_rsp = par->kernel_stack;
-        if (par->cr3) vmm_switch_cr3(par->cr3);
+        if (par->mm && par->mm->cr3) vmm_switch_cr3(par->mm->cr3);
         fpu_restore(par);
+        process_apply_fs_base(par);
         scheduler_invalidate_user_frame();
         restore_frame(par->parked_rsp);      /* never returns */
     }
@@ -316,7 +450,7 @@ void process_run(uint32_t pid) {
     /* Switch to the process's private address space. From here on the
      * kernel runs (and the vmm walks) inside this process's page tables
      * until the scheduler returns to the kernel-main task. */
-    if (proc->cr3) vmm_switch_cr3(proc->cr3);
+    if (proc->mm && proc->mm->cr3) vmm_switch_cr3(proc->mm->cr3);
 
     /* Set TSS kernel stack for interrupt/syscall returns, and the global
      * copy used by the Linux-ABI `syscall` entry (which does not switch
@@ -325,8 +459,8 @@ void process_run(uint32_t pid) {
     syscall_kernel_rsp = proc->kernel_stack;
 
     /* Fresh TLS state: the previous process's FS base must not leak */
-    wrmsr(MSR_FS_BASE, 0);
     proc->fs_base = 0;
+    wrmsr(MSR_FS_BASE, 0);
 
     /* Fresh FPU/SSE state for the new program */
     if (!fpu_template_ready) fpu_init_template();
@@ -341,7 +475,7 @@ void process_run(uint32_t pid) {
 
     /* Jump to user mode (ELF path uses the auxv block RSP) */
     jump_to_user(proc->entry_point,
-                 proc->user_rsp ? proc->user_rsp : proc->stack_top);
+                 proc->user_rsp ? proc->user_rsp : proc->mm->stack_top);
 }
 
 /* Jump to user mode using iretq
@@ -416,22 +550,43 @@ static void rand_fill16(uint8_t* dst) {
 /* Build argc/argv/envp/auxv at the top of the user stack.
  * interp_base: load base of the ELF interpreter (0 = none/static).
  * exec_path: path string published via AT_EXECFN.
+ * envp: kernel-side environment strings (NULL/empty -> default PATH).
  * Returns the RSP to hand to jump_to_user. All writes go through the
  * identity map so the process's CR3 need not be active yet. */
+#define EXEC_MAX_STR 32
+
 static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* res,
                                     char* const* argv, int argc,
+                                    char* const* envp, int envc,
                                     uint64_t interp_base, const char* exec_path) {
-    uint64_t sp = proc->stack_top;
+    (void)envc;
+    uint64_t sp = proc->mm->stack_top;
 
-    int n = (argc < 8) ? argc : 8;   /* argv[0] = program path anyway */
-    uint64_t ustr[8];
+    int n = (argc < EXEC_MAX_STR) ? argc : EXEC_MAX_STR;
+    int en = 0;
+    uint64_t ustr[EXEC_MAX_STR];
+    uint64_t uenv[EXEC_MAX_STR];
 
-    /* envp: just PATH for now */
-    static const char env_str[] = "PATH=/bin";
-    size_t env_len = sizeof(env_str);   /* includes NUL */
-    sp -= env_len;
-    uint64_t uenv = sp;
-    uvm_write_user_va(proc, sp, env_str, env_len);
+    if (envp != NULL) {
+        for (; en < EXEC_MAX_STR; en++) {
+            if (envp[en] == NULL) break;
+        }
+    }
+    if (en == 0) {
+        /* No environment given: keep the historical default so the
+         * shell's exec_load_program path keeps working. */
+        static const char* def_envp[2] = { "PATH=/bin", NULL };
+        envp = def_envp;
+        en = 1;
+    }
+
+    for (int i = 0; i < en; i++) {
+        const char* s = envp[i] ? envp[i] : "";
+        size_t l = strlen(s) + 1;
+        sp -= l;
+        uenv[i] = sp;
+        uvm_write_user_va(proc, sp, s, l);
+    }
 
     size_t exec_len = strlen(exec_path) + 1;
     sp -= exec_len;
@@ -454,15 +609,16 @@ static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* re
 
     /* Final block: argc + argv[] + NULL + envp[] + NULL + auxv.
      * RSP must be 16-byte aligned at the entry point per the ABI. */
-    size_t block = 8 + 8 * ((size_t)n + 1) + 8 * 3 + 8 * (2 * AUXV_PAIRS);
+    size_t block = 8 + 8 * ((size_t)n + 1) + 8 * ((size_t)en + 1)
+                 + 8 * (2 * AUXV_PAIRS);
     sp = (sp - block) & ~0xFULL;
 
-    uint64_t blk[1 + 8 + 1 + 3 + 2 * AUXV_PAIRS];
+    uint64_t blk[1 + EXEC_MAX_STR + 1 + EXEC_MAX_STR + 1 + 2 * AUXV_PAIRS];
     uint64_t* u = blk;
     *u++ = (uint64_t)n;
     for (int i = 0; i < n; i++) *u++ = ustr[i];
     *u++ = 0;                 /* argv end */
-    *u++ = uenv;              /* envp[0] */
+    for (int i = 0; i < en; i++) *u++ = uenv[i];
     *u++ = 0;                 /* envp end */
 
     struct { uint64_t k, v; } aux[AUXV_PAIRS] = {
@@ -491,25 +647,19 @@ static uint64_t process_build_stack(process_t* proc, const elf_load_result_t* re
     return sp;
 }
 
-/* Allocate and initialize a bare process slot (no user memory yet).
- * Each process gets its own address space (Phase 1.5). */
+/* Allocate and initialize a bare process slot (no mm, no fd table yet -
+ * callers attach the resource groups per fork/clone semantics). */
 static process_t* process_alloc_slot(const char* name) {
     process_t* proc = find_free_process();
     if (proc == NULL) return NULL;
     memset(proc, 0, sizeof(process_t));
-    proc->pid = next_pid++;
+    proc->pid = proc->tid = proc->tgid = next_pid++;
     strncpy(proc->name, name, sizeof(proc->name) - 1);
     int proc_index = proc - processes;
     proc->kernel_stack = (uint64_t)&kernel_stacks[proc_index][KERNEL_STACK_SIZE];
     proc->wait_pid = 0;
-    proc->cr3 = vmm_create_address_space();
-    if (proc->cr3 == 0) {
-        memset(proc, 0, sizeof(process_t));
-        return NULL;
-    }
     proc->parent_pid = (current_process >= 0) ? processes[current_process].pid : 0;
-    /* Fresh process: console ttys at fd 0/1/2 (P1.2 unified fd layer) */
-    fd_table_init(proc);
+    proc->sighand = sighand_new();
     return proc;
 }
 
@@ -543,6 +693,15 @@ int exec_load_program(const char* path, char* const* argv, int argc) {
     if (elf_is_elf64(buffer, entry->size)) {
         process_t* proc = process_alloc_slot(base);
         if (proc == NULL) {
+            kfree(buffer);
+            return -1;
+        }
+        proc->mm = mm_new();
+        fd_table_init(proc);
+        if (proc->mm == NULL || proc->files == NULL) {
+            if (proc->mm) mm_put(proc->mm);
+            sighand_put(proc->sighand);
+            memset(proc, 0, sizeof(process_t));
             kfree(buffer);
             return -1;
         }
@@ -581,7 +740,9 @@ int exec_load_program(const char* path, char* const* argv, int argc) {
                 }
             }
             klog("\n");
-            uvm_release_all(proc);
+            mm_put(proc->mm);
+            fd_table_exit(proc);
+            sighand_put(proc->sighand);
             memset(proc, 0, sizeof(process_t));
             kfree(buffer);
             return -1;
@@ -628,28 +789,30 @@ int exec_load_program(const char* path, char* const* argv, int argc) {
             /* The mmap arena of a dynamic process starts above the
              * interpreter so loader/library mappings cannot collide. */
             if (ires.brk_start > UVM_MMAP_BASE) {
-                proc->mmap_top = ires.brk_start;
+                proc->mm->mmap_top = ires.brk_start;
             }
         }
 
         /* Map the user stack and lay out argc/argv/envp/auxv */
-        proc->stack_top = USER_STACK_BASE;
+        proc->mm->stack_top = USER_STACK_BASE;
         if (uvm_map_range(proc, USER_STACK_BASE - USER_STACK_SIZE, USER_STACK_BASE,
                           UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
             klog("[exec] out of memory for user stack\n");
-            uvm_release_all(proc);
+            mm_put(proc->mm);
+            fd_table_exit(proc);
+            sighand_put(proc->sighand);
             memset(proc, 0, sizeof(process_t));
             kfree(buffer);
             return -1;
         }
-        proc->stack_pages = USER_STACK_SIZE / 4096;
+        proc->mm->stack_pages = USER_STACK_SIZE / 4096;
 
         proc->entry_point = entry;
-        proc->brk_start = proc->brk_cur = res.brk_start;
-        if (proc->mmap_top < UVM_MMAP_BASE) proc->mmap_top = UVM_MMAP_BASE;
+        proc->mm->brk_start = proc->mm->brk_cur = res.brk_start;
+        if (proc->mm->mmap_top < UVM_MMAP_BASE) proc->mm->mmap_top = UVM_MMAP_BASE;
 
         proc->user_rsp = process_build_stack(proc, &res, argv, argc,
-                                             interp_base, path);
+                                             NULL, 0, interp_base, path);
         proc->state = PROCESS_STATE_READY;
         if (interp_base != 0) {
             klog("[exec] dynamic exec via ");
@@ -717,6 +880,10 @@ extern const uint8_t user_probe_ld_end[] __attribute__((weak));
 /* glibc dynamic + pthread primitives (Phase 3.2) */
 extern const uint8_t user_pthread_start[] __attribute__((weak));
 extern const uint8_t user_pthread_end[] __attribute__((weak));
+
+/* musl REAL multithreading probe (Phase 1.3 clone/futex/TLS) */
+extern const uint8_t user_threads_start[] __attribute__((weak));
+extern const uint8_t user_threads_end[] __attribute__((weak));
 
 /* Freestanding Linux-ABI syscall probe (always embedded) */
 extern const uint8_t user_mini_start[];
@@ -933,6 +1100,8 @@ void user_programs_install(void) {
                       "glibc");
     user_install_blob("/bin", "hello-pthread", user_pthread_start,
                       user_pthread_end, "glibc pthread probe");
+    user_install_blob("/bin", "hello-threads", user_threads_start,
+                      user_threads_end, "musl multithreading probe");
 
     /* Desktop art assets: user/art/* -> /home/user/art */
     user_install_blob("/home/user/art", "103.mp3", user_art_103_mp3_start,
@@ -1018,6 +1187,7 @@ process_t* process_find_waiter(int child_pid) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t* p = &processes[i];
         if (p->state != PROCESS_STATE_BLOCKED) continue;
+        if (p->is_thread) continue;          /* threads never wait4 */
         if (p->wait_pid == child_pid ||
             (p->wait_pid == -1 && p->parent_pid != 0)) {
             /* wait_pid == -1: waiter of this child only if it forked it */
@@ -1025,7 +1195,10 @@ process_t* process_find_waiter(int child_pid) {
                 int found = 0;
                 for (int j = 0; j < MAX_PROCESSES; j++) {
                     if (processes[j].pid == (uint32_t)child_pid &&
-                        processes[j].parent_pid == (int)p->pid) { found = 1; break; }
+                        !processes[j].is_thread &&
+                        processes[j].parent_pid == (int)p->pid) {
+                        found = 1; break;
+                    }
                 }
                 if (!found) continue;
             }
@@ -1039,6 +1212,7 @@ process_t* process_find_child(process_t* parent, int pid) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t* c = &processes[i];
         if (c->state == PROCESS_STATE_UNUSED) continue;
+        if (c->is_thread) continue;          /* threads are not wait4-able */
         if (c->parent_pid != (int)parent->pid) continue;
         if (pid > 0 && (int)c->pid != pid) continue;
         if (c->state == PROCESS_STATE_READY ||
@@ -1053,8 +1227,9 @@ process_t* process_find_child(process_t* parent, int pid) {
 /* Write an int into a user VA of the given process (wait4 status
  * delivery; the process may not be the currently active CR3). */
 void process_write_user_int(process_t* p, uint64_t uaddr, int val) {
+    if (p == NULL || p->mm == NULL) return;
     uint64_t old = vmm_current_root();
-    vmm_set_root_ptr(p->cr3);
+    vmm_set_root_ptr(p->mm->cr3);
     uint64_t page = uaddr & ~0xFFFULL;
     uint64_t phys = vmm_get_phys(page);
     if (phys != 0) {
@@ -1067,21 +1242,8 @@ void process_write_user_int(process_t* p, uint64_t uaddr, int val) {
  * caller's syscall-entry frame holding the parent's user context; the
  * child gets a clone of it (IRQ layout, RAX=0) parked on its own kernel
  * stack so the scheduler can resume it like any user frame. */
-int process_fork(uint64_t frame_rsp) {
-    process_t* p = process_get_current();
-    if (p == NULL) return -1;
-
-    process_t* c = process_alloc_slot(p->name);
-    if (c == NULL) return -1;
-    c->parent_pid = (int)p->pid;
-
-    if (uvm_fork(p, c) != 0) {
-        vmm_destroy_address_space(c->cr3);
-        memset(c, 0, sizeof(process_t));
-        return -1;
-    }
-    fd_table_fork(p, c);                    /* shared, refcounted fds */
-
+static int fork_common(process_t* p, process_t* c, uint64_t frame_rsp,
+                       uint64_t child_rsp) {
     /* Child starts with a snapshot of the parent's live FPU/SSE state */
     if (!fpu_template_ready) fpu_init_template();
     memcpy(c->fpu, fpu_template, sizeof(fpu_template));
@@ -1098,16 +1260,115 @@ int process_fork(uint64_t frame_rsp) {
     f[IRQ_RIP] = e[ENTY_RIP];
     f[IRQ_CS] = 0x1B;
     f[IRQ_RFLAGS] = e[ENTY_RFLAGS];
-    f[IRQ_RSP] = e[ENTY_RSP];
+    f[IRQ_RSP] = child_rsp ? child_rsp : e[ENTY_RSP];
     f[IRQ_SS] = 0x23;
 
     c->entry_point = e[ENTY_RIP];
-    c->user_rsp = e[ENTY_RSP];
+    c->user_rsp = f[IRQ_RSP];
     c->parked_rsp = frsp;
     c->state = PROCESS_STATE_READY;
+    return 0;
+}
+
+int process_fork(uint64_t frame_rsp) {
+    process_t* p = process_get_current();
+    if (p == NULL || p->mm == NULL) return -1;
+
+    process_t* c = process_alloc_slot(p->name);
+    if (c == NULL) return -1;
+    c->parent_pid = (int)p->pid;
+
+    c->mm = mm_new();
+    if (c->mm == NULL) {
+        sighand_put(c->sighand);
+        memset(c, 0, sizeof(process_t));
+        return -1;
+    }
+    if (uvm_fork(p, c) != 0) {
+        mm_put(c->mm);
+        sighand_put(c->sighand);
+        memset(c, 0, sizeof(process_t));
+        return -1;
+    }
+    fd_table_fork(p, c);                    /* own table, ref'd entries */
+    c->current_dir_cluster = p->current_dir_cluster;
+
+    fork_common(p, c, frame_rsp, 0);
 
     klog("[fork] child ready\n");
     return (int)c->pid;
+}
+
+/* clone (P1.3): Linux thread/process creation. Minimal flag set:
+ * CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID|
+ * CHILD_CLEARTID (everything musl pthread_create / posix_spawn need).
+ * Without CLONE_VM this degrades to fork with the optional tid/TLS
+ * hooks (glibc fork passes just SIGCHLD). */
+#define LNX_CLONE_VM            0x100
+#define LNX_CLONE_FS            0x200
+#define LNX_CLONE_FILES         0x400
+#define LNX_CLONE_SIGHAND       0x800
+#define LNX_CLONE_THREAD        0x10000
+#define LNX_CLONE_SYSVSEM       0x40000
+#define LNX_CLONE_SETTLS        0x80000
+#define LNX_CLONE_PARENT_SETTID 0x100000
+#define LNX_CLONE_CHILD_CLEARTID 0x200000
+
+int process_clone(uint64_t frame_rsp, uint64_t flags, uint64_t child_stack,
+                  uint64_t parent_tidptr, uint64_t child_tidptr, uint64_t tls) {
+    process_t* p = process_get_current();
+    if (p == NULL || p->mm == NULL) return -1;
+
+    process_t* c = process_alloc_slot(p->name);
+    if (c == NULL) return -1;
+    c->parent_pid = (int)p->pid;
+
+    if (flags & LNX_CLONE_THREAD) {
+        /* Same thread group: unique tid, shared pid/tgid */
+        c->pid = p->tgid;
+        c->tgid = p->tgid;
+        c->tid = next_tid++;
+        c->is_thread = 1;
+    }
+
+    if (flags & LNX_CLONE_VM) {
+        c->mm = mm_get(p->mm);
+    } else {
+        c->mm = mm_new();
+        if (c->mm == NULL || uvm_fork(p, c) != 0) {
+            if (c->mm) mm_put(c->mm);
+            sighand_put(c->sighand);
+            memset(c, 0, sizeof(process_t));
+            return -1;
+        }
+    }
+
+    if (flags & LNX_CLONE_FILES) fd_table_share(p, c);
+    else fd_table_fork(p, c);
+
+    if (flags & LNX_CLONE_SIGHAND) {
+        sighand_put(c->sighand);
+        c->sighand = sighand_get(p->sighand);
+    }
+    c->current_dir_cluster = p->current_dir_cluster;   /* (CLONE_FS: copy) */
+
+    if (flags & LNX_CLONE_SETTLS) c->fs_base = tls;
+    if (flags & LNX_CLONE_CHILD_CLEARTID) c->clear_child_tid = child_tidptr;
+
+    fork_common(p, c, frame_rsp, (flags & LNX_CLONE_VM) ? child_stack : 0);
+
+    if (flags & LNX_CLONE_PARENT_SETTID && parent_tidptr) {
+        process_write_user_int(p, parent_tidptr, (int)c->tid);
+    }
+
+    klog((flags & LNX_CLONE_VM) ? "[clone] thread (vm shared)\n"
+                                : "[clone] process (vm copied)\n");
+    return (int)c->tid;
+}
+
+/* Apply the saved TLS pointer to the live CPU (resume points) */
+void process_apply_fs_base(process_t* p) {
+    if (p) wrmsr(MSR_FS_BASE, p->fs_base);
 }
 
 /* wait4 slow path: park the caller (BLOCKED) and run the child until it
@@ -1139,26 +1400,27 @@ void process_wait_run(process_t* child, uint64_t status_ptr, uint64_t frame_rsp)
     p->wait_status_ptr = status_ptr;
     p->parked_rsp = (uint64_t)f;
 
-    /* Hand the CPU to the child (swap FPU/SSE state along the way) */
+    /* Hand the CPU to the child (swap FPU/SSE + TLS state along the way) */
     fpu_save(p);
     fpu_restore(child);
+    process_apply_fs_base(child);
     current_process = child - processes;
     child->state = PROCESS_STATE_RUNNING;
     tss_set_kernel_stack(child->kernel_stack);
     syscall_kernel_rsp = child->kernel_stack;
-    if (child->cr3) vmm_switch_cr3(child->cr3);
+    if (child->mm && child->mm->cr3) vmm_switch_cr3(child->mm->cr3);
     scheduler_invalidate_user_frame();
 
     restore_frame(child->parked_rsp);  /* never returns */
 }
 
 /* Scheduler helper: another READY process holding a parked user frame
- * (fork child / preempted parent), or NULL. */
-process_t* process_pick_ready(uint32_t exclude_pid) {
+ * (fork child / preempted process / thread), or NULL. */
+process_t* process_pick_ready(process_t* exclude) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t* p = &processes[i];
         if (p->state == PROCESS_STATE_READY && p->parked_rsp != 0 &&
-            p->pid != exclude_pid) {
+            p != exclude) {
             return p;
         }
     }
@@ -1252,12 +1514,17 @@ uint64_t process_park_entry_frame(process_t* p, uint64_t frame_rsp,
 }
 
 /* execve (Phase 1.5): replace the current process image with a new ELF.
- * The caller passes kernel-side copies of path/argv (user memory is
- * about to be torn down). On success the live syscall-entry frame is
- * rewritten so its iretq lands in the new program; returns 0. On early
- * failure (before the old image is dropped) returns -1. */
+ * The caller passes kernel-side copies of path/argv/envp (user memory is
+ * about to be torn down). The image lives in the process's mm group, so
+ * exec builds a FRESH mm and swaps it in - mandatory for
+ * clone(CLONE_VM|CLONE_VFORK) (musl posix_spawn), where the old mm is
+ * shared with a suspended parent and must not be released. On success
+ * the live syscall-entry frame is rewritten so its iretq lands in the
+ * new program; returns 0. On early failure (before the old image is
+ * dropped) returns -1. */
 int exec_replace(uint64_t frame_rsp, const char* path,
-                 char* const* argv, int argc) {
+                 char* const* argv, int argc,
+                 char* const* envp, int envc) {
     fs_entry_t* entry = fs_resolve_path(path);
     if (entry == NULL || entry->type != FS_TYPE_FILE) return -1;
 
@@ -1278,16 +1545,22 @@ int exec_replace(uint64_t frame_rsp, const char* path,
         return -1;
     }
 
-    /* Point of no return: drop the old image. Any failure from here on
-     * terminates the process - there is nothing left to return to. */
-    uvm_release_all(proc);
+    /* Point of no return: build the replacement mm and make it the
+     * process's active one. Any failure from here on terminates the
+     * process - there is nothing left to return to. */
+    mm_t* old_mm = proc->mm;
+    proc->mm = mm_new();
+    if (proc->mm == NULL) {
+        proc->mm = old_mm;
+        goto dead;
+    }
 
-    proc->stack_top = USER_STACK_BASE;
+    proc->mm->stack_top = USER_STACK_BASE;
     if (uvm_map_range(proc, USER_STACK_BASE - USER_STACK_SIZE, USER_STACK_BASE,
                       UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
         goto dead;
     }
-    proc->stack_pages = USER_STACK_SIZE / 4096;
+    proc->mm->stack_pages = USER_STACK_SIZE / 4096;
 
     elf_load_result_t res;
     if (elf_load(proc, buffer, entry->size, &res) != 0) goto dead;
@@ -1316,15 +1589,21 @@ int exec_replace(uint64_t frame_rsp, const char* path,
         interp_base = UVM_INTERP_BASE;
         entry_va = ires.entry;
         if (ires.brk_start > UVM_MMAP_BASE) {
-            proc->mmap_top = ires.brk_start;
+            proc->mm->mmap_top = ires.brk_start;
         }
     }
 
     proc->entry_point = entry_va;
-    proc->brk_start = proc->brk_cur = res.brk_start;
-    if (proc->mmap_top < UVM_MMAP_BASE) proc->mmap_top = UVM_MMAP_BASE;
+    proc->mm->brk_start = proc->mm->brk_cur = res.brk_start;
+    if (proc->mm->mmap_top < UVM_MMAP_BASE) proc->mm->mmap_top = UVM_MMAP_BASE;
     proc->user_rsp = process_build_stack(proc, &res, argv, argc,
-                                         interp_base, path);
+                                         envp, envc, interp_base, path);
+
+    /* The old image is no longer needed; drop the reference (shared mms
+     * of vfork parents just lose one ref). Switch CR3 so anything that
+     * reads user memory afterwards sees the new image. */
+    mm_put(old_mm);
+    if (proc->mm->cr3) vmm_switch_cr3(proc->mm->cr3);
 
     /* Rewrite the live syscall frame: the epilogue's iretq now enters
      * the new image with RAX = 0 (execve "never returns" to the caller). */

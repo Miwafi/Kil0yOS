@@ -49,6 +49,10 @@ uint64_t uvm_mmap_anon(process_t* proc, uint64_t hint, size_t len,
 /* Release every region of the process (unmap + free physical pages). */
 void uvm_release_all(process_t* proc);
 
+/* Same teardown for a bare mm (used by mm_put when the last reference
+ * to a shared mm goes away). Does not free the mm itself. */
+void uvm_release_mm(mm_t* mm);
+
 /* fork: copy all mapped user pages of parent into fresh frames of child
  * and mirror the region table + brk/mmap cursors. Returns 0 or -1. */
 int uvm_fork(process_t* parent, process_t* child);

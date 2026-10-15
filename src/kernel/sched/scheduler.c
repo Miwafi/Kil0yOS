@@ -175,18 +175,19 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
             tasks[0].rsp = current_rsp;
             user_frame_valid = 0;
 
-            /* Phase 1.5 round-robin: a forked child (or a preempted
-             * process) may hold a parked frame - give it the CPU
-             * instead of resuming the same user process. */
-            process_t* next = process_pick_ready(uproc->pid);
+            /* Phase 1.5 round-robin: a forked child, thread or a
+             * preempted process may hold a parked frame - give it the
+             * CPU instead of resuming the same user process. */
+            process_t* next = process_pick_ready(uproc);
             if (next != NULL) {
                 fpu_restore(next);
+                process_apply_fs_base(next);
                 uproc->parked_rsp = user_frame;   /* park, do not lose */
                 uproc->state = PROCESS_STATE_READY;
                 process_become_current(next);
                 tss_set_kernel_stack(next->kernel_stack);
                 syscall_kernel_rsp = next->kernel_stack;
-                if (next->cr3) vmm_switch_cr3(next->cr3);
+                if (next->mm && next->mm->cr3) vmm_switch_cr3(next->mm->cr3);
                 return next->parked_rsp;
             }
             fpu_restore(uproc);
@@ -210,13 +211,14 @@ uint64_t scheduler_tick(uint64_t current_rsp) {
     /* A parked user process became READY while the kernel tasks ran
      * (IRQ/other-syscall wakeup): hand it the CPU immediately. */
     {
-        process_t* wk = process_pick_ready(0);
+        process_t* wk = process_pick_ready(NULL);
         if (wk != NULL) {
             fpu_restore(wk);
+            process_apply_fs_base(wk);
             process_become_current(wk);
             tss_set_kernel_stack(wk->kernel_stack);
             syscall_kernel_rsp = wk->kernel_stack;
-            if (wk->cr3) vmm_switch_cr3(wk->cr3);
+            if (wk->mm && wk->mm->cr3) vmm_switch_cr3(wk->mm->cr3);
             return wk->parked_rsp;
         }
     }

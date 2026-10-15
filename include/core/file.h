@@ -66,6 +66,7 @@ int          fd_dup(int fd);
 int          fd_dup2(int fd, int fd2);
 void         fd_table_init(struct process* p); /* fresh table: tty 0/1/2 */
 void         fd_table_fork(struct process* parent, struct process* child);
-void         fd_table_exit(struct process* p); /* close all (refcount aware) */
+void         fd_table_share(struct process* parent, struct process* child);
+void         fd_table_exit(struct process* p); /* drop group ref (last closes) */
 
 #endif /* FILE_H */

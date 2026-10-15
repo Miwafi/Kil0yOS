@@ -136,13 +136,14 @@ void wait_timers_poll(void) {
 /* Hand the CPU away from a parked process. Never returns. */
 static __attribute__((noreturn)) void park_switch(process_t* p) {
     /* Prefer another READY parked process (fork child, woken syscall) */
-    process_t* next = process_pick_ready(p->pid);
+    process_t* next = process_pick_ready(p);
     if (next != NULL) {
         fpu_restore(next);
+        process_apply_fs_base(next);
         process_become_current(next);
         tss_set_kernel_stack(next->kernel_stack);
         syscall_kernel_rsp = next->kernel_stack;
-        if (next->cr3) vmm_switch_cr3(next->cr3);
+        if (next->mm && next->mm->cr3) vmm_switch_cr3(next->mm->cr3);
         scheduler_invalidate_user_frame();
         restore_frame(next->parked_rsp);
     }
@@ -152,6 +153,14 @@ static __attribute__((noreturn)) void park_switch(process_t* p) {
     scheduler_request_main_switch();
     __asm__ volatile("sti; nop; int $32");
     __builtin_unreachable();
+}
+
+/* Complete the park of the current process: it must already have its
+ * resumable frame in parked_rsp, state BLOCKED, FPU saved, and the
+ * caller must hold cli. Hands the CPU to another parked process or the
+ * kernel main task; never returns. */
+void wait_park_now(process_t* p) {
+    park_switch(p);
 }
 
 void wait_block(uint64_t frame_rsp, wait_queue_t* wq,

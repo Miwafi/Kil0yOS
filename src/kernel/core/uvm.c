@@ -30,7 +30,7 @@ static uint64_t page_up(uint64_t a)   { return (a + 0xFFF) & ~0xFFFULL; }
  * so page contents are accessed through the identity map (VA == PA). */
 static uint64_t uvm_enter(process_t* proc) {
     uint64_t old = vmm_current_root();
-    if (proc->cr3) vmm_set_root_ptr(proc->cr3);
+    if (proc->mm && proc->mm->cr3) vmm_set_root_ptr(proc->mm->cr3);
     return old;
 }
 static void uvm_leave(uint64_t old) {
@@ -77,9 +77,9 @@ void uvm_read_user_va(process_t* proc, void* dst, uint64_t src_va, size_t len) {
 }
 
 /* Region bookkeeping: extend an overlapping region or add a new one. */
-static void region_commit(process_t* proc, uint64_t start, uint64_t end, uint32_t prot) {
+static void region_commit(mm_t* mm, uint64_t start, uint64_t end, uint32_t prot) {
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
-        vm_region_t* r = &proc->regions[i];
+        vm_region_t* r = &mm->regions[i];
         if (!r->used || r->end < start || r->start > end) continue;
         if (r->prot != prot) continue;
         if (start < r->start) r->start = start;
@@ -87,7 +87,7 @@ static void region_commit(process_t* proc, uint64_t start, uint64_t end, uint32_
         return;
     }
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
-        vm_region_t* r = &proc->regions[i];
+        vm_region_t* r = &mm->regions[i];
         if (!r->used) {
             r->used = 1;
             r->start = start;
@@ -144,7 +144,7 @@ int uvm_map_range(process_t* proc, uint64_t start, uint64_t end, uint32_t prot) 
         }
     }
 
-    region_commit(proc, s, e, prot);
+    region_commit(proc->mm, s, e, prot);
     uvm_leave(old_root);
     return 0;
 }
@@ -164,7 +164,7 @@ int uvm_unmap_range(process_t* proc, uint64_t start, uint64_t end) {
     uvm_leave(old_root);
 
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
-        vm_region_t* r = &proc->regions[i];
+        vm_region_t* r = &proc->mm->regions[i];
         if (!r->used || r->end <= s || r->start >= e) continue;
         if (r->start >= s && r->end <= e) {
             r->used = 0;                       /* fully covered: drop */
@@ -193,7 +193,7 @@ int uvm_change_prot(process_t* proc, uint64_t start, uint64_t end, uint32_t prot
     uvm_leave(old_root);
 
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
-        vm_region_t* r = &proc->regions[i];
+        vm_region_t* r = &proc->mm->regions[i];
         if (!r->used || r->end <= s || r->start >= e) continue;
         r->prot = prot;
     }
@@ -201,14 +201,14 @@ int uvm_change_prot(process_t* proc, uint64_t start, uint64_t end, uint32_t prot
 }
 
 int uvm_check_range(process_t* proc, uint64_t uaddr, size_t len) {
-    if (proc == NULL) return 0;
+    if (proc == NULL || proc->mm == NULL) return 0;
     if (len == 0) return 1;
     if (uaddr + len < uaddr) return 0;
 
     for (uint64_t a = page_down(uaddr); a < uaddr + len; a += PAGE_SIZE) {
         int inside = 0;
         for (int i = 0; i < MAX_VM_REGIONS; i++) {
-            vm_region_t* r = &proc->regions[i];
+            vm_region_t* r = &proc->mm->regions[i];
             if (r->used && a >= r->start && a < r->end) {
                 inside = 1;
                 break;
@@ -233,18 +233,23 @@ uint64_t uvm_mmap_anon(process_t* proc, uint64_t hint, size_t len, uint32_t prot
 
     /* Bump allocation; freed VAs are not reused (musl malloc recycles
      * chunks in userland, so syscall-level churn is minimal). */
-    if (proc->mmap_top < UVM_MMAP_BASE) proc->mmap_top = UVM_MMAP_BASE;
-    uint64_t s = page_up(proc->mmap_top);
+    mm_t* mm = proc->mm;
+    if (mm->mmap_top < UVM_MMAP_BASE) mm->mmap_top = UVM_MMAP_BASE;
+    uint64_t s = page_up(mm->mmap_top);
     if (s + plen > UVM_MMAP_LIMIT) return 0;
     if (uvm_map_range(proc, s, s + plen, prot) != 0) return 0;
-    proc->mmap_top = s + plen;
+    mm->mmap_top = s + plen;
     return s;
 }
 
-void uvm_release_all(process_t* proc) {
-    uint64_t old_root = uvm_enter(proc);
+/* Release every region tracked by an mm (unmap + free physical pages).
+ * Does NOT drop the mm reference itself. */
+void uvm_release_mm(mm_t* mm) {
+    if (mm == NULL) return;
+    uint64_t old = vmm_current_root();
+    if (mm->cr3) vmm_set_root_ptr(mm->cr3);
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
-        vm_region_t* r = &proc->regions[i];
+        vm_region_t* r = &mm->regions[i];
         if (!r->used) continue;
         for (uint64_t v = r->start; v < r->end; v += PAGE_SIZE) {
             uint64_t phys = vmm_get_phys(v);
@@ -255,20 +260,26 @@ void uvm_release_all(process_t* proc) {
         }
         r->used = 0;
     }
-    uvm_leave(old_root);
-    proc->brk_start = 0;
-    proc->brk_cur = 0;
-    proc->mmap_top = 0;
+    vmm_set_root_ptr(old);
+    mm->brk_start = 0;
+    mm->brk_cur = 0;
+    mm->mmap_top = 0;
+}
+
+void uvm_release_all(process_t* proc) {
+    uvm_release_mm(proc->mm);
 }
 
 /* fork (Phase 1.5): copy every mapped user page of parent into fresh
  * frames of child (no COW). Content flows through the identity map so
  * neither CR3 needs to be active. Returns 0 or -1 (out of memory). */
 int uvm_fork(process_t* parent, process_t* child) {
+    mm_t* pmm = parent->mm;
+    mm_t* cmm = child->mm;
     uint64_t old_root = uvm_enter(parent);
 
     for (int i = 0; i < MAX_VM_REGIONS; i++) {
-        vm_region_t* r = &parent->regions[i];
+        vm_region_t* r = &pmm->regions[i];
         if (!r->used) continue;
 
         for (uint64_t v = r->start; v < r->end; v += PAGE_SIZE) {
@@ -279,33 +290,33 @@ int uvm_fork(process_t* parent, process_t* child) {
             uint64_t cphys = pmm_alloc_page();
             if (cphys == 0) {
                 uvm_leave(old_root);
-                uvm_release_all(child);
+                uvm_release_mm(cmm);
                 return -1;
             }
             memcpy((void*)cphys, (const void*)pphys, PAGE_SIZE);
 
             /* Map into the child's address space */
-            vmm_set_root_ptr(child->cr3);
+            vmm_set_root_ptr(cmm->cr3);
             vmm_map_page(v, cphys, prot_to_pte(r->prot));
-            vmm_set_root_ptr(parent->cr3);
+            vmm_set_root_ptr(pmm->cr3);
         }
 
         /* Mirror the region entry */
         vm_region_t* cr = NULL;
         for (int j = 0; j < MAX_VM_REGIONS; j++) {
-            if (!child->regions[j].used) { cr = &child->regions[j]; break; }
+            if (!cmm->regions[j].used) { cr = &cmm->regions[j]; break; }
         }
         if (cr == NULL) {
             uvm_leave(old_root);
-            uvm_release_all(child);
+            uvm_release_mm(cmm);
             return -1;
         }
         *cr = *r;
     }
 
     uvm_leave(old_root);
-    child->brk_start = parent->brk_start;
-    child->brk_cur = parent->brk_cur;
-    child->mmap_top = parent->mmap_top;
+    cmm->brk_start = pmm->brk_start;
+    cmm->brk_cur = pmm->brk_cur;
+    cmm->mmap_top = pmm->mmap_top;
     return 0;
 }

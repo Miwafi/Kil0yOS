@@ -582,6 +582,18 @@ static uint64_t sc_fork(uint64_t u1, uint64_t u2, uint64_t u3,
     return (uint64_t)process_fork(lnx_frame_rsp);
 }
 
+/* clone(2) (P1.3): Linux x86-64 ABI is
+ *   clone(flags, stack, parent_tid, child_tid, tls)
+ * i.e. tls rides R8 and child_tid rides R10. musl pthread_create and
+ * posix_spawn need the shared-groups subset. */
+static uint64_t sc_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid,
+                         uint64_t child_tid, uint64_t tls,
+                         uint64_t u6) {
+    (void)u6;
+    return (uint64_t)process_clone(lnx_frame_rsp, flags, stack,
+                                   parent_tid, child_tid, tls);
+}
+
 static uint64_t sc_wait4(uint64_t pid, uint64_t status_ptr, uint64_t options,
                          uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)options; (void)u4; (void)u5; (void)u6;
@@ -610,18 +622,22 @@ static uint64_t sc_wait4(uint64_t pid, uint64_t status_ptr, uint64_t options,
 
 static uint64_t sc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp,
                           uint64_t u4, uint64_t u5, uint64_t u6) {
-    (void)uenvp; (void)u4; (void)u5; (void)u6;
+    (void)u4; (void)u5; (void)u6;
     char kpath[MAX_PATH_LENGTH];
     if (fetch_user_path(upath, kpath, sizeof(kpath)) < 0) return -L_EINVAL;
 
-    /* Snapshot argv into kernel memory: the user image is torn down by
-     * exec before the new one is mapped. */
-    const int MAX_ARGS = 8;
-    char (*bufs)[96] = kmalloc((size_t)MAX_ARGS * 96);
-    char** ptrs = kmalloc(((size_t)MAX_ARGS + 1) * sizeof(char*));
-    if (bufs == NULL || ptrs == NULL) {
+    /* Snapshot argv AND envp into kernel memory: the user image is torn
+     * down by exec before the new one is mapped. */
+    const int MAX_ARGS = 32;
+    char (*bufs)[96]  = kmalloc((size_t)MAX_ARGS * 96);
+    char (*ebufs)[96] = kmalloc((size_t)MAX_ARGS * 96);
+    char** ptrs  = kmalloc(((size_t)MAX_ARGS + 1) * sizeof(char*));
+    char** eptrs = kmalloc(((size_t)MAX_ARGS + 1) * sizeof(char*));
+    if (bufs == NULL || ebufs == NULL || ptrs == NULL || eptrs == NULL) {
         if (bufs) kfree(bufs);
+        if (ebufs) kfree(ebufs);
         if (ptrs) kfree(ptrs);
+        if (eptrs) kfree(eptrs);
         return -L_ENOMEM;
     }
 
@@ -644,9 +660,24 @@ static uint64_t sc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp,
     }
     ptrs[argc] = NULL;
 
-    int rc = exec_replace(lnx_frame_rsp, kpath, ptrs, argc);
+    int envc = 0;
+    if (uenvp != 0) {
+        for (; envc < MAX_ARGS; envc++) {
+            if (!process_check_user_range(uenvp + (uint64_t)envc * 8, 8)) break;
+            uint64_t p;
+            memcpy(&p, (const void*)(uenvp + (uint64_t)envc * 8), sizeof(p));
+            if (p == 0) break;
+            if (fetch_user_path(p, ebufs[envc], 96) < 0) break;
+            eptrs[envc] = ebufs[envc];
+        }
+    }
+    eptrs[envc] = NULL;
+
+    int rc = exec_replace(lnx_frame_rsp, kpath, ptrs, argc, eptrs, envc);
     kfree(bufs);
+    kfree(ebufs);
     kfree(ptrs);
+    kfree(eptrs);
     if (rc != 0) return -L_ENOENT;
     return 0;   /* frame rewritten: the epilogue enters the new image */
 }
@@ -767,22 +798,23 @@ static uint64_t sc_brk(uint64_t addr,
                        uint64_t u2, uint64_t u3, uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
     process_t* proc = process_get_current();
-    if (proc == NULL) return -L_ENOMEM;
-    if (proc->brk_start == 0) return -L_ENOMEM;   /* not an ELF process */
+    if (proc == NULL || proc->mm == NULL) return -L_ENOMEM;
+    mm_t* mm = proc->mm;
+    if (mm->brk_start == 0) return -L_ENOMEM;   /* not an ELF process */
 
-    if (addr == 0 || addr < proc->brk_start || addr > UVM_BRK_LIMIT) {
-        return proc->brk_cur;
+    if (addr == 0 || addr < mm->brk_start || addr > UVM_BRK_LIMIT) {
+        return mm->brk_cur;
     }
 
-    if (addr > proc->brk_cur) {
-        if (uvm_map_range(proc, proc->brk_cur, addr, UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
-            return proc->brk_cur;
+    if (addr > mm->brk_cur) {
+        if (uvm_map_range(proc, mm->brk_cur, addr, UVM_PROT_READ | UVM_PROT_WRITE) != 0) {
+            return mm->brk_cur;
         }
-    } else if (addr < proc->brk_cur) {
-        uvm_unmap_range(proc, addr, proc->brk_cur);
+    } else if (addr < mm->brk_cur) {
+        uvm_unmap_range(proc, addr, mm->brk_cur);
     }
-    proc->brk_cur = addr;
-    return proc->brk_cur;
+    mm->brk_cur = addr;
+    return mm->brk_cur;
 }
 
 static uint64_t sc_readlink(uint64_t upath, uint64_t ubuf, uint64_t size,
@@ -802,7 +834,7 @@ static uint64_t sc_gettid(uint64_t u1, uint64_t u2, uint64_t u3,
                           uint64_t u4, uint64_t u5, uint64_t u6) {
     (void)u1; (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
     process_t* proc = process_get_current();
-    return proc ? proc->pid : 0;
+    return proc ? proc->tid : 0;
 }
 
 /* Single-threaded, no signals: succeed without doing anything */
@@ -832,26 +864,125 @@ static uint64_t sc_getuid_like(uint64_t u1, uint64_t u2, uint64_t u3,
     return 0;   /* root */
 }
 
-/* futex(2): Phase 3.2 minimal. Programs are single-threaded, so only
- * the uncontended paths are exercised: WAIT would only be called when
- * another thread should wake us (impossible here), WAKE wakes nothing. */
-#define LNX_FUTEX_WAIT 0
-#define LNX_FUTEX_WAKE 1
+/* --- futex (P1.3 rewrite) --------------------------------------------------
+ * Hashed waiter registry; each waiter parks on its OWN private wait queue
+ * so a timeout timer can only ever wake its owner (no cross-waiter
+ * pollution when WAKE and a deadline race). Wake flavor is always
+ * WAIT_COMPLETE: futex returns 0 when woken, -ETIMEDOUT on deadline. */
+#define LNX_FUTEX_PRIVATE 128
+#define LNX_FUTEX_WAIT    0
+#define LNX_FUTEX_WAKE    1
+#define L_EFAULT  14
+#define L_ETIMEDOUT 110
+
+typedef struct futex_waiter {
+    uint64_t uaddr;
+    process_t* proc;
+    wait_queue_t wq;             /* private; holds exactly proc */
+    struct futex_waiter* bnext;
+} futex_waiter_t;
+
+#define FUT_HASH 16
+static futex_waiter_t* futex_tab[FUT_HASH];
+
+static inline uint64_t futex_hash(uint64_t uaddr) {
+    return ((uaddr >> 2) ^ (uaddr >> 17)) & (FUT_HASH - 1);
+}
+
+/* WAIT: returns 0, -EAGAIN, -EINVAL or -ETIMEDOUT (via parked frame). */
+static uint64_t futex_wait(uint64_t uaddr, uint32_t val, uint64_t timeout_us) {
+    if (!process_check_user_range(uaddr, 4)) return -L_EINVAL;
+    if (*(volatile uint32_t*)uaddr != val) return -L_EAGAIN;
+
+    process_t* p = process_get_current();
+    futex_waiter_t* w = (futex_waiter_t*)kmalloc(sizeof(futex_waiter_t));
+    if (p == NULL || w == NULL) return -L_ENOMEM;
+    w->uaddr = uaddr;
+    w->proc = p;
+    w->wq.head = w->wq.tail = NULL;
+    w->bnext = NULL;
+
+    uint64_t h = futex_hash(uaddr);
+
+    __asm__ volatile("cli");
+
+    if (timeout_us != 0 &&
+        wait_timer_arm(&w->wq, timeout_us, WAIT_COMPLETE,
+                       (uint64_t)(int64_t)-L_ETIMEDOUT) != 0) {
+        /* Timer pool exhausted: bounded spin, report timeout */
+        __asm__ volatile("sti");
+        kfree(w);
+        uint64_t deadline = pit_uptime_us() + timeout_us;
+        while (pit_uptime_us() < deadline) __asm__ volatile("pause");
+        return (uint64_t)(int64_t)-L_ETIMEDOUT;
+    }
+
+    process_park_entry_frame(p, lnx_frame_rsp, 0, 0);  /* wake => RAX 0 */
+    w->bnext = futex_tab[h];
+    futex_tab[h] = w;
+    p->wait_next = NULL;
+    w->wq.head = w->wq.tail = p;
+    p->state = PROCESS_STATE_BLOCKED;
+    fpu_save(p);
+
+    wait_park_now(p);                    /* never returns */
+}
+
+/* WAKE up to n waiters on uaddr; returns the number woken. Also reaps
+ * stale (timed-out) entries for this address. Exported: used by the
+ * thread-exit path to signal CLONE_CHILD_CLEARTID joiners. */
+int futex_wake_user(uint64_t uaddr, int n) {
+    uint64_t h = futex_hash(uaddr);
+    futex_waiter_t** pp = &futex_tab[h];
+    int woken = 0;
+    while (*pp != NULL) {
+        futex_waiter_t* w = *pp;
+        if (w->uaddr != uaddr) {
+            pp = &w->bnext;
+            continue;
+        }
+        if (w->proc->state == PROCESS_STATE_BLOCKED) {
+            if (n >= 0 && woken >= n) {
+                pp = &w->bnext;
+                continue;
+            }
+            wait_wake_status(&w->wq, 0);
+            *pp = w->bnext;
+            kfree(w);
+            woken++;
+        } else {
+            /* Timed out or already gone: lazy reaper */
+            *pp = w->bnext;
+            kfree(w);
+        }
+    }
+    return woken;
+}
 
 static uint64_t sc_futex(uint64_t uaddr, uint64_t op, uint64_t val,
-                         uint64_t u4, uint64_t u5, uint64_t u6) {
-    (void)u4; (void)u5; (void)u6;
+                         uint64_t utime, uint64_t u5, uint64_t u6) {
+    (void)u5; (void)u6;
     switch (op & 0x7F) {
-    case LNX_FUTEX_WAIT:
-        if (!process_check_user_range(uaddr, 4)) return -L_EINVAL;
-        /* Linux returns EAGAIN when the value raced; otherwise block.
-         * We cannot be raced (no threads), so pretending we were woken
-         * is equivalent to the uncontended fast path. */
-        if (*(volatile uint32_t*)uaddr != (uint32_t)val) return -L_EAGAIN;
-        return 0;
+    case LNX_FUTEX_WAIT: {
+        uint64_t timeout_us = 0;
+        if (utime != 0) {
+            /* user-space struct timespec { i64 sec; i64 nsec } */
+            if (!process_check_user_range(utime, 16)) return -L_EFAULT;
+            int64_t sec, nsec;
+            memcpy(&sec,  (const void*)utime, 8);
+            memcpy(&nsec, (const void*)(utime + 8), 8);
+            if (sec < 0) return (uint64_t)(int64_t)-L_EINVAL;
+            timeout_us = (uint64_t)sec * 1000000ULL +
+                         (uint64_t)nsec / 1000ULL;
+            if (sec != 0 && timeout_us == 0) timeout_us = 1;
+        }
+        return futex_wait(uaddr, (uint32_t)val, timeout_us);
+    }
     case LNX_FUTEX_WAKE:
-        return 0;
+        if (!process_check_user_range(uaddr, 4)) return -L_EFAULT;
+        return (uint64_t)futex_wake_user(uaddr, (int)val);
     default:
+        /* FD, REQUEUE, BITSET, ... : nothing depends on them yet */
         return 0;
     }
 }
@@ -1362,11 +1493,13 @@ static uint64_t sc_getsockopt_stub(uint64_t fd, uint64_t level, uint64_t optname
     return 0;
 }
 
-static uint64_t sc_set_tid_address(uint64_t u1, uint64_t u2, uint64_t u3,
+static uint64_t sc_set_tid_address(uint64_t tidptr, uint64_t u2, uint64_t u3,
                                    uint64_t u4, uint64_t u5, uint64_t u6) {
-    (void)u1; (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
+    (void)u2; (void)u3; (void)u4; (void)u5; (void)u6;
     process_t* proc = process_get_current();
-    return proc ? proc->pid : 0;
+    if (proc == NULL) return 0;
+    proc->clear_child_tid = tidptr;
+    return proc->tid;
 }
 
 static uint64_t sc_exit(uint64_t code, uint64_t u2, uint64_t u3,
@@ -1511,7 +1644,7 @@ void syscall_lnx_init(void) {
     /* Phase 1.5: process syscalls */
     lnx_table[LNX_fork] = sc_fork;
     lnx_table[LNX_vfork] = sc_fork;
-    lnx_table[LNX_clone] = sc_fork;
+    lnx_table[LNX_clone] = sc_clone;
     lnx_table[LNX_wait4] = sc_wait4;
     lnx_table[LNX_execve] = sc_execve;
     lnx_table[LNX_chdir] = sc_chdir;

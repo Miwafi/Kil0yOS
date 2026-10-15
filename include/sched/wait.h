@@ -53,6 +53,10 @@ void wait_wake(wait_queue_t* wq, int max);
 /* Wake the first waiter with ret stored into its parked frame RAX. */
 void wait_wake_status(wait_queue_t* wq, uint64_t ret);
 
+/* Complete a manual park: caller did process_park_entry_frame + set
+ * BLOCKED + fpu_save under cli; this hands the CPU away (noreturn). */
+void wait_park_now(process_t* p) __attribute__((noreturn));
+
 /* Mark a specific process READY (frames untouched). */
 void wait_wake_proc(process_t* p);
 

@@ -43,6 +43,36 @@ typedef struct {
     uint32_t prot;    /* UVM_PROT_* */
 } vm_region_t;
 
+/* --- Shareable process resource groups (P1.3, Linux "clone namespaces") ---
+ * Threads created via clone(CLONE_VM|...) share these objects by
+ * refcount instead of copying. A plain fork deep-copies all of them. */
+
+/* Memory group: address space root + user VM bookkeeping. */
+typedef struct mm_struct {
+    int refs;
+    uint64_t cr3;             /* phys of this mm's PML4 (0 = kernel-shared) */
+    vm_region_t regions[MAX_VM_REGIONS];
+    uint64_t brk_start;       /* heap base = page-aligned end of ELF image */
+    uint64_t brk_cur;         /* current program break */
+    uint64_t mmap_top;        /* bump allocator top of the mmap arena */
+    uint64_t code_base;
+    uint64_t stack_top;
+    uint32_t code_pages;      /* mapped code page count (raw binary path) */
+    uint32_t stack_pages;     /* mapped stack page count */
+} mm_t;
+
+/* File-descriptor group: the unified open-file table (VFS files, sockets,
+ * console ttys are all struct file entries). */
+typedef struct files_struct {
+    int refs;
+    struct file* fds[LNX_MAX_FDS];
+} files_t;
+
+/* Signal-disposition group (stub until Phase 1.5 signals). */
+typedef struct sighand_struct {
+    int refs;
+} sighand_t;
+
 typedef struct user_program_header {
     uint32_t magic;           /* Must be USER_MAGIC */
     uint32_t entry_offset;    /* Entry point offset from code base */
@@ -54,32 +84,26 @@ typedef struct user_program_header {
 
 /* Process control block */
 typedef struct process {
-    uint32_t pid;
+    uint32_t pid;             /* thread-group id (leader tid for threads) */
+    uint32_t tid;             /* kernel thread id (== pid for a leader) */
+    uint32_t tgid;            /* thread-group id (== pid) */
+    int is_thread;            /* clone(CLONE_THREAD) task: never a zombie */
     process_state_t state;
     char name[32];
 
-    /* Memory */
-    uint64_t code_base;
-    uint64_t data_base;
-    uint64_t stack_top;
-    uint32_t code_pages;      /* mapped code page count (raw binary path) */
-    uint32_t stack_pages;     /* mapped stack page count */
-
-    /* User VM (ELF / mmap / brk bookkeeping) */
-    vm_region_t regions[MAX_VM_REGIONS];
-    uint64_t brk_start;       /* heap base = page-aligned end of ELF image */
-    uint64_t brk_cur;         /* current program break */
-    uint64_t mmap_top;        /* bump allocator top of the mmap arena */
-    uint64_t fs_base;         /* ARCH_SET_FS value (TLS pointer) */
+    /* Memory group (shared by CLONE_VM threads) */
+    mm_t* mm;
 
     /* Execution context */
     uint64_t entry_point;
     uint64_t user_rsp;        /* initial user RSP (ELF path: argc/auxv block) */
     uint64_t kernel_stack;    /* Kernel stack for syscalls */
+    uint64_t fs_base;         /* TLS pointer (arch_prctl / CLONE_SETTLS) */
+    uint64_t clear_child_tid; /* CLONE_CHILD_CLEARTID target (0 = none) */
 
     /* Scheduling */
     uint64_t ticks_remaining;
-    uint64_t total_ticks;
+    uint64_t ticks_used;
 
     /* Termination */
     int exit_status;
@@ -87,14 +111,14 @@ typedef struct process {
     /* File system */
     int current_dir_cluster;
 
-    /* Unified open-file table (P1.2): VFS files, sockets and the console
-     * ttys are all struct file entries, refcount-shared across fork. */
-    struct file* fds[LNX_MAX_FDS];
+    /* File-descriptor group (shared by CLONE_FILES threads) */
+    files_t* files;
 
-    /* Address space + fork/wait state (Phase 1.5). cr3 is the phys of
-     * this process's PML4 (0 = legacy kernel-shared). parked_rsp holds a
-     * resumable IRQ-frame while the process is blocked (wait4). */
-    uint64_t cr3;
+    /* Signal-disposition group (shared by CLONE_SIGHAND threads) */
+    sighand_t* sighand;
+
+    /* fork/wait state (Phase 1.5). parked_rsp holds a resumable
+     * IRQ-frame while the process is blocked (wait4). */
     uint64_t parked_rsp;
     int parent_pid;
     int wait_pid;             /* -1 = any child */
@@ -156,13 +180,24 @@ int exec_load_program(const char* path, char* const* argv, int argc);
 /* execve (Phase 1.5): replace the CURRENT process image with a new ELF.
  * frame_rsp points at the live syscall-entry frame; on success its
  * RIP/RSP/RAX fields are rewritten so the syscall epilogue's iretq lands
- * directly in the new program. Returns 0, or -1 (old image intact). */
+ * directly in the new program. envp may be NULL (default PATH is set).
+ * Returns 0, or -1 (old image intact). */
 int exec_replace(uint64_t frame_rsp, const char* path,
-                 char* const* argv, int argc);
+                 char* const* argv, int argc,
+                 char* const* envp, int envc);
 
 /* fork/wait4 (Phase 1.5). frame_rsp points at the caller's syscall-entry
  * frame holding the user context to clone / park. */
 int  process_fork(uint64_t frame_rsp);
+
+/* clone (P1.3): create a thread or process sharing resource groups per
+ * the given Linux clone flags. Returns the child tid or -1. */
+int process_clone(uint64_t frame_rsp, uint64_t flags, uint64_t child_stack,
+                  uint64_t parent_tidptr, uint64_t child_tidptr, uint64_t tls);
+
+/* Apply the process's TLS pointer to the live CPU (call at every
+ * user-context resume point, next to fpu_restore). */
+void process_apply_fs_base(process_t* p);
 void process_wait_run(process_t* child, uint64_t status_ptr, uint64_t frame_rsp);
 process_t* process_find_waiter(int child_pid);
 process_t* process_find_child(process_t* parent, int pid);
@@ -171,8 +206,9 @@ process_t* process_find_child(process_t* parent, int pid);
 void process_write_user_int(process_t* p, uint64_t uaddr, int val);
 
 /* Scheduler helper: another READY process holding a parked user frame
- * (fork child / preempted parent), or NULL. */
-process_t* process_pick_ready(uint32_t exclude_pid);
+ * (fork child / preempted process / thread), or NULL. exclude names the
+ * process to skip (NULL = none). */
+process_t* process_pick_ready(process_t* exclude);
 
 /* Scheduler hook: mark the given process RUNNING and current */
 void process_become_current(process_t* proc);

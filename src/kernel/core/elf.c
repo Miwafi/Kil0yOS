@@ -174,7 +174,7 @@ static int elf_load_at(process_t* proc, const uint8_t* data, size_t size,
         /* Walk the process root while resolving segment pages (see
          * elf_copy_segment); the CPU CR3 itself stays untouched. */
         uint64_t saved_root = vmm_current_root();
-        if (proc->cr3) vmm_set_root_ptr(proc->cr3);
+        if (proc->mm && proc->mm->cr3) vmm_set_root_ptr(proc->mm->cr3);
         int crc = elf_copy_segment(data, p, bias);
         vmm_set_root_ptr(saved_root);
         if (crc != 0) return ELF_ERR_MAP;

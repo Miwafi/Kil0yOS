@@ -89,14 +89,14 @@ int file_close(struct file* f) {
     return r;
 }
 
-/* --- per-process fd table -------------------------------------------------- */
+/* --- per-process fd table (files_t group, P1.3) ---------------------------- */
 
 int fd_install(struct file* f) {
     process_t* proc = process_get_current();
-    if (proc == NULL || f == NULL) return -1;
+    if (proc == NULL || proc->files == NULL || f == NULL) return -1;
     for (int fd = 0; fd < LNX_MAX_FDS; fd++) {
-        if (proc->fds[fd] == NULL) {
-            proc->fds[fd] = f;
+        if (proc->files->fds[fd] == NULL) {
+            proc->files->fds[fd] = f;
             return fd;
         }
     }
@@ -105,16 +105,18 @@ int fd_install(struct file* f) {
 
 struct file* fd_get_file(int fd) {
     process_t* proc = process_get_current();
-    if (proc == NULL || fd < 0 || fd >= LNX_MAX_FDS) return NULL;
-    return proc->fds[fd];
+    if (proc == NULL || proc->files == NULL || fd < 0 || fd >= LNX_MAX_FDS)
+        return NULL;
+    return proc->files->fds[fd];
 }
 
 int fd_close(int fd) {
     process_t* proc = process_get_current();
-    if (proc == NULL || fd < 0 || fd >= LNX_MAX_FDS) return -9;
-    struct file* f = proc->fds[fd];
+    if (proc == NULL || proc->files == NULL || fd < 0 || fd >= LNX_MAX_FDS)
+        return -9;
+    struct file* f = proc->files->fds[fd];
     if (f == NULL) return -9;               /* -EBADF */
-    proc->fds[fd] = NULL;
+    proc->files->fds[fd] = NULL;
     return file_close(f);
 }
 
@@ -131,33 +133,52 @@ int fd_dup2(int fd, int fd2) {
     if (fd2 < 0 || fd2 >= LNX_MAX_FDS) return -9;
     fd_close(fd2);
     process_t* proc = process_get_current();
-    if (proc == NULL) return -9;
-    proc->fds[fd2] = file_ref(f);
+    if (proc == NULL || proc->files == NULL) return -9;
+    proc->files->fds[fd2] = file_ref(f);
     return fd2;
 }
 
 void fd_table_init(struct process* p) {
     if (p == NULL) return;
-    for (int i = 0; i < LNX_MAX_FDS; i++) p->fds[i] = NULL;
+    p->files = (files_t*)kmalloc(sizeof(files_t));
+    if (p->files == NULL) return;
+    p->files->refs = 1;
+    for (int i = 0; i < LNX_MAX_FDS; i++) p->files->fds[i] = NULL;
     for (int i = 0; i < 3; i++) {
         struct file* f = file_new(FILE_T_TTY, &tty_ops, NULL);
         if (f == NULL) return;
-        p->fds[i] = f;
+        p->files->fds[i] = f;
     }
 }
 
+/* fork: child gets its own copy of the fd table (each entry ref'd) */
 void fd_table_fork(struct process* parent, struct process* child) {
     if (parent == NULL || child == NULL) return;
+    child->files = (files_t*)kmalloc(sizeof(files_t));
+    if (child->files == NULL) return;
+    child->files->refs = 1;
     for (int i = 0; i < LNX_MAX_FDS; i++) {
-        child->fds[i] = file_ref(parent->fds[i]);
+        child->files->fds[i] = file_ref(parent->files->fds[i]);
     }
 }
 
+/* clone(CLONE_FILES): child shares the parent's fd table by refcount */
+void fd_table_share(struct process* parent, struct process* child) {
+    if (parent == NULL || child == NULL || parent->files == NULL) return;
+    child->files = parent->files;
+    child->files->refs++;
+}
+
+/* Drop the caller's reference to its fd group; the last reference
+ * closes every file still open in the table. */
 void fd_table_exit(struct process* p) {
-    if (p == NULL) return;
+    if (p == NULL || p->files == NULL) return;
+    files_t* t = p->files;
+    p->files = NULL;
+    if (--t->refs > 0) return;
     for (int i = 0; i < LNX_MAX_FDS; i++) {
-        struct file* f = p->fds[i];
-        p->fds[i] = NULL;
+        struct file* f = t->fds[i];
         if (f) file_close(f);
     }
+    kfree(t);
 }
