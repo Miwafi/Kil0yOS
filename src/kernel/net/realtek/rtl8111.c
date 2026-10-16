@@ -1,12 +1,17 @@
-/* RTL8111F (Realtek RTL8168/8111 PCIe Gigabit) driver.
+/* RTL8111F/G (Realtek RTL8168/8111 PCIe Gigabit) driver.
  *
- * Chip interface follows the Linux r8169 driver (project-local copy at
- * LinuxSample/linux-master/drivers/net/ethernet/realtek/r8169_main.c):
- * MMIO BAR0, 16-byte TX/RX descriptors, ChipCmd reset, NPQ TX kick, and the
- * RTL8111F-specific init workarounds (ERI register sequence + EPHY patch
- * table from rtl_hw_start_8168f/rtl_hw_start_8168f_1). ASPM/CLKREQ are kept
- * disabled on both the chip and the PCIe link control - r8169 documents ASPM
- * as a typical cause of tx timeouts / dead devices on this family.
+ * Programming interface follows the Linux r8169 driver (project-local copy
+ * at LinuxSample/linux-master/drivers/net/ethernet/realtek/r8169_main.c):
+ * MMIO BAR0, 16-byte TX/RX descriptors, ChipCmd reset, NPQ TX kick, and
+ * per-family init workarounds (ERI register sequence + EPHY patch table
+ * selected by xid at probe). ASPM/CLKREQ are kept disabled on both the
+ * chip and the PCIe link control - r8169 documents ASPM as a typical
+ * cause of tx timeouts / dead devices on this family.
+ *
+ * Currently supports:
+ *   RTL8111F / MAC_VER_35/36 (xid 0x480/0x481)  - rtl_hw_start_8168f
+ *   RTL8111GN / MAC_VER_40   (xid 0x4c0)        - rtl_hw_start_8168g + ephy_g_1
+ *   RTL8111GU / MAC_VER_42   (xid 0x509)        - rtl_hw_start_8168g + ephy_g_2
  *
  * Modelled after e1000.c (MMIO + descriptor rings + sync TX wait) and
  * rtl8139.c (netif hookups, IRQ-in-handler EOI, polling fallback).
@@ -21,6 +26,8 @@
 #include "core/interrupts.h"
 #include "core/isr.h"
 #include "lib/string.h"
+#include "lib/stdlib.h"
+#include <stdarg.h>
 
 #define NUM_TX 16
 #define NUM_RX 16
@@ -36,6 +43,9 @@
 
 static volatile uint8_t* mmio8 = NULL;
 static uint8_t rtl8111_irq = 0;
+
+/* Scratch buffer for ksprintf-formatted diagnostics (single-threaded init path). */
+static char rtl8111_tmp[128];
 
 static rtl8111_desc_t* tx_descs = NULL;
 static void* tx_ring_raw = NULL;
@@ -129,6 +139,275 @@ static void rtl8111_ephy_init_8168f_1(void) {
     }
 }
 
+/* rtl_ephy_init(r8169 e_info_8168g_1): RTL8111GN (MAC_VER_40, xid 0x4c0) */
+static void rtl8111_ephy_init_8168g_1(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x00, 0x0008, 0x0000 },
+        { 0x0c, 0x3ff0, 0x0820 },
+        { 0x1e, 0x0000, 0x0001 },
+        { 0x19, 0x8000, 0x0000 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8168g_2): RTL8111GU (MAC_VER_42, xid 0x509) */
+static void rtl8111_ephy_init_8168g_2(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x00, 0x0008, 0x0000 },
+        { 0x0c, 0x3ff0, 0x0820 },
+        { 0x19, 0xffff, 0x7c00 },
+        { 0x1e, 0xffff, 0x20eb },
+        { 0x0d, 0xffff, 0x1666 },
+        { 0x00, 0xffff, 0x10a3 },
+        { 0x06, 0xffff, 0xf050 },
+        { 0x04, 0x0000, 0x0010 },
+        { 0x1d, 0x4000, 0x0000 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8168d_4): RTL8168dp/8111dp (MAC_VER_28/31) */
+static void rtl8111_ephy_init_8168d_4(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x0b, 0x0000, 0x0048 },
+        { 0x19, 0x0020, 0x0050 },
+        { 0x0c, 0x0100, 0x0020 },
+        { 0x10, 0x0004, 0x0000 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8168e_1): RTL8168e/8111e (MAC_VER_32/33) */
+static void rtl8111_ephy_init_8168e_1(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x00, 0x0200, 0x0100 },
+        { 0x00, 0x0000, 0x0004 },
+        { 0x06, 0x0002, 0x0001 },
+        { 0x06, 0x0000, 0x0030 },
+        { 0x07, 0x0000, 0x2000 },
+        { 0x00, 0x0000, 0x0020 },
+        { 0x03, 0x5800, 0x2000 },
+        { 0x03, 0x0000, 0x0001 },
+        { 0x01, 0x0800, 0x1000 },
+        { 0x07, 0x0000, 0x4000 },
+        { 0x1e, 0x0000, 0x2000 },
+        { 0x19, 0xffff, 0xfe6c },
+        { 0x0a, 0x0000, 0x0040 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8168e_2): RTL8168evl/8111evl (MAC_VER_34) */
+static void rtl8111_ephy_init_8168e_2(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x09, 0x0000, 0x0080 },
+        { 0x19, 0x0000, 0x0224 },
+        { 0x00, 0x0000, 0x0004 },
+        { 0x0c, 0x3df0, 0x0200 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8411): RTL8411 (MAC_VER_38) */
+static void rtl8111_ephy_init_8411(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x06, 0x00c0, 0x0020 },
+        { 0x0f, 0xffff, 0x5200 },
+        { 0x19, 0x0000, 0x0224 },
+        { 0x00, 0x0000, 0x0008 },
+        { 0x0c, 0x3df0, 0x0200 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8411_2): RTL8411b (MAC_VER_44) */
+static void rtl8111_ephy_init_8411b(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x00, 0x0008, 0x0000 },
+        { 0x0c, 0x37d0, 0x0820 },
+        { 0x1e, 0x0000, 0x0001 },
+        { 0x19, 0x8021, 0x0000 },
+        { 0x1e, 0x0000, 0x2000 },
+        { 0x0d, 0x0100, 0x0200 },
+        { 0x00, 0x0000, 0x0080 },
+        { 0x06, 0x0000, 0x0010 },
+        { 0x04, 0x0000, 0x0010 },
+        { 0x1d, 0x0000, 0x4000 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8168h_1): RTL8168h/8111h/M (MAC_VER_46) */
+static void rtl8111_ephy_init_8168h_1(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x1e, 0x0800, 0x0001 },
+        { 0x1d, 0x0000, 0x0800 },
+        { 0x05, 0xffff, 0x2089 },
+        { 0x06, 0xffff, 0x5881 },
+        { 0x04, 0xffff, 0x854a },
+        { 0x01, 0xffff, 0x068b },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8168ep_3): RTL8168ep/8111ep (MAC_VER_51, 实体机 RTL8111GN 最可能是这个!) */
+static void rtl8111_ephy_init_8168ep_3(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x00, 0x0000, 0x0080 },
+        { 0x0d, 0x0100, 0x0200 },
+        { 0x19, 0x8021, 0x0000 },
+        { 0x1e, 0x0000, 0x2000 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_ephy_init(r8169 e_info_8117): RTL8168fp/8117 (MAC_VER_52) */
+static void rtl8111_ephy_init_8117(void) {
+    static const struct { uint8_t reg; uint16_t mask, bits; } table[] = {
+        { 0x19, 0x0040, 0x1100 },
+        { 0x59, 0x0040, 0x1100 },
+    };
+    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint16_t w = (rtl8111_ephy_read(table[i].reg) & ~table[i].mask) | table[i].bits;
+        rtl8111_ephy_write(table[i].reg, w);
+    }
+}
+
+/* rtl_hw_start_8168g (r8169): RTL8168G/8111G MAC init sequence.
+ * Key differences from 8168F: FIFO sizes 0x08/0x10 instead of 0x10/0x10,
+ * pause thresholds set via ERI 0xcc/0xd0 (these are the FINAL values - do
+ * NOT overwrite them). ERI 0x2f8 magic write, RXDV gate disabled (MISC bit
+ * 19), Config3 L2/L3 disabled. */
+static void rtl8111_hw_start_8168g(void) {
+    /* rtl_set_fifo_size(0x08, 0x10, 0x02, 0x06) */
+    rtl8111_eri_write(0xc8, R8168_ERI_MASK_1111, (0x08 << 16) | 0x02);
+    rtl8111_eri_write(0xe8, R8168_ERI_MASK_1111, (0x10 << 16) | 0x06);
+    /* rtl8168g_set_pause_thresholds(0x38, 0x48) - final values, not ASPM! */
+    rtl8111_eri_write(0xcc, R8168_ERI_MASK_0001, 0x38);
+    rtl8111_eri_write(0xd0, R8168_ERI_MASK_0001, 0x48);
+    /* rtl_reset_packet_filter: clear then set ERI 0xdc bit0 */
+    rtl8111_eri_w0w1(0xdc, 0, 1 << 0);
+    rtl8111_eri_w0w1(0xdc, 1 << 0, 0);
+    /* ERI magic for 8168G family */
+    rtl8111_eri_write(0x2f8, R8168_ERI_MASK_0011, 0x1d8f);
+    /* rtl_disable_rxdvgate: clear MISC bit 19 (RXDV_GATED_EN) */
+    wr32(R8168_MISC, rd32(R8168_MISC) & ~R8168_MISC_RXDVGATE);
+    rtl8111_eri_write(0xc0, R8168_ERI_MASK_0011, 0x0000);
+    rtl8111_eri_write(0xb8, R8168_ERI_MASK_0011, 0x0000);
+    /* rtl_w0w1_eri(0x2fc, 0x01, 0x06) */
+    rtl8111_eri_w0w1(0x2fc, 0x01, 0x06);
+    /* rtl_eri_clear_bits(0x1b0, BIT(12)) */
+    rtl8111_eri_w0w1(0x1b0, 0, 1 << 12);
+    /* rtl_pcie_state_l2l3_disable: clear Config3 Rdy_to_L23 */
+    wr8(R8168_CONFIG3, rd8(R8168_CONFIG3) & ~(uint8_t)R8168_CFG3_RDY_L23);
+}
+
+/* rtl_hw_start_8168ep (r8169 base for VER_51/52): EP/FP family.
+ * Similar to 8168g but with different pause thresholds (0x2f/0x5f). */
+static void rtl8111_hw_start_8168ep(void) {
+    rtl8111_eri_write(0xc8, R8168_ERI_MASK_1111, (0x08 << 16) | 0x02);
+    rtl8111_eri_write(0xe8, R8168_ERI_MASK_1111, (0x10 << 16) | 0x06);
+    /* Pause thresholds for EP/FP family: 0x2f low, 0x5f high */
+    rtl8111_eri_write(0xcc, R8168_ERI_MASK_0001, 0x2f);
+    rtl8111_eri_write(0xd0, R8168_ERI_MASK_0001, 0x5f);
+    rtl8111_eri_w0w1(0xdc, 0, 1 << 0);
+    rtl8111_eri_w0w1(0xdc, 1 << 0, 0);
+    rtl8111_eri_write(0x5f0, R8168_ERI_MASK_0011, 0x4f87);
+    wr32(R8168_MISC, rd32(R8168_MISC) & ~R8168_MISC_RXDVGATE);
+    rtl8111_eri_write(0xc0, R8168_ERI_MASK_0011, 0x0000);
+    rtl8111_eri_write(0xb8, R8168_ERI_MASK_0011, 0x0000);
+    rtl8111_eri_w0w1(0x2fc, 0x01, 0x06);
+    wr8(R8168_CONFIG3, rd8(R8168_CONFIG3) & ~(uint8_t)R8168_CFG3_RDY_L23);
+}
+
+/* rtl_hw_start_8168h_1 extra ERI for H-family (VER_46): same base as G,
+ * additional 0xdc bit set, 0x5f0 write, DLLPR PFM off */
+static void rtl8111_hw_start_8168h_extras(void) {
+    /* rtl_eri_set_bits(tp, 0xdc, 0x001c): set bits 2,3,4 of 0xdc */
+    rtl8111_eri_w0w1(0xdc, (1 << 2) | (1 << 3) | (1 << 4), 0);
+    rtl8111_eri_write(0x5f0, R8168_ERI_MASK_0011, 0x4f87);
+    rtl8111_eri_w0w1(0x1b0, 0, 1 << 12);
+    /* DLLPR &= ~PFM_EN (0x06) */
+    wr8(R8168_DLLPR, rd8(R8168_DLLPR) & ~(uint8_t)R8168_DLLPR_PFM_EN);
+}
+
+/* hw_start_8117 extra ERI for FP family (VER_52): 0xd4 bit set */
+static void rtl8111_hw_start_8117_extras(void) {
+    rtl8111_eri_w0w1(0xd4, 1 << 4, 0);
+}
+
+/* rtl_hw_start_8168e_2 (VER_34): VER_32-34 share this base, FIFO same as F
+ * but pause thresholds are unique. */
+static void rtl8111_hw_start_8168e_2(void) {
+    rtl8111_eri_write(0xc0, R8168_ERI_MASK_0011, 0x0000);
+    rtl8111_eri_write(0xb8, R8168_ERI_MASK_1111, 0x0000);
+    rtl8111_eri_write(0xc8, R8168_ERI_MASK_1111, (0x10 << 16) | 0x02);
+    rtl8111_eri_write(0xe8, R8168_ERI_MASK_1111, (0x10 << 16) | 0x06);
+    rtl8111_eri_w0w1(0x1d0, 1 << 1, 0);
+    rtl8111_eri_w0w1(0xdc, 0, 1 << 0);
+    rtl8111_eri_w0w1(0xdc, 1 << 0, 0);
+    rtl8111_eri_w0w1(0x1b0, 1 << 4, 0);
+    rtl8111_eri_write(0xcc, R8168_ERI_MASK_1111, 0x00000050);
+    rtl8111_eri_write(0xd0, R8168_ERI_MASK_1111, 0x07ff0060);
+}
+
+/* rtl_hw_start_8168d (VER_25/26): very old MAC, minimal init */
+static void rtl8111_hw_start_8168d(void) {
+    /* rtl_disable_clock_request: clear Config2 CLKREQ */
+    wr8(R8168_CONFIG2, rd8(R8168_CONFIG2) & ~(uint8_t)R8168_CFG2_CLKREQ_EN);
+}
+
+/* rtl_hw_start_8168d_4 (VER_28/31): ephy + enable clock request */
+static void rtl8111_hw_start_8168d_4(void) {
+    wr8(R8168_CONFIG2, rd8(R8168_CONFIG2) | (uint8_t)R8168_CFG2_CLKREQ_EN);
+}
+
+/* Low-power knobs common to ALL G/F family variants (PFM_EN on, SPI_EN off).
+ * H-family is the ONLY exception - hw_start_8168h_1 explicitly clears
+ * DLLPR PFM_EN and must NOT have a generic lowpower block afterwards. */
+static void rtl8111_hw_lowpower_generic(void) {
+    wr8(R8168_MCU, rd8(R8168_MCU) & ~(uint8_t)R8168_MCU_NOW_IS_OOB);
+    wr8(R8168_DLLPR, rd8(R8168_DLLPR) | R8168_DLLPR_PFM_EN);
+    wr32(R8168_MISC, rd32(R8168_MISC) | R8168_MISC_PWM_EN);
+    wr8(R8168_CONFIG5, rd8(R8168_CONFIG5) & ~(uint8_t)R8168_CFG5_SPI_EN);
+}
+
+/* Low-power knobs for H-family - hw_start_8168h_extras() clears DLLPR PFM_EN
+ * explicitly, so we omit the generic DLLPR write here. We DO still set the
+ * other common knobs. */
+static void rtl8111_hw_lowpower_h(void) {
+    wr8(R8168_MCU, rd8(R8168_MCU) & ~(uint8_t)R8168_MCU_NOW_IS_OOB);
+    wr32(R8168_MISC, rd32(R8168_MISC) | R8168_MISC_PWM_EN);
+    wr8(R8168_CONFIG5, rd8(R8168_CONFIG5) & ~(uint8_t)R8168_CFG5_SPI_EN);
+}
+
 /* Clear ASPM L0s/L1 and CLKREQ in the PCIe Link Control register.
  * r8169 comment: "ASPM compatibility issues are a typical reason for tx
  * timeouts"; pci_disable_link_state(PCIE_LINK_STATE_L1) at probe. */
@@ -148,9 +427,6 @@ static void rtl8111_pcie_disable_aspm(uint16_t bus, uint16_t device, uint16_t fn
 
 /* rtl_hw_start_8168f (r8169): ERI workaround sequence for the 8168F MAC */
 static void rtl8111_hw_start_8168f(void) {
-    /* rtl_set_def_aspm_entry_latency: L0 7us, L1 16us (0x27) */
-    rtl8111_eri_write(0xcc, R8168_ERI_MASK_0001, 0x27);
-    rtl8111_eri_write(0xd0, R8168_ERI_MASK_0001, 0x00);
     rtl8111_eri_write(0xc0, R8168_ERI_MASK_0011, 0x0000);
     rtl8111_eri_write(0xb8, R8168_ERI_MASK_1111, 0x0000);
     /* rtl_set_fifo_size(0x10, 0x10, 0x02, 0x06) - pairs with TXCFG_AUTO_FIFO */
@@ -161,6 +437,7 @@ static void rtl8111_hw_start_8168f(void) {
     rtl8111_eri_w0w1(0xdc, 1 << 0, 0);
     rtl8111_eri_w0w1(0x1b0, 1 << 4, 0);
     rtl8111_eri_w0w1(0x1d0, (1 << 4) | (1 << 1), 0);
+    /* Final pause thresholds for F-family */
     rtl8111_eri_write(0xcc, R8168_ERI_MASK_1111, 0x00000050);
     rtl8111_eri_write(0xd0, R8168_ERI_MASK_1111, 0x00000060);
 }
@@ -270,6 +547,42 @@ int rtl8111_send(const uint8_t* data, uint16_t len) {
     return 0;
 }
 
+/* Per-xid detection dispatch. xid = (TxConfig >> 20) & 0xfcf.
+ * All chips share PCI ID 0x10ec:0x8168, xid is the version key.
+ * Falls back to G-family (most recent) when unknown - better compatibility
+ * than F-family on brand-new revs. */
+static struct rtl_chip_id rtl_xid_detect(uint32_t xid) {
+    switch (xid) {
+        /* --- D-family (VER_25..31, oldest) --- */
+        case RTL_XID_D1:  return (struct rtl_chip_id){ RTL_MAC_D, RTL_HW_D,      "RTL8168d/8111d"   };
+        case RTL_XID_D2:  return (struct rtl_chip_id){ RTL_MAC_D, RTL_HW_D,      "RTL8168d/8111d"   };
+        case RTL_XID_DP1: return (struct rtl_chip_id){ RTL_MAC_D, RTL_HW_DP4,    "RTL8168dp/8111dp" };
+        case RTL_XID_DP2: return (struct rtl_chip_id){ RTL_MAC_D, RTL_HW_DP4,    "RTL8168dp/8111dp" };
+        /* --- F-family (VER_32..38) --- */
+        case RTL_XID_E1:  return (struct rtl_chip_id){ RTL_MAC_F, RTL_HW_E,      "RTL8168e/8111e"   };
+        case RTL_XID_E2:  return (struct rtl_chip_id){ RTL_MAC_F, RTL_HW_E,      "RTL8168e/8111e"   };
+        case RTL_XID_EVL: return (struct rtl_chip_id){ RTL_MAC_F, RTL_HW_EVL,    "RTL8168evl/8111evl" };
+        case RTL_XID_F1:  return (struct rtl_chip_id){ RTL_MAC_F, RTL_HW_F,      "RTL8168f/8111f"   };
+        case RTL_XID_F2:  return (struct rtl_chip_id){ RTL_MAC_F, RTL_HW_F,      "RTL8168f/8111f"   };
+        case RTL_XID_8411:return (struct rtl_chip_id){ RTL_MAC_F, RTL_HW_8411,   "RTL8411"          };
+        /* --- G-family (VER_40..52, newest) --- */
+        case RTL_XID_G:   return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_G_BASE, "RTL8168g/8111g"   };
+        case RTL_XID_GU:  return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_GU,     "RTL8168gu/8111gu" };
+        case RTL_XID_8411B:return(struct rtl_chip_id){ RTL_MAC_G, RTL_HW_8411B,  "RTL8411b"         };
+        case RTL_XID_H1:  return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_H,      "RTL8168h/8111h"   };
+        case RTL_XID_H2:  return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_H,      "RTL8168M"         };
+        case RTL_XID_EP:  return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_EP,     "RTL8168ep/8111ep (GN?)" };
+        case RTL_XID_FP1: return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_FP,     "RTL8168fp/RTL8117" };
+        case RTL_XID_FP2: return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_FP,     "RTL8168fp/RTL8117" };
+        default: {
+            /* Unknown xid - fall back to G-family (most recent rev, widest coverage) */
+            static char unknown[64];
+            ksprintf(unknown, sizeof(unknown), "unknown(0x%x)->G-fallback", (unsigned)xid);
+            return (struct rtl_chip_id){ RTL_MAC_G, RTL_HW_G_BASE, unknown };
+        }
+    }
+}
+
 int rtl8111_init(void) {
     pci_device_t* dev = pci_find_device(RTL8111_VENDOR_ID, RTL8111_DEVICE_ID);
     if (!dev) return -1;
@@ -280,27 +593,63 @@ int rtl8111_init(void) {
     cmd |= 0x0006; /* Memory Space + Bus Master */
     pci_write_word(dev->bus, dev->device, dev->function, PCI_COMMAND_OFFSET, cmd);
 
-    /* Read the 64-bit BAR0 properly (e1000 pattern). RTL8168 BAR0 is MMIO,
-     * BAR1 is I/O - composing BAR1 blindly would corrupt the address. */
-    uint32_t bar0_raw = pci_read_dword(dev->bus, dev->device, dev->function, PCI_BAR0_OFFSET);
-    uint32_t bar1 = pci_read_dword(dev->bus, dev->device, dev->function, PCI_BAR1_OFFSET);
-    if (bar0_raw == 0 || bar0_raw == 0xFFFFFFFF) {
-        rtl8111_log("bad BAR0");
+    /* Dump BAR0..BAR5 raw values - CRITICAL for diagnosing "BAR0 is I/O"
+     * type mismatches. Realtek PCIe devices ALWAYS have at least one MMIO
+     * BAR; which one it is depends on the chip revision/BIOS assignment. */
+    for (int i = 0; i < 6; i++) {
+        uint32_t raw = pci_read_dword(dev->bus, dev->device, dev->function,
+                                       PCI_BAR0_OFFSET + i * 4);
+        klog_hex("[rtl8111] BAR", (uint64_t)i);
+        klog_hex("  raw ", raw);
+    }
+
+    /* Search BAR0..BAR5 for the first MEMORY BAR (bit 0 clear).
+     * Some RTL8168 variants use BAR0 as I/O and BAR2 as MMIO, or the BIOS
+     * may remap the layout; never assume BAR0 == MMIO.
+     *
+     * PCI Memory BAR encoding (low 4 bits):
+     *   bit 0 = 0 (memory), bits [2:1] = 00 (32b) or 10 (64b)
+     * PCI I/O BAR encoding:
+     *   bit 0 = 1
+     */
+    uint32_t bar0_raw = 0, bar1 = 0;
+    int bar_index = -1;
+    for (int i = 0; i < 6; i++) {
+        uint32_t raw = pci_read_dword(dev->bus, dev->device, dev->function,
+                                       PCI_BAR0_OFFSET + i * 4);
+        if (raw == 0 || raw == 0xFFFFFFFF) continue;       /* unused BAR */
+        if (raw & 0x1) continue;                            /* I/O BAR, skip */
+        bar0_raw = raw;
+        bar_index = i;
+        /* 64-bit memory BAR? bits [2:1] == 10 */
+        if ((raw & 0x6) == 0x4 && i < 5) {
+            bar1 = pci_read_dword(dev->bus, dev->device, dev->function,
+                                   PCI_BAR0_OFFSET + (i + 1) * 4);
+            if (bar1 == 0xFFFFFFFF) {
+                ksprintf(rtl8111_tmp, sizeof(rtl8111_tmp),
+                          "BAR%d bad upper half", i);
+                rtl8111_log(rtl8111_tmp);
+                return -1;
+            }
+        } else {
+            bar1 = 0;
+        }
+        break;
+    }
+    if (bar_index < 0) {
+        rtl8111_log("no usable MMIO BAR found in BAR0..5");
         return -1;
     }
-    if (bar0_raw & 0x1) {
-        rtl8111_log("BAR0 is I/O space, no MMIO access");
-        return -1;
-    }
+    ksprintf(rtl8111_tmp, sizeof(rtl8111_tmp),
+             "using BAR%d (raw=0x%x upper=0x%x)", bar_index, bar0_raw, bar1);
+    rtl8111_log(rtl8111_tmp);
+
     uint64_t bar = bar0_raw & ~0xFULL;
     if ((bar0_raw & 0x6) == 0x4) { /* 64-bit memory BAR */
-        if (bar1 == 0xFFFFFFFF) {
-            rtl8111_log("bad BAR1");
-            return -1;
-        }
         bar |= ((uint64_t)(bar1 & ~0xFULL)) << 32;
     }
     mmio8 = (volatile uint8_t*)bar;
+    klog_hex("[rtl8111] mmio_base", (uint64_t)bar);
 
     /* Chip version (r8169: xid = (TxConfig >> 20) & 0xfcf; RTL8111F = 0x48x) */
     uint32_t txconfig = rd32(R8168_TX_CONFIG);
@@ -308,11 +657,23 @@ int rtl8111_init(void) {
         rtl8111_log("MMIO dead");
         return -1;
     }
-    klog_hex("[rtl8111] TxConfig xid", (txconfig >> 20) & 0xfcf);
+    uint32_t xid = (txconfig >> 20) & RTL_XID_MASK;
+    klog_hex("[rtl8111] TxConfig xid", xid);
 
-    /* Software reset: write CmdReset, poll until self-cleared */
+    /* Dispatch chip info from the full xid table */
+    struct rtl_chip_id chip = rtl_xid_detect(xid);
+    {
+        char buf[128];
+        ksprintf(buf, sizeof(buf), "[rtl8111] chip: %s (family=%d, hw_variant=%d)",
+                 chip.name, chip.family, chip.hw);
+        klog(buf);
+    }
+
+    /* Software reset: write CmdReset, poll until self-cleared.
+     * Real silicon can be significantly slower than QEMU's emulated device -
+     * bump timeout from 100k to 500k iterations. */
     wr8(R8168_CHIP_CMD, R8168_CMD_RESET);
-    int timeout = 100000;
+    int timeout = 500000;
     while (rd8(R8168_CHIP_CMD) & R8168_CMD_RESET) {
         if (--timeout <= 0) {
             rtl8111_log("reset timeout");
@@ -368,7 +729,7 @@ int rtl8111_init(void) {
     rx_cur = 0;
 
     /* ---- rtl_hw_start (r8169) ---- */
-    /* Config regs must be unlocked to touch Config2/Config5 */
+    /* Config regs must be unlocked to touch Config2/Config3/Config5 */
     wr8(R8168_CFG9346, R8168_CFG_UNLOCK);
     /* Chip-side ASPM/clock-request off (r8169 does this before EPHY access) */
     wr8(R8168_CONFIG2, rd8(R8168_CONFIG2) & ~(uint8_t)R8168_CFG2_CLKREQ_EN);
@@ -377,17 +738,94 @@ int rtl8111_init(void) {
     wr16(R8168_CPLUS_CMD, 0);
     /* Early TX threshold (8168E-VL and later: r8169 EarlySize) */
     wr8(R8168_MAX_TX_PKT, R8168_EARLY_SIZE);
-    /* 8168F MAC workarounds */
-    rtl8111_hw_start_8168f();
+
+    /* Dispatch MAC init sequence by hw variant. Every variant in
+     * Linux's rtl_hw_start_* dispatch table has a unique ERI sequence and
+     * often a unique ephy patch - using the wrong sequence breaks link-up.
+     *
+     * NOTE: Each hw variant below handles ITS OWN low-power knobs (MCU,
+     * DLLPR, MISC, Config5) inline. We intentionally do NOT have a single
+     * shared "common knobs" block after the switch, because H-family
+     * (hw_start_8168h_1) clears DLLPR PFM_EN explicitly - a shared block
+     * would re-set it and contradict the per-variant init. */
+    switch (chip.hw) {
+        case RTL_HW_G_BASE:
+            rtl8111_hw_start_8168g();
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_GU:
+            rtl8111_hw_start_8168g();
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_8411B:
+            rtl8111_hw_start_8168g();
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_H:
+            rtl8111_hw_start_8168g();
+            rtl8111_hw_start_8168h_extras(); /* DLLPR &= ~PFM_EN is inside */
+            rtl8111_hw_lowpower_h();        /* no DLLPR write here to avoid clobbering */
+            break;
+        case RTL_HW_EP:
+            rtl8111_hw_start_8168ep();
+            rtl8111_hw_lowpower_generic();  /* EP family clears TX_10M_PS_EN only, PFM_EN stays */
+            break;
+        case RTL_HW_FP:
+            rtl8111_hw_start_8168ep();
+            rtl8111_hw_start_8117_extras();
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_F:
+            rtl8111_hw_start_8168f();
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_8411:
+            rtl8111_hw_start_8168f();
+            wr8(R8168_CONFIG3, rd8(R8168_CONFIG3) & ~(uint8_t)R8168_CFG3_RDY_L23);
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_E:
+            wr8(R8168_MISC, rd8(R8168_MISC) | (1 << 12) | (1 << 13)); /* TXPLA_RST */
+            wr8(R8168_MISC, rd8(R8168_MISC) & ~((uint8_t)(1 << 12) | (1 << 13)));
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_EVL:
+            rtl8111_hw_start_8168e_2();
+            rtl8111_hw_lowpower_generic();
+            break;
+        case RTL_HW_D:
+            rtl8111_hw_start_8168d();
+            wr8(R8168_MCU, rd8(R8168_MCU) & ~(uint8_t)R8168_MCU_NOW_IS_OOB);
+            break;
+        case RTL_HW_DP4:
+            rtl8111_hw_start_8168d_4();
+            wr8(R8168_MCU, rd8(R8168_MCU) & ~(uint8_t)R8168_MCU_NOW_IS_OOB);
+            break;
+        default:
+            rtl8111_hw_start_8168g();
+            rtl8111_hw_lowpower_generic();
+            break;
+    }
+
     /* PCIe-side ASPM/CLKREQ off (r8169 pci_disable_link_state) */
     rtl8111_pcie_disable_aspm(dev->bus, dev->device, dev->function);
-    /* Low-power knobs from rtl_hw_start_8168f */
-    wr8(R8168_MCU, rd8(R8168_MCU) & ~(uint8_t)R8168_MCU_NOW_IS_OOB);
-    wr8(R8168_DLLPR, rd8(R8168_DLLPR) | R8168_DLLPR_PFM_EN);
-    wr32(R8168_MISC, rd32(R8168_MISC) | R8168_MISC_PWM_EN);
-    wr8(R8168_CONFIG5, rd8(R8168_CONFIG5) & ~(uint8_t)R8168_CFG5_SPI_EN);
-    /* PHY side patches */
-    rtl8111_ephy_init_8168f_1();
+
+    /* PHY side patches - switch on hw variant */
+    switch (chip.hw) {
+        case RTL_HW_G_BASE:  rtl8111_ephy_init_8168g_1();  break;
+        case RTL_HW_GU:      rtl8111_ephy_init_8168g_2();  break;
+        case RTL_HW_8411B:   rtl8111_ephy_init_8411b();    break;
+        case RTL_HW_H:       rtl8111_ephy_init_8168h_1(); break;
+        case RTL_HW_EP:      rtl8111_ephy_init_8168ep_3();break;
+        case RTL_HW_FP:      rtl8111_ephy_init_8117();    break;
+        case RTL_HW_F:       rtl8111_ephy_init_8168f_1(); break;
+        case RTL_HW_8411:    rtl8111_ephy_init_8411();     break;
+        case RTL_HW_E:       rtl8111_ephy_init_8168e_1(); break;
+        case RTL_HW_EVL:     rtl8111_ephy_init_8168e_2(); break;
+        case RTL_HW_D:       break; /* no ephy patch for VER_25/26 */
+        case RTL_HW_DP4:     rtl8111_ephy_init_8168d_4(); break;
+        default:             rtl8111_ephy_init_8168g_1(); break;
+    }
     /* Disable interrupt coalescing */
     wr16(R8168_INTR_MITIGATE, 0);
 

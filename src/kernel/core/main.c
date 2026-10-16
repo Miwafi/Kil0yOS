@@ -176,8 +176,14 @@ static void boot_start(const char* label) {
 
 /* Verdict tag color on whichever console is active; boot_tag_color_reset()
  * restores the boot-screen default (fb light grey / VGA white-on-black). */
-static void boot_tag_color(int ok) {
-    uint8_t ega = ok ? (uint8_t)COLOR_LIGHT_GREEN : (uint8_t)COLOR_LIGHT_RED;
+static void boot_tag_color(int level) {
+    /* level: 0 = fail (red), 1 = ok (green), 2 = skip (yellow/brown) */
+    uint8_t ega;
+    switch (level) {
+        case 0:  ega = COLOR_LIGHT_RED; break;
+        case 2:  ega = COLOR_LIGHT_BROWN; break;
+        default: ega = COLOR_LIGHT_GREEN; break;
+    }
     if (fb_is_active() && !fb_console_muted()) {
         fb_set_color(ega);
     } else if (!vga_is_graphics()) {
@@ -199,10 +205,49 @@ static void boot_ok(void) {
     boot_tag_color_reset();
 }
 
+/* Yellow [ SKIP ] tag for steps that failed but have a fallback - the
+ * system continues to boot normally but the user should know the hardware
+ * wasn't fully functional (e.g. no DHCP server reachable). */
+static void boot_skip(void) {
+    boot_tag_color(2);   /* EGA 2 = yellow */
+    klog_out("[ SKIP ]\n");
+    boot_tag_color_reset();
+}
+
+/* Dump the tail of the klog ring to the screen (for boot-fail diagnostics).
+ * Boot status lines are normally painted with klog_muted=1, so detailed
+ * driver diagnostics stay in the ring/serial only. When something FAILs we
+ * yank the last 4KB of ring back onto the screen so the user can see the
+ * exact failure point without needing a serial console or shell dmesg.
+ *
+ * We use a static flag to guarantee the dump fires AT MOST ONCE per boot -
+ * otherwise a probe loop that boot_fails on every NIC would spam the ring
+ * tail hundreds of times on a multi-function PCIe device. */
+static int boot_diag_dumped = 0;
+static void boot_fail_dump_klog(void) {
+    if (boot_diag_dumped) return;
+    boot_diag_dumped = 1;
+
+    uint32_t wr = klog_seq();
+    uint32_t start = (wr > 4096) ? wr - 4096 : 0;
+    uint32_t seq = start;
+    char buf[256];
+
+    klog_out("\n--- boot diagnostic log (klog ring tail) ---\n");
+    for (;;) {
+        uint32_t n = klog_copy_from(&seq, buf, (uint32_t)sizeof(buf));
+        if (n == 0) break;
+        buf[n] = '\0';
+        klog_out(buf);
+    }
+    klog_out("--- end of diagnostic ---\n");
+}
+
 static void boot_fail(void) {
     boot_tag_color(0);
     klog_out("[FAILED]\n");
     boot_tag_color_reset();
+    boot_fail_dump_klog();
 }
 
 void kernel_main(uint64_t mb_info_phys) {
@@ -342,12 +387,12 @@ void kernel_main(uint64_t mb_info_phys) {
         if (dhcp_autoconfig(&g_netif) == 0) {
             boot_ok();
         } else {
-            boot_fail();
+            boot_skip();
             g_netif.ip      = 0x0A00020F; /* 10.0.2.15 */
             g_netif.netmask = 0xFFFFFF00; /* 255.255.255.0 */
             g_netif.gateway = 0x0A000202; /* 10.0.2.2 */
             g_netif.dns     = 0x0A000203; /* 10.0.2.3 (slirp DNS proxy) */
-            klog("net: DHCP failed, using static fallback\n");
+            klog("net: DHCP timed out (no cable?); using static fallback\n");
         }
     } else {
         boot_fail();

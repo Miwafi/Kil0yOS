@@ -3,7 +3,7 @@
 
 #include "lib/types.h"
 
-/* RTL8111F = Realtek RTL8168/8111 PCIe Gigabit family (0x10EC:0x8168).
+/* RTL8111F/G = Realtek RTL8168/8111 PCIe Gigabit family (0x10EC:0x8168).
  * Programming interface verified against Linux r8169 (r8169_main.c). */
 
 #define RTL8111_VENDOR_ID   0x10EC
@@ -77,10 +77,14 @@
 #define R8168_CFG_UNLOCK     0xC0
 #define R8168_CFG_LOCK       0x00
 
-/* Config2 / Config5 */
+/* Config2 / Config3 / Config5 */
 #define R8168_CFG2_CLKREQ_EN  (1 << 7)
+#define R8168_CFG3_RDY_L23    (1 << 1)     /* L23 Enable, PCIe state L2/L3 */
 #define R8168_CFG5_ASPM_EN    (1 << 0)
 #define R8168_CFG5_SPI_EN     (1 << 3)
+
+/* MISC bits */
+#define R8168_MISC_RXDVGATE   (1 << 19)    /* RXDV_GATED_EN */
 
 /* PHYstatus bits */
 #define R8168_PHYST_LINK     0x02
@@ -104,11 +108,83 @@
 #define R8168_ERI_MASK_0011     (0x3u << R8168_ERI_MASK_SHIFT)
 #define R8168_ERI_MASK_1111     (0xFu << R8168_ERI_MASK_SHIFT)
 
+/* Config3 register offset (Config2=0x53, Config3=0x54, Config4=0x55, Config5=0x56) */
+#define R8168_CONFIG3         0x54    /* 8-bit */
+
 /* EPHY access channel */
 #define R8168_EPHY_FLAG       0x80000000u
 #define R8168_EPHY_WRITE_CMD  0x80000000u
 #define R8168_EPHY_REG_SHIFT  16
 #define R8168_EPHY_REG_MASK   0x1f
+
+/* Chip xid (extended version id) extracted from (TxConfig >> 20) & 0xfcf.
+ * The xid uniquely identifies the MAC revision inside the 0x10ec:0x8168
+ * PCI device family (RTL8168/8111 Gigabit series). Values from Linux r8169
+ * rtl_chip_infos[] mask/val pairs (mask=0x7cf for all entries below).
+ *
+ * Supported chips (VER_25..VER_52, all VID:DID = 10ec:8168):
+ *   G-family (VER_40..52):  8168fp/8117, 8168ep/8111ep, 8168h/8111h,
+ *                           8411b, 8168gu/8111gu, 8168g/8111g/8111GN
+ *   F-family (VER_32..38):  8411, 8168f/8111f, 8168evl/8111evl,
+ *                           8168e/8111e
+ *   D-family (VER_25..31):  8168d/8111d, 8168dp/8111dp
+ */
+#define RTL_XID_MASK          0xfcf
+
+/* --- G-family (VER_40..52) --- */
+#define RTL_XID_G             0x4c0    /* RTL8168g/8111g       VER_40 */
+#define RTL_XID_GU            0x509    /* RTL8168gu/8111gu     VER_42 */
+#define RTL_XID_8411B         0x5c8    /* RTL8411b             VER_44 */
+#define RTL_XID_H1            0x541    /* RTL8168h/8111h       VER_46 */
+#define RTL_XID_H2            0x6c0    /* RTL8168M             VER_46 */
+#define RTL_XID_EP            0x502    /* RTL8168ep/8111ep     VER_51 (GN?) */
+#define RTL_XID_FP1           0x54a    /* RTL8168fp/8117       VER_52 */
+#define RTL_XID_FP2           0x54b    /* RTL8168fp/8117       VER_52 */
+
+/* --- F-family (VER_32..38) --- */
+#define RTL_XID_F1            0x480    /* RTL8168f/8111f       VER_35 */
+#define RTL_XID_F2            0x481    /* RTL8168f/8111f       VER_36 */
+#define RTL_XID_8411          0x488    /* RTL8411              VER_38 */
+#define RTL_XID_E1            0x2c1    /* RTL8168e/8111e       VER_32 */
+#define RTL_XID_E2            0x2c0    /* RTL8168e/8111e       VER_33 */
+#define RTL_XID_EVL           0x2c8    /* RTL8168evl/8111evl   VER_34 */
+
+/* --- D-family (VER_25..31) --- */
+#define RTL_XID_D1            0x281    /* RTL8168d/8111d       VER_25 */
+#define RTL_XID_D2            0x280    /* RTL8168d/8111d       VER_26 */
+#define RTL_XID_DP1           0x28a    /* RTL8168dp/8111dp     VER_28 */
+#define RTL_XID_DP2           0x28b    /* RTL8168dp/8111dp     VER_31 */
+
+enum rtl_mac_family {
+    RTL_MAC_G,      /* VER_40..52: 8111G/GN/GU/H/EP/FP/117 */
+    RTL_MAC_F,      /* VER_32..38: 8111F/E/EVL, 8411       */
+    RTL_MAC_D,      /* VER_25..31: 8111D/DP                */
+    RTL_MAC_UNKNOWN
+};
+
+/* hw_start variant selected per xid (from Linux rtl_hw_start_* dispatch) */
+enum rtl_hw_variant {
+    RTL_HW_G_BASE,     /* rtl_hw_start_8168g   : VER_40 base */
+    RTL_HW_GU,         /* rtl_hw_start_8168g_2 : VER_42       */
+    RTL_HW_8411B,      /* rtl_hw_start_8411_2  : VER_44       */
+    RTL_HW_H,          /* rtl_hw_start_8168h_1 : VER_46       */
+    RTL_HW_EP,         /* rtl_hw_start_8168ep_3: VER_51       */
+    RTL_HW_FP,         /* rtl_hw_start_8117    : VER_52       */
+    RTL_HW_F,          /* rtl_hw_start_8168f   : VER_35/36    */
+    RTL_HW_8411,       /* rtl_hw_start_8411    : VER_38       */
+    RTL_HW_E,          /* rtl_hw_start_8168e_1 : VER_32/33    */
+    RTL_HW_EVL,        /* rtl_hw_start_8168e_2 : VER_34       */
+    RTL_HW_D,          /* rtl_hw_start_8168d   : VER_25/26    */
+    RTL_HW_DP4,        /* rtl_hw_start_8168d_4 : VER_28/31    */
+    RTL_HW_UNKNOWN,
+};
+
+/* Per-xid dispatch result (filled by rtl_xid_detect) */
+struct rtl_chip_id {
+    enum rtl_mac_family family;
+    enum rtl_hw_variant hw;
+    const char* name;      /* short display string */
+};
 
 /* MaxTxPacketSize: EarlySize value used by r8169 for 8168E-VL and later */
 #define R8168_EARLY_SIZE      0x27

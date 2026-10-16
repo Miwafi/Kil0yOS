@@ -76,6 +76,7 @@ static int cmd_power(int argc, char** argv);
 static int cmd_painme(int argc, char** argv);
 static int cmd_mnt(int argc, char** argv);
 static int cmd_kilinstall(int argc, char** argv);
+static int cmd_dmesg(int argc, char** argv);
 
 static shell_command_t commands[] = {
     {"ls", "List directory contents", cmd_ls},
@@ -112,6 +113,7 @@ static shell_command_t commands[] = {
     {"time", "Show current time", cmd_time},
     {"exec", "Execute a user program", cmd_exec},
     {"help", "Show help information", cmd_help},
+    {"dmesg", "Print kernel boot log (last ~8KB from klog ring)", cmd_dmesg},
     {"shutdown", "Shut down the system", cmd_shutdown},
     {NULL, NULL, NULL}
 };
@@ -349,6 +351,26 @@ static int cmd_echo(int argc, char** argv) {
         }
     }
     vga_puts("\n");
+    return 0;
+}
+
+static int cmd_dmesg(int argc, char** argv) {
+    extern uint32_t klog_seq(void);
+    extern uint32_t klog_copy_from(uint32_t* seq, char* dst, uint32_t max);
+
+    /* Snapshot: start reading from the oldest byte still in the ring */
+    uint32_t wr = klog_seq();
+    uint32_t start = (wr > 8192) ? wr - 8192 : 0;
+    uint32_t seq = start;
+
+    char buf[256];
+    for (;;) {
+        uint32_t n = klog_copy_from(&seq, buf, (uint32_t)sizeof(buf));
+        if (n == 0) break;
+        buf[n] = '\0';
+        vga_puts(buf);   /* always print, regardless of klog_muted */
+    }
+    vga_puts("\n--- end of dmesg ---\n");
     return 0;
 }
 
